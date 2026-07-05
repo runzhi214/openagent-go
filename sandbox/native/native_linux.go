@@ -1,0 +1,193 @@
+package native
+
+import (
+	"context"
+	"fmt"
+	"os/exec"
+	"strings"
+
+	openagent "github.com/yusheng-g/openagent-go"
+)
+
+// confineAndRun uses Bubblewrap (bwrap) for Linux namespace isolation.
+// bwrap is available on most Linux distros (used by Flatpak) and provides
+// filesystem + network + PID isolation without root or setuid.
+//
+// Falls back to unsandboxed execution with a warning if bwrap is not found.
+func (s *Sandbox) confineAndRun(ctx context.Context, cmd openagent.Command) (openagent.Result, error) {
+	args, ok := s.bwrapArgs(cmd)
+	if !ok {
+		return s.unconfinedRun(ctx, cmd)
+	}
+
+	c := exec.CommandContext(ctx, "bwrap", args...)
+	c.Dir = s.workDir
+	for _, e := range cmd.Env {
+		c.Env = append(c.Env, e)
+	}
+	if cmd.Stdin != "" {
+		c.Stdin = strings.NewReader(cmd.Stdin)
+	}
+
+	var stdout, stderr strings.Builder
+	c.Stdout = &stdout
+	c.Stderr = &stderr
+
+	err := c.Run()
+	result := openagent.Result{
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+		ExitCode: 0,
+	}
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			result.ExitCode = exitErr.ExitCode()
+			return result, nil
+		}
+		return result, fmt.Errorf("native sandbox (linux): %w", err)
+	}
+	return result, nil
+}
+
+func (s *Sandbox) confineAndRunStream(ctx context.Context, cmd openagent.Command) <-chan openagent.ToolStreamChunk {
+	ch := make(chan openagent.ToolStreamChunk, 16)
+	go func() {
+		defer close(ch)
+
+		args, ok := s.bwrapArgs(cmd)
+		if !ok {
+			// Fallback: run unconfined.
+			for chunk := range s.unconfinedRunStream(ctx, cmd) {
+				ch <- chunk
+			}
+			return
+		}
+
+		c := exec.CommandContext(ctx, "bwrap", args...)
+		c.Dir = s.workDir
+		for _, e := range cmd.Env {
+			c.Env = append(c.Env, e)
+		}
+		if cmd.Stdin != "" {
+			c.Stdin = strings.NewReader(cmd.Stdin)
+		}
+
+		stdout, _ := c.StdoutPipe()
+		stderr, _ := c.StderrPipe()
+		if err := c.Start(); err != nil {
+			ch <- openagent.ToolStreamChunk{Error: fmt.Errorf("native sandbox (linux): %w", err)}
+			return
+		}
+
+		done := make(chan struct{}, 2)
+		go readLines(stdout, ch, done)
+		go readLines(stderr, ch, done)
+		<-done
+		<-done
+		_ = c.Wait()
+	}()
+	return ch
+}
+
+// bwrapArgs builds Bubblewrap arguments for namespace isolation.
+// Returns false if bwrap is not installed.
+//
+// Isolation provided:
+//   - New mount namespace with minimal /usr, /bin, /lib bind mounts
+//   - /workspace bind-mounted (only writable path)
+//   - New network namespace (no network)
+//   - New PID namespace
+//   - New UTS namespace
+func (s *Sandbox) bwrapArgs(cmd openagent.Command) ([]string, bool) {
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		return nil, false
+	}
+
+	args := []string{
+		"--unshare-all",            // new namespaces for everything (incl. network)
+		"--new-session",            // new session, no controlling tty
+		"--die-with-parent",        // kill container when parent dies
+		"--proc", "/proc",          // mount proc
+		"--dev", "/dev",            // minimal /dev
+		"--ro-bind", "/usr", "/usr",
+		"--ro-bind", "/bin", "/bin",
+		"--ro-bind", "/lib", "/lib",
+		"--ro-bind", "/lib64", "/lib64",
+	}
+
+	// Bind workspace as writable /workspace.
+	args = append(args, "--bind", s.workDir, "/workspace")
+	args = append(args, "--chdir", "/workspace")
+
+	// Pass environment variables.
+	for _, e := range cmd.Env {
+		args = append(args, "--setenv", e)
+	}
+
+	// The command to run.
+	args = append(args, "--", cmd.Program)
+	args = append(args, cmd.Args...)
+
+	return args, true
+}
+
+// ── Fallback: unconfined execution ──
+
+func (s *Sandbox) unconfinedRun(ctx context.Context, cmd openagent.Command) (openagent.Result, error) {
+	c := exec.CommandContext(ctx, cmd.Program, cmd.Args...)
+	c.Dir = s.workDir
+	for _, e := range cmd.Env {
+		c.Env = append(c.Env, e)
+	}
+	if cmd.Stdin != "" {
+		c.Stdin = strings.NewReader(cmd.Stdin)
+	}
+
+	var stdout, stderr strings.Builder
+	c.Stdout = &stdout
+	c.Stderr = &stderr
+
+	err := c.Run()
+	result := openagent.Result{
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String() + "\n[warning: bwrap not found, running without sandbox]",
+		ExitCode: 0,
+	}
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			result.ExitCode = exitErr.ExitCode()
+			return result, nil
+		}
+		return result, fmt.Errorf("native sandbox (linux, unconfined): %w", err)
+	}
+	return result, nil
+}
+
+func (s *Sandbox) unconfinedRunStream(ctx context.Context, cmd openagent.Command) <-chan openagent.ToolStreamChunk {
+	ch := make(chan openagent.ToolStreamChunk, 16)
+	go func() {
+		defer close(ch)
+		c := exec.CommandContext(ctx, cmd.Program, cmd.Args...)
+		c.Dir = s.workDir
+		for _, e := range cmd.Env {
+			c.Env = append(c.Env, e)
+		}
+		if cmd.Stdin != "" {
+			c.Stdin = strings.NewReader(cmd.Stdin)
+		}
+
+		stdout, _ := c.StdoutPipe()
+		stderr, _ := c.StderrPipe()
+		if err := c.Start(); err != nil {
+			ch <- openagent.ToolStreamChunk{Error: err}
+			return
+		}
+		done := make(chan struct{}, 2)
+		go readLines(stdout, ch, done)
+		go readLines(stderr, ch, done)
+		<-done
+		<-done
+		_ = c.Wait()
+	}()
+	return ch
+}

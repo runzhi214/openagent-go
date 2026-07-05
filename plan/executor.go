@@ -1,0 +1,915 @@
+package plan
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	openagent "github.com/yusheng-g/openagent-go"
+)
+
+// executor runs a PlanDef to completion.
+type executor struct {
+	config          PlanConfig
+	agents          map[string]openagent.AgentRunner
+	agentInfos      []openagent.AgentInfo
+	model           openagent.Model // for summarisation
+	sessionID       string          // base session id for step isolation
+}
+
+// ── Entry point ──
+
+func (e *executor) execute(ctx context.Context, def *PlanDef, state *PlanState, eventCh chan<- PlanEvent) (*PlanResult, error) {
+	state.Status = PlanStatusRunning
+	state.UpdatedAt = time.Now()
+
+	// Resolve final steps: those explicitly marked Final, or leaf nodes.
+	finalSteps := make(map[string]bool)
+	for _, s := range def.Steps {
+		if s.Final {
+			finalSteps[s.ID] = true
+		}
+	}
+
+	// Replan loop.
+	maxReplans := e.config.MaxReplans
+	if maxReplans <= 0 {
+		maxReplans = 3
+	}
+
+	var totalUsage openagent.Usage
+
+	for {
+		select {
+		case <-ctx.Done():
+			state.Status = PlanStatusCancelled
+			if eventCh != nil {
+				eventCh <- PlanEvent{Type: PlanEventError, ErrText: ctx.Err().Error()}
+			}
+			return nil, ctx.Err()
+		default:
+		}
+
+		// Reset pending steps that aren't done.
+		for _, s := range def.Steps {
+			if sr, ok := state.Results[s.ID]; !ok || sr == nil {
+				state.Results[s.ID] = &StepResult{Status: StepStatusPending}
+			}
+		}
+
+		// Execute batches.
+		result, err := e.executeBatches(ctx, def, state, finalSteps, eventCh)
+		if err != nil {
+			state.Status = PlanStatusFailed
+			return nil, err
+		}
+		if result != nil {
+			totalUsage.PromptTokens += result.Usage.PromptTokens
+			totalUsage.CompletionTokens += result.Usage.CompletionTokens
+			totalUsage.TotalTokens += result.Usage.TotalTokens
+		}
+
+		// Check for failures.
+		failedID := e.findFailed(def, state)
+		if failedID == "" {
+			// All done.
+			state.Status = PlanStatusDone
+			state.UpdatedAt = time.Now()
+			result := e.buildResult(def, state, totalUsage)
+			if eventCh != nil {
+				eventCh <- PlanEvent{Type: PlanEventDone, Text: result.FinalOutput}
+			}
+			return result, nil
+		}
+
+		// If auto-replan is disabled, pause for manual intervention.
+		// The caller sees (nil, nil) and knows execution is paused, not failed.
+		if !e.config.AutoReplan {
+			state.UpdatedAt = time.Now()
+			if eventCh != nil {
+				failedSR := state.Results[failedID]
+				errText := ""
+				if failedSR != nil {
+					errText = failedSR.Error
+				}
+				eventCh <- PlanEvent{
+					Type:    PlanEventWaitingRetry,
+					StepID:  failedID,
+					ErrText: errText,
+				}
+			}
+			return nil, nil // paused — caller can resume via ExecuteWithState
+		}
+
+		// Replan.
+		state.ReplanCount++
+		if state.ReplanCount > maxReplans {
+			state.Status = PlanStatusFailed
+			return nil, fmt.Errorf("max replans exceeded (%d)", maxReplans)
+		}
+
+		if eventCh != nil {
+			eventCh <- PlanEvent{Type: PlanEventReplanning, StepID: failedID}
+		}
+
+		newDef, err := e.replanAfterFailure(ctx, def, state, failedID)
+		if err != nil {
+			state.Status = PlanStatusFailed
+			return nil, fmt.Errorf("replan failed: %w", err)
+		}
+
+		def = newDef
+		state.Steps = def.Steps
+		state.UpdatedAt = time.Now()
+	}
+}
+
+// ── Batch execution ──
+
+func (e *executor) executeBatches(ctx context.Context, def *PlanDef, state *PlanState, finalSteps map[string]bool, eventCh chan<- PlanEvent) (*PlanResult, error) {
+	// Build adjacency and in-degree for remaining (pending) steps.
+	pending := make(map[string]StepDef)
+	for _, s := range def.Steps {
+		sr := state.Results[s.ID]
+		if sr == nil || sr.Status == StepStatusPending || sr.Status == StepStatusFailed {
+			pending[s.ID] = s
+		}
+	}
+
+	if len(pending) == 0 {
+		return nil, nil
+	}
+
+	// Topological sort of pending steps.
+	batches := topoSortPending(pending)
+
+	for _, batch := range batches {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		// Run batch in parallel.
+		batchResult, err := e.runBatch(ctx, batch, state, eventCh)
+		if err != nil {
+			return nil, err
+		}
+		if batchResult != nil {
+			// A step failed — stop batch execution, return result so caller can replan.
+			return batchResult, nil
+		}
+	}
+
+	return nil, nil
+}
+
+// runBatch executes a single topological batch concurrently.
+// Returns a result with usage if a step failed (to trigger replan);
+// returns nil, nil if all steps succeeded.
+// When one step fails, all other in-progress steps in the batch are cancelled
+// via context to avoid wasting tokens.
+func (e *executor) runBatch(ctx context.Context, batch []string, state *PlanState, eventCh chan<- PlanEvent) (*PlanResult, error) {
+	concurrency := e.config.MaxConcurrency
+	if concurrency <= 0 {
+		concurrency = 8
+	}
+	if len(batch) < concurrency {
+		concurrency = len(batch)
+	}
+
+	batchCtx, batchCancel := context.WithCancel(ctx)
+	defer batchCancel()
+
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		failed  bool
+		usage   openagent.Usage
+		sem     = make(chan struct{}, concurrency)
+	)
+
+	for _, stepID := range batch {
+		if failed {
+			break
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(id string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			// Check context before starting.
+			select {
+			case <-batchCtx.Done():
+				mu.Lock()
+				failed = true
+				mu.Unlock()
+				return
+			default:
+			}
+
+			sr := e.executeStep(batchCtx, id, state, eventCh)
+
+			mu.Lock()
+			if sr.Status == StepStatusFailed && !failed {
+				failed = true
+				batchCancel() // cancel sibling steps
+			}
+			mu.Unlock()
+		}(stepID)
+	}
+
+	wg.Wait()
+
+	if failed {
+		return &PlanResult{Usage: usage}, nil
+	}
+	return nil, nil
+}
+
+// ── Single step execution ──
+
+func (e *executor) executeStep(ctx context.Context, stepID string, state *PlanState, eventCh chan<- PlanEvent) *StepResult {
+	step := e.findStep(state.Steps, stepID)
+	if step == nil {
+		return &StepResult{Status: StepStatusFailed, Error: fmt.Sprintf("step %q not found", stepID)}
+	}
+
+	runner, ok := e.agents[step.Agent]
+	if !ok {
+		return &StepResult{Status: StepStatusFailed, Error: fmt.Sprintf("agent %q not found", step.Agent)}
+	}
+
+	sr := state.Results[stepID]
+	if sr == nil {
+		sr = &StepResult{Status: StepStatusPending}
+		state.Results[stepID] = sr
+	}
+
+	maxRetries := step.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+
+	for retry := 0; retry <= maxRetries; retry++ {
+		sr.Retries = retry
+		sr.Status = StepStatusRunning
+		sr.StartTime = time.Now()
+
+		if eventCh != nil {
+			eventCh <- PlanEvent{Type: PlanEventStepStart, StepID: stepID, Agent: step.Agent}
+		}
+
+		// Build step context from dependency results.
+		stepCtx := e.buildStepContext(state.Steps, state.Results, stepID)
+
+		// Isolated session so this step doesn't see other steps' internal history.
+		stepSession := openagent.Session{
+			ID:        e.sessionID + "/steps/" + stepID,
+			AgentName: step.Agent,
+			CreatedAt: time.Now(),
+		}
+
+		// Build prefix: system message with plan context.
+		prefix := []openagent.Message{
+			{Role: openagent.RoleSystem, Content: formatStepContext(stepCtx)},
+		}
+		input := openagent.UserMessage("Complete your task as described above.")
+
+		// Execute with timeout.
+		var result *openagent.RunResult
+		var runErr error
+
+		// Create a per-iteration timeout context. Cancel is called explicitly
+		// at the end of each iteration rather than deferred — defer in a loop
+		// stacks callbacks to function exit, leaking timers across retries.
+		var runCtx context.Context
+		var cancel context.CancelFunc
+		if e.config.StepTimeout > 0 {
+			runCtx, cancel = context.WithTimeout(ctx, e.config.StepTimeout)
+		} else {
+			runCtx = ctx
+		}
+
+		if eventCh != nil {
+			result, runErr = e.runStepStreaming(runCtx, runner, stepSession, prefix, input, stepID, eventCh)
+		} else {
+			result, runErr = runner.RunWithPrefix(runCtx, stepSession, prefix, input)
+		}
+
+		if cancel != nil {
+			cancel()
+		}
+
+		if runErr != nil {
+			sr.Status = StepStatusFailed
+			sr.Error = runErr.Error()
+			sr.EndTime = time.Now()
+			if eventCh != nil {
+				eventCh <- PlanEvent{Type: PlanEventStepFailed, StepID: stepID, Agent: step.Agent, Result: sr, ErrText: sr.Error}
+			}
+			if isPermanentError(runErr) {
+				return sr // don't retry permanent failures
+			}
+			continue // retry transient errors
+		}
+
+		// Generate summary.
+		summary, sumErr := e.summarize(ctx, step, result.FinalOutput)
+		if sumErr != nil {
+			// Non-fatal: fall back to truncated output.
+			summary = truncateStr(result.FinalOutput, 500)
+		}
+
+		sr.Status = StepStatusDone
+		sr.Summary = summary
+		sr.FinalOutput = result.FinalOutput
+		sr.Error = ""
+		sr.EndTime = time.Now()
+
+		if eventCh != nil {
+			eventCh <- PlanEvent{Type: PlanEventStepDone, StepID: stepID, Agent: step.Agent, Result: sr}
+		}
+
+		return sr
+	}
+
+	// All retries exhausted.
+	sr.Status = StepStatusFailed
+	sr.EndTime = time.Now()
+	if eventCh != nil {
+		eventCh <- PlanEvent{Type: PlanEventStepFailed, StepID: stepID, Agent: step.Agent, Result: sr, ErrText: sr.Error}
+	}
+	return sr
+}
+
+// runStepStreaming forwards agent stream events to the plan event channel.
+func (e *executor) runStepStreaming(ctx context.Context, runner openagent.AgentRunner, session openagent.Session, prefix []openagent.Message, input openagent.Message, stepID string, eventCh chan<- PlanEvent) (*openagent.RunResult, error) {
+	ch := runner.RunStreamWithPrefix(ctx, session, prefix, input)
+	var result *openagent.RunResult
+	for evt := range ch {
+		switch evt.Type {
+		case openagent.StreamTextDelta:
+			eventCh <- PlanEvent{Type: PlanEventTextDelta, StepID: stepID, Text: evt.Text}
+		case openagent.StreamToolCall:
+			pe := PlanEvent{Type: PlanEventToolCall, StepID: stepID}
+			if len(evt.Message.ToolCalls) > 0 {
+				tc := evt.Message.ToolCalls[0]
+				pe.ToolID = tc.ID
+				pe.ToolName = tc.Function.Name
+				pe.ToolArgs = tc.Function.Arguments
+			}
+			eventCh <- pe
+		case openagent.StreamToolProgress:
+			eventCh <- PlanEvent{Type: PlanEventToolProgress, StepID: stepID, Text: evt.Text}
+		case openagent.StreamToolResult:
+			eventCh <- PlanEvent{
+				Type: PlanEventToolResult, StepID: stepID,
+				Text: evt.Message.Content, // tool result text
+			}
+		case openagent.StreamRetrying:
+			// non-fatal, silently continue
+		case openagent.StreamDone:
+			result = evt.Result
+		case openagent.StreamError:
+			return nil, evt.Error
+		case openagent.StreamAborted:
+			return nil, fmt.Errorf("step %q aborted: %w", stepID, evt.Error)
+		}
+	}
+	if result == nil {
+		return nil, fmt.Errorf("step %q stream ended without result", stepID)
+	}
+	return result, nil
+}
+
+// ── StepContext assembly ──
+
+func (e *executor) buildStepContext(steps []StepDef, results map[string]*StepResult, stepID string) StepContext {
+	var self StepDef
+	for _, s := range steps {
+		if s.ID == stepID {
+			self = s
+			break
+		}
+	}
+
+	sc := StepContext{
+		Goal: "", // filled in later if needed
+		Task: self.Task,
+	}
+
+	for _, depID := range self.DependsOn {
+		sr, ok := results[depID]
+		if !ok || sr == nil {
+			continue
+		}
+
+		var depStep StepDef
+		for _, s := range steps {
+			if s.ID == depID {
+				depStep = s
+				break
+			}
+		}
+
+		output := sr.FinalOutput
+		// Only include full output if it's short enough.
+		if len(output) > 2000 {
+			output = truncateStr(output, 2000)
+		}
+
+		dr := DepResult{
+			StepID:    depID,
+			AgentName: depStep.Agent,
+			Task:      depStep.Task,
+			Summary:   sr.Summary,
+			Output:    output,
+			Success:   sr.Status == StepStatusDone,
+			Error:     sr.Error,
+		}
+		sc.Dependencies = append(sc.Dependencies, dr)
+	}
+
+	return sc
+}
+
+func formatStepContext(sc StepContext) string {
+	var b strings.Builder
+	b.WriteString("## Plan Context\n\n")
+	if sc.Goal != "" {
+		b.WriteString(fmt.Sprintf("**Goal:** %s\n\n", sc.Goal))
+	}
+	b.WriteString(fmt.Sprintf("**Your task:** %s\n", sc.Task))
+
+	if len(sc.Dependencies) > 0 {
+		b.WriteString("\n## Results from Previous Steps\n\n")
+		for _, dr := range sc.Dependencies {
+			b.WriteString(fmt.Sprintf("### Step %q (%s)\n", dr.StepID, dr.AgentName))
+			b.WriteString(fmt.Sprintf("Task: %s\n", dr.Task))
+			if dr.Success {
+				b.WriteString(fmt.Sprintf("Result: %s\n", dr.Summary))
+				if dr.Output != "" && dr.Output != dr.Summary {
+					b.WriteString(fmt.Sprintf("\nFull output:\n%s\n", dr.Output))
+				}
+			} else {
+				b.WriteString(fmt.Sprintf("⚠️ This step failed: %s\n", dr.Error))
+			}
+			b.WriteString("\n")
+		}
+	}
+
+	b.WriteString("---\n\nComplete your task and produce your final answer.")
+	return b.String()
+}
+
+// ── Summarisation ──
+
+func (e *executor) summarize(ctx context.Context, step *StepDef, output string) (string, error) {
+	if e.model == nil {
+		return truncateStr(output, 500), nil
+	}
+	if len(output) < 500 {
+		return output, nil
+	}
+
+	prompt := fmt.Sprintf(
+		"Summarize the following agent output in 2-3 sentences. "+
+			"Focus on key decisions, results, and outputs produced.\n\n"+
+			"Agent: %s\nTask: %s\n\nOutput:\n%s",
+		step.Agent, step.Task, output,
+	)
+
+	resp, err := e.model.ChatCompletion(ctx, openagent.ChatCompletionRequest{
+		Messages: []openagent.Message{
+			{Role: openagent.RoleSystem, Content: "You are a concise summarizer. Return only the summary, no preamble."},
+			{Role: openagent.RoleUser, Content: prompt},
+		},
+		MaxTokens: 300,
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Choices) == 0 {
+		return truncateStr(output, 500), nil
+	}
+	return strings.TrimSpace(resp.Choices[0].Message.Content), nil
+}
+
+// ── Helpers ──
+
+func (e *executor) findStep(steps []StepDef, id string) *StepDef {
+	for i := range steps {
+		if steps[i].ID == id {
+			return &steps[i]
+		}
+	}
+	return nil
+}
+
+func (e *executor) findFailed(def *PlanDef, state *PlanState) string {
+	for _, s := range def.Steps {
+		sr := state.Results[s.ID]
+		if sr != nil && sr.Status == StepStatusFailed {
+			return s.ID
+		}
+	}
+	return ""
+}
+
+func (e *executor) buildResult(def *PlanDef, state *PlanState, usage openagent.Usage) *PlanResult {
+	var finalOutputs []string
+	for _, s := range def.Steps {
+		sr := state.Results[s.ID]
+		if sr == nil || sr.Status != StepStatusDone {
+			continue
+		}
+		// Check if it's a final step (explicitly marked or leaf node with no dependents).
+		isFinal := s.Final
+		if !isFinal {
+			isFinal = true
+			for _, other := range def.Steps {
+				for _, dep := range other.DependsOn {
+					if dep == s.ID {
+						isFinal = false
+						break
+					}
+				}
+				if !isFinal {
+					break
+				}
+			}
+		}
+		if isFinal && sr.FinalOutput != "" {
+			finalOutputs = append(finalOutputs, sr.FinalOutput)
+		}
+	}
+
+	finalOutput := strings.Join(finalOutputs, "\n\n")
+
+	steps := make([]StepResult, 0, len(state.Results))
+	for _, s := range def.Steps {
+		if sr, ok := state.Results[s.ID]; ok && sr != nil {
+			steps = append(steps, *sr)
+		}
+	}
+
+	return &PlanResult{
+		Goal:        def.Goal,
+		FinalOutput: finalOutput,
+		Steps:       steps,
+		Usage:       usage,
+		ReplanCount: state.ReplanCount,
+	}
+}
+
+func (e *executor) replanAfterFailure(ctx context.Context, def *PlanDef, state *PlanState, failedID string) (*PlanDef, error) {
+	// Determine the affected subtree: the failed step + all transitive dependents.
+	affected := affectedSteps(def, failedID)
+
+	// Collect context from successful steps.
+	var successContext []string
+	for _, s := range def.Steps {
+		sr := state.Results[s.ID]
+		if sr == nil || sr.Status != StepStatusDone {
+			continue
+		}
+		if affected[s.ID] {
+			continue
+		}
+		successContext = append(successContext, fmt.Sprintf(
+			"Step %q (%s): %s", s.ID, s.Agent, sr.Summary,
+		))
+	}
+
+	// Collect failure info.
+	sr := state.Results[failedID]
+	failureInfo := fmt.Sprintf("Step %q failed: %s", failedID, sr.Error)
+
+	// Build a replan prompt.
+	var b strings.Builder
+	b.WriteString("## Replanning\n\n")
+	b.WriteString(fmt.Sprintf("**Original goal:** %s\n\n", def.Goal))
+	b.WriteString(fmt.Sprintf("**Failure:** %s\n\n", failureInfo))
+
+	if len(successContext) > 0 {
+		b.WriteString("## Completed Steps (do not regenerate these)\n\n")
+		for _, sc := range successContext {
+			b.WriteString(fmt.Sprintf("- %s\n", sc))
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("## Steps that Need Replanning\n\n")
+	for _, s := range def.Steps {
+		if affected[s.ID] {
+			b.WriteString(fmt.Sprintf("- %s (agent: %s, original task: %s)\n", s.ID, s.Agent, s.Task))
+		}
+	}
+	// List surviving step IDs so the LLM doesn't reuse them.
+	var survivingIDs []string
+	for _, s := range def.Steps {
+		if !affected[s.ID] {
+			survivingIDs = append(survivingIDs, s.ID)
+		}
+	}
+	if len(survivingIDs) > 0 {
+		b.WriteString("\n## Surviving Step IDs (DO NOT reuse these)\n")
+		b.WriteString(strings.Join(survivingIDs, ", "))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\nGenerate a replacement plan for only the failed and affected steps. ")
+	b.WriteString("Use NEW unique step IDs — do NOT reuse any surviving IDs listed above. ")
+	b.WriteString("The replacement steps should accomplish the same goal as the original affected steps. ")
+	b.WriteString("Return ONLY the replacement steps as a JSON array (not a full plan):\n")
+	b.WriteString(`[{"id": "...", "agent": "...", "task": "...", "depends_on": [...], "final": false}]`)
+
+	resp, err := e.model.ChatCompletion(ctx, openagent.ChatCompletionRequest{
+		Messages: []openagent.Message{
+			{Role: openagent.RoleSystem, Content: plannerSystemPrompt},
+			{Role: openagent.RoleUser, Content: b.String()},
+		},
+		MaxTokens: 2048,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("replan model call failed: %w", err)
+	}
+	if len(resp.Choices) == 0 {
+		return nil, fmt.Errorf("replan: model returned no choices")
+	}
+
+	// Parse replacement steps.
+	raw := strings.TrimSpace(resp.Choices[0].Message.Content)
+	raw = strings.TrimPrefix(raw, "```json")
+	raw = strings.TrimPrefix(raw, "```")
+	if idx := strings.LastIndex(raw, "```"); idx >= 0 {
+		raw = raw[:idx]
+	}
+	raw = strings.TrimSpace(raw)
+
+	var newSteps []StepDef
+	if err := json.Unmarshal([]byte(raw), &newSteps); err != nil {
+		return nil, fmt.Errorf("replan: failed to parse replacement steps: %w\nRaw:\n%s", err, truncateStr(raw, 500))
+	}
+
+	if len(newSteps) == 0 {
+		return nil, fmt.Errorf("replan: no replacement steps generated")
+	}
+
+	// Merge: remove affected steps, add new ones.
+	merged := make([]StepDef, 0, len(def.Steps)-len(affected)+len(newSteps))
+	for _, s := range def.Steps {
+		if !affected[s.ID] {
+			merged = append(merged, s)
+		}
+	}
+	merged = append(merged, newSteps...)
+
+	newDef := &PlanDef{Goal: def.Goal, Steps: merged}
+
+	// Validate the merged plan.
+	agentNames := make(map[string]bool)
+	for _, a := range e.agentInfos {
+		agentNames[a.Name] = true
+	}
+	if err := Validate(newDef, agentNames); err != nil {
+		return nil, fmt.Errorf("replan validation failed: %w", err)
+	}
+
+	// Reset results for affected steps.
+	for id := range affected {
+		delete(state.Results, id)
+	}
+
+	return newDef, nil
+}
+
+// replanWithFeedback is like replanAfterFailure but incorporates user feedback
+// (natural language suggestions) into the replan prompt. The caller is responsible
+// for cleaning up affected step results in state before resuming execution.
+func (e *executor) replanWithFeedback(ctx context.Context, def *PlanDef, state *PlanState, failedID string, feedback string) (*PlanDef, error) {
+	affected := affectedSteps(def, failedID)
+
+	// Collect success context.
+	var successContext []string
+	for _, s := range def.Steps {
+		sr := state.Results[s.ID]
+		if sr == nil || sr.Status != StepStatusDone {
+			continue
+		}
+		if affected[s.ID] {
+			continue
+		}
+		successContext = append(successContext, fmt.Sprintf(
+			"Step %q (%s): %s", s.ID, s.Agent, sr.Summary,
+		))
+	}
+
+	// Build prompt with user feedback.
+	var b strings.Builder
+	b.WriteString("## Replanning with User Feedback\n\n")
+	b.WriteString(fmt.Sprintf("**Original goal:** %s\n\n", def.Goal))
+
+	sr := state.Results[failedID]
+	if sr != nil {
+		b.WriteString(fmt.Sprintf("**Failure:** Step %q failed: %s\n\n", failedID, sr.Error))
+	}
+
+	b.WriteString(fmt.Sprintf("**User feedback:** %s\n\n", feedback))
+
+	if len(successContext) > 0 {
+		b.WriteString("## Completed Steps (do not regenerate these)\n\n")
+		for _, sc := range successContext {
+			b.WriteString(fmt.Sprintf("- %s\n", sc))
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("## Steps that Need Replanning\n\n")
+	for _, s := range def.Steps {
+		if affected[s.ID] {
+			b.WriteString(fmt.Sprintf("- %s (agent: %s, original task: %s)\n", s.ID, s.Agent, s.Task))
+		}
+	}
+
+	var survivingIDs []string
+	for _, s := range def.Steps {
+		if !affected[s.ID] {
+			survivingIDs = append(survivingIDs, s.ID)
+		}
+	}
+	if len(survivingIDs) > 0 {
+		b.WriteString("\n## Surviving Step IDs (DO NOT reuse these)\n")
+		b.WriteString(strings.Join(survivingIDs, ", "))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n**IMPORTANT**: The user has provided feedback above. Use it to guide your replanning — ")
+	b.WriteString("choose different agents, rephrase tasks, or restructure the approach based on their suggestions.\n\n")
+	b.WriteString("Generate a replacement plan for only the failed and affected steps. ")
+	b.WriteString("Return ONLY the replacement steps as a JSON array:\n")
+	b.WriteString(`[{"id": "...", "agent": "...", "task": "...", "depends_on": [...], "final": false}]`)
+
+	resp, err := e.model.ChatCompletion(ctx, openagent.ChatCompletionRequest{
+		Messages: []openagent.Message{
+			{Role: openagent.RoleSystem, Content: plannerSystemPrompt},
+			{Role: openagent.RoleUser, Content: b.String()},
+		},
+		MaxTokens: 2048,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("replan model call failed: %w", err)
+	}
+	if len(resp.Choices) == 0 {
+		return nil, fmt.Errorf("replan: model returned no choices")
+	}
+
+	// Parse replacement steps.
+	raw := strings.TrimSpace(resp.Choices[0].Message.Content)
+	raw = strings.TrimPrefix(raw, "```json")
+	raw = strings.TrimPrefix(raw, "```")
+	if idx := strings.LastIndex(raw, "```"); idx >= 0 {
+		raw = raw[:idx]
+	}
+	raw = strings.TrimSpace(raw)
+
+	var newSteps []StepDef
+	if err := json.Unmarshal([]byte(raw), &newSteps); err != nil {
+		return nil, fmt.Errorf("replan: failed to parse replacement steps: %w\nRaw:\n%s", err, truncateStr(raw, 500))
+	}
+
+	if len(newSteps) == 0 {
+		return nil, fmt.Errorf("replan: no replacement steps generated")
+	}
+
+	// Merge: remove affected steps, add new ones.
+	merged := make([]StepDef, 0, len(def.Steps)-len(affected)+len(newSteps))
+	for _, s := range def.Steps {
+		if !affected[s.ID] {
+			merged = append(merged, s)
+		}
+	}
+	merged = append(merged, newSteps...)
+
+	newDef := &PlanDef{Goal: def.Goal, Steps: merged}
+
+	agentNames := make(map[string]bool)
+	for _, a := range e.agentInfos {
+		agentNames[a.Name] = true
+	}
+	if err := Validate(newDef, agentNames); err != nil {
+		return nil, fmt.Errorf("replan validation failed: %w", err)
+	}
+
+	// Clean up affected results in state so the new steps start fresh.
+	for id := range affected {
+		delete(state.Results, id)
+	}
+
+	return newDef, nil
+}
+
+// isPermanentError returns true for errors that won't be fixed by retrying.
+func isPermanentError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	// Context cancellation / deadline — not worth retrying.
+	permanent := []string{"context canceled", "deadline exceeded", "400", "401", "403", "404", "invalid API key", "does not exist"}
+	for _, p := range permanent {
+		if strings.Contains(msg, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// ── DAG helpers ──
+
+// topoSortPending sorts pending step IDs into topological batches.
+func topoSortPending(pending map[string]StepDef) [][]string {
+	// Build in-degree map (only counting pending dependencies).
+	inDegree := make(map[string]int)
+	adj := make(map[string][]string)
+
+	for id := range pending {
+		if _, ok := inDegree[id]; !ok {
+			inDegree[id] = 0
+		}
+	}
+
+	for id, s := range pending {
+		for _, dep := range s.DependsOn {
+			if _, ok := pending[dep]; ok {
+				inDegree[id]++
+				adj[dep] = append(adj[dep], id)
+			}
+		}
+	}
+
+	var batches [][]string
+
+	for len(inDegree) > 0 {
+		// Collect all nodes with in-degree 0.
+		var batch []string
+		for id, deg := range inDegree {
+			if deg == 0 {
+				batch = append(batch, id)
+			}
+		}
+
+		if len(batch) == 0 {
+			// Cycle detected among pending nodes — shouldn't happen if Validate passed.
+			break
+		}
+
+		batches = append(batches, batch)
+
+		// Remove batch nodes and update in-degrees.
+		for _, id := range batch {
+			delete(inDegree, id)
+			for _, next := range adj[id] {
+				if _, ok := inDegree[next]; ok {
+					inDegree[next]--
+				}
+			}
+		}
+	}
+
+	return batches
+}
+
+// affectedSteps returns the set of step IDs that are transitively dependent on startID.
+func affectedSteps(def *PlanDef, startID string) map[string]bool {
+	affected := map[string]bool{startID: true}
+
+	// Build reverse dependency map: step → steps that depend on it.
+	dependents := make(map[string][]string)
+	for _, s := range def.Steps {
+		for _, dep := range s.DependsOn {
+			dependents[dep] = append(dependents[dep], s.ID)
+		}
+	}
+
+	// BFS/DFS to find all transitive dependents.
+	queue := []string{startID}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		for _, next := range dependents[current] {
+			if !affected[next] {
+				affected[next] = true
+				queue = append(queue, next)
+			}
+		}
+	}
+
+	return affected
+}
+

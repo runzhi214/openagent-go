@@ -1,0 +1,284 @@
+// Package file implements openagent.Memory with JSONL files on disk.
+// Zero external dependencies — uses only the standard library.
+//
+// Each session is stored as a JSONL file (one JSON object per line).
+// Search uses case-insensitive substring matching on message content.
+//
+// Usage:
+//
+//	mem, err := file.New("/path/to/memory/dir")
+//	mem.WithWorkingMemN(10)                        // optional, default 20
+//	mem.WithSummarizer(openai.NewSummarizer(...))  // optional, enables auto-compaction
+//	agent := openagent.NewAgent("bot", openagent.WithMemory(mem))
+package file
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	openagent "github.com/yusheng-g/openagent-go"
+)
+
+// Memory implements openagent.Memory backed by JSONL files.
+type Memory struct {
+	dir        string
+	mu         sync.RWMutex
+	summarizer openagent.Summarizer // nil = no auto-compaction
+	workingN   int                  // max uncompressed messages
+
+}
+
+// New creates a Memory store at dir. Directory is created if missing.
+func New(dir string) (*Memory, error) {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("file memory: %w", err)
+	}
+	return &Memory{dir: dir, workingN: 20}, nil
+}
+
+// WithSummarizer enables auto-compaction. nil (default) disables it.
+func (m *Memory) WithSummarizer(s openagent.Summarizer) *Memory {
+	m.summarizer = s
+	return m
+}
+
+// WithWorkingMemN sets the max number of uncompressed messages before
+// auto-compaction kicks in. Default is 20.
+func (m *Memory) WithWorkingMemN(n int) *Memory {
+	m.workingN = n
+	return m
+}
+
+// ── openagent.Memory ──
+
+// Close implements io.Closer. The file-based implementation opens and closes
+// files per-operation, so it holds no persistent resources. Returns nil.
+func (m *Memory) Close() error { return nil }
+
+// DeleteSession removes the session's JSONL file and compressed file.
+// It is safe to call on a session that doesn't exist (no error).
+func (m *Memory) DeleteSession(ctx context.Context, sessionID string) error {
+	_ = os.Remove(m.sessionPath(sessionID))
+	_ = os.Remove(m.compressedPath(sessionID))
+	return ctx.Err()
+}
+
+// Append writes a message to the session's JSONL file.
+func (m *Memory) Append(ctx context.Context, sessionID string, msg openagent.Message) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	f, err := os.OpenFile(m.sessionPath(sessionID), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("file memory append: %w", err)
+	}
+	defer f.Close()
+
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("file memory append: %w", err)
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		return fmt.Errorf("file memory append: %w", err)
+	}
+	return nil
+}
+
+// Recent returns the last n messages for a session, oldest first.
+// If a Summarizer is configured and stored messages exceed workingN,
+// old messages are automatically compressed and removed from the file.
+func (m *Memory) Recent(ctx context.Context, sessionID string, n int) ([]openagent.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	all, err := m.readAllLocked(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Auto-compact if summarizer is set and we're over the limit
+	if m.summarizer != nil && len(all) > m.workingN {
+		split := len(all) - m.workingN
+		old, recent := all[:split], all[split:]
+
+		cc, err := m.summarizer.Summarize(ctx, old)
+		if err == nil {
+			// Persist compressed context
+			m.writeCompressed(sessionID, cc)
+			// Rewrite file with only recent messages
+			m.writeAllLocked(sessionID, recent)
+			all = recent
+		}
+		// On summarization error, keep all messages — no data loss
+	}
+
+	if len(all) <= n {
+		return all, nil
+	}
+	return all[len(all)-n:], nil
+}
+
+// Compressed returns the stored CompressedContext, or nil if none exists.
+func (m *Memory) Compressed(ctx context.Context, sessionID string) (*openagent.CompressedContext, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.readCompressed(sessionID)
+}
+
+// Search finds messages containing query as a case-insensitive substring.
+func (m *Memory) Search(ctx context.Context, sessionID, query string, limit int) ([]openagent.SearchResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	all, err := m.readAllLocked(ctx, sessionID)
+	m.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	q := strings.ToLower(query)
+
+	type scored struct {
+		idx   int
+		score float64
+	}
+	var matches []scored
+
+	for i, msg := range all {
+		pos := strings.Index(strings.ToLower(msg.Content), q)
+		if pos < 0 {
+			continue
+		}
+		// Earlier match → higher score, normalized to ~[0,1]
+		score := 1.0 / (1.0 + float64(pos))
+		matches = append(matches, scored{idx: i, score: score})
+	}
+
+	// Sort by score descending
+	for i := 0; i < len(matches); i++ {
+		for j := i + 1; j < len(matches); j++ {
+			if matches[j].score > matches[i].score {
+				matches[i], matches[j] = matches[j], matches[i]
+			}
+		}
+	}
+
+	if limit > len(matches) {
+		limit = len(matches)
+	}
+
+	results := make([]openagent.SearchResult, limit)
+	for i := 0; i < limit; i++ {
+		m := matches[i]
+		results[i] = openagent.SearchResult{
+			Message: all[m.idx],
+			Score:   m.score,
+		}
+	}
+	return results, nil
+}
+
+// ── Internal ──
+
+func (m *Memory) sessionPath(sessionID string) string {
+	safe := strings.ReplaceAll(sessionID, "/", "_")
+	safe = strings.ReplaceAll(safe, string(os.PathSeparator), "_")
+	return filepath.Join(m.dir, safe+".jsonl")
+}
+
+func (m *Memory) compressedPath(sessionID string) string {
+	safe := strings.ReplaceAll(sessionID, "/", "_")
+	safe = strings.ReplaceAll(safe, string(os.PathSeparator), "_")
+	return filepath.Join(m.dir, safe+".compressed.json")
+}
+
+// readAllLocked reads all messages from the JSONL file. Caller must hold m.mu.
+func (m *Memory) readAllLocked(ctx context.Context, sessionID string) ([]openagent.Message, error) {
+	f, err := os.Open(m.sessionPath(sessionID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("file memory read: %w", err)
+	}
+	defer f.Close()
+
+	var msgs []openagent.Message
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	for scanner.Scan() {
+		if len(msgs)%100 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		var msg openagent.Message
+		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+			continue
+		}
+		msgs = append(msgs, msg)
+	}
+	return msgs, scanner.Err()
+}
+
+// writeAllLocked overwrites the session file. Caller must hold m.mu.
+func (m *Memory) writeAllLocked(sessionID string, msgs []openagent.Message) error {
+	f, err := os.Create(m.sessionPath(sessionID))
+	if err != nil {
+		return fmt.Errorf("file memory write: %w", err)
+	}
+	defer f.Close()
+
+	for _, msg := range msgs {
+		b, err := json.Marshal(msg)
+		if err != nil {
+			return err
+		}
+		if _, err := f.Write(append(b, '\n')); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Memory) writeCompressed(sessionID string, cc *openagent.CompressedContext) error {
+	b, err := json.Marshal(cc)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(m.compressedPath(sessionID), b, 0644)
+}
+
+func (m *Memory) readCompressed(sessionID string) (*openagent.CompressedContext, error) {
+	b, err := os.ReadFile(m.compressedPath(sessionID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("file memory compressed read: %w", err)
+	}
+	var cc openagent.CompressedContext
+	if err := json.Unmarshal(b, &cc); err != nil {
+		return nil, nil
+	}
+	return &cc, nil
+}

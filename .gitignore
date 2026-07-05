@@ -24,6 +24,14 @@ profile.cov
 go.work
 go.work.sum
 
+# Build output
+bin/
+build/
+
+# WASM plugin binaries (compiled from examples/plugin/)
+plugins/
+*.wasm
+
 # env file
 .env
 

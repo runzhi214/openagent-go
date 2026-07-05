@@ -1,0 +1,82 @@
+package openagent
+
+// AgentOption is a functional option for configuring an Agent.
+type AgentOption func(*Agent)
+
+// WithModel sets the LLM provider.
+func WithModel(m Model) AgentOption {
+	return func(a *Agent) { a.Model = m }
+}
+
+// WithDescription sets a human-readable description of the agent.
+func WithDescription(desc string) AgentOption {
+	return func(a *Agent) { a.Description = desc }
+}
+
+// WithInstructions sets the system instructions for the agent.
+func WithInstructions(instr string) AgentOption {
+	return func(a *Agent) { a.Instructions = instr }
+}
+
+// WithTools adds tools to the agent.
+func WithTools(tools ...Tool) AgentOption {
+	return func(a *Agent) { a.Tools = append(a.Tools, tools...) }
+}
+
+// WithMemory sets the memory backend for conversation persistence.
+func WithMemory(m Memory) AgentOption {
+	return func(a *Agent) { a.Memory = m }
+}
+
+// WithPrompt replaces the default prompt builder.
+func WithPrompt(pb PromptBuilder) AgentOption {
+	return func(a *Agent) { a.Prompt = pb }
+}
+
+// WithInputGuard sets the input guard.
+func WithInputGuard(g InputGuard) AgentOption {
+	return func(a *Agent) { a.InGuard = g }
+}
+
+// WithOutputGuard sets the output guard.
+func WithOutputGuard(g OutputGuard) AgentOption {
+	return func(a *Agent) { a.OutGuard = g }
+}
+
+// WithApprover sets the tool-call approver. If nil (default), all tool calls
+// are executed without asking.
+func WithApprover(ap Approver) AgentOption {
+	return func(a *Agent) { a.Approver = ap }
+}
+
+// WithRunHooks sets lifecycle hooks for the agent.
+func WithRunHooks(h RunHooks) AgentOption {
+	return func(a *Agent) { a.Hooks = h }
+}
+
+// WithRunObserver sets the stage-level observer for the agent.
+// Use WithRunObservers to combine multiple observers.
+func WithRunObserver(o RunObserver) AgentOption {
+	return func(a *Agent) { a.Observer = o }
+}
+
+// WithRunObservers combines multiple RunObservers into one.
+// Equivalent to: WithRunObserver(MultiObserver(observers...))
+func WithRunObservers(observers ...RunObserver) AgentOption {
+	return WithRunObserver(MultiObserver(observers...))
+}
+
+// WithSkillLoader sets the skill loader for on-demand skill loading.
+func WithSkillLoader(sl SkillLoader) AgentOption {
+	return func(a *Agent) { a.SkillLoader = sl }
+}
+
+// WithMaxTurns sets the maximum number of loop iterations per run.
+func WithMaxTurns(n int) AgentOption {
+	return func(a *Agent) { a.MaxTurns = n }
+}
+
+// WithWorkingMemory sets the number of recent turns kept in working memory.
+func WithWorkingMemory(n int) AgentOption {
+	return func(a *Agent) { a.WorkingMemN = n }
+}
