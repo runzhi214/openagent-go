@@ -27,7 +27,7 @@ func main() {
 
 	agent := openagent.NewAgent("calculator",
 		openagent.WithModel(model),
-		openagent.WithInstructions("You are a helpful assistant. Use the calculator tool for math."),
+		openagent.WithInstructions("You are a precise calculator. Use the calculator tool for arithmetic. Answer concisely."),
 		openagent.WithTools(&calculatorTool{}),
 		openagent.WithRunObserver(observer),
 	)

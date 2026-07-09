@@ -14,14 +14,18 @@ import (
 )
 
 // validatePath resolves p against workDir into a safe absolute path.
-// It rejects absolute paths (contract: "relative to workspace root"),
-// resolves ".." and symlinks, but does NOT enforce workspace boundaries —
+// Accepts both relative paths (joined with workDir) and absolute paths.
+// Resolves symlinks but does NOT enforce workspace boundaries —
 // that policy belongs to the [openagent.Approver].
 func validatePath(workDir, p string) (string, error) {
+	var abs string
+	var err error
 	if filepath.IsAbs(p) {
-		return "", fmt.Errorf("use a relative path (workspace root: %s) — got absolute: %s", workDir, p)
+		abs = p
+	} else {
+		abs = filepath.Join(workDir, p)
 	}
-	abs, err := filepath.Abs(filepath.Join(workDir, p))
+	abs, err = filepath.Abs(abs)
 	if err != nil {
 		return "", fmt.Errorf("invalid path: %w", err)
 	}
@@ -82,7 +86,18 @@ func (t *ReadFile) Execute(ctx context.Context, args json.RawMessage) (string, e
 		if os.IsNotExist(err) {
 			return "", fmt.Errorf("read: file not found: %s", params.Path)
 		}
+		if os.IsPermission(err) {
+			return "", fmt.Errorf("read: permission denied: %s", params.Path)
+		}
 		return "", fmt.Errorf("read: %w", err)
+	}
+
+	// Binary detection: check first 512 bytes for null bytes.
+	// If the file is binary, return a clear message so the model doesn't
+	// try to parse garbage or mistakenly treat it as a directory.
+	if isBinary(data) {
+		return fmt.Sprintf("[binary file: %s, %d bytes, type: %s]",
+			params.Path, len(data), detectType(data)), nil
 	}
 
 	const maxSize = 100 * 1024 // 100KB
@@ -90,6 +105,35 @@ func (t *ReadFile) Execute(ctx context.Context, args json.RawMessage) (string, e
 		return string(data[:maxSize]) + fmt.Sprintf("\n... [truncated, %d bytes total]", len(data)), nil
 	}
 	return string(data), nil
+}
+
+func isBinary(data []byte) bool {
+	n := len(data)
+	if n > 512 {
+		n = 512
+	}
+	for _, b := range data[:n] {
+		if b == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func detectType(data []byte) string {
+	n := len(data)
+	if n > 64 {
+		n = 64
+	}
+	for _, b := range data[:n] {
+		if b < 9 || (b > 13 && b < 32) && b != 27 {
+			return "binary data"
+		}
+	}
+	if data[0] == 0x7f && data[1] == 'E' && data[2] == 'L' && data[3] == 'F' {
+		return "ELF executable"
+	}
+	return "unknown binary"
 }
 
 // ── WriteFile ──

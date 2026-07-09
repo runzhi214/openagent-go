@@ -65,7 +65,7 @@ func main() {
 	// ── Single agent ──
 	agent := openagent.NewAgent("assistant",
 		openagent.WithModel(llm),
-		openagent.WithInstructions("You are a helpful assistant. You have access to shell, read, write, ls, and grep tools. Use them to help the user."),
+		openagent.WithInstructions("You are a capable assistant. Use shell, read, write, ls, and grep tools to explore, build, and edit the codebase. Be concise and action-oriented."),
 		openagent.WithTools(sandboxTools...),
 		openagent.WithMaxTurns(10),
 	)

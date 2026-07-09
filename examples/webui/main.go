@@ -151,15 +151,16 @@ func main() {
 // ── Shared types ──
 
 type sseEvent struct {
-	Type      string          `json:"type"`
-	Text      string          `json:"text,omitempty"`
-	Agent     string          `json:"agent,omitempty"`
-	ToolCall  *toolCallJSON   `json:"tool_call,omitempty"`
-	HandoffTo string          `json:"handoff_to,omitempty"`
-	StepID    string          `json:"step_id,omitempty"`
-	PlanDef   json.RawMessage `json:"plan_def,omitempty"` // plan_generated
-	Error     string          `json:"error,omitempty"`
-	Stage     json.RawMessage `json:"stage,omitempty"` // stage event detail (pipeline panel)
+	Type       string          `json:"type"`
+	Text       string          `json:"text,omitempty"`
+	Agent      string          `json:"agent,omitempty"`
+	ToolCall   *toolCallJSON   `json:"tool_call,omitempty"`
+	ToolCallID string          `json:"tool_call_id,omitempty"`
+	HandoffTo  string          `json:"handoff_to,omitempty"`
+	StepID     string          `json:"step_id,omitempty"`
+	PlanDef    json.RawMessage `json:"plan_def,omitempty"` // plan_generated
+	Error      string          `json:"error,omitempty"`
+	Stage      json.RawMessage `json:"stage,omitempty"` // stage event detail (pipeline panel)
 }
 
 // stageData is the JSON payload for "stage" SSE events.
@@ -331,7 +332,7 @@ func (h *hub) getOrCreate(id string) *session {
 
 	s.agent = openagent.NewAgent("assistant",
 		openagent.WithModel(h.llm),
-		openagent.WithInstructions("You are a helpful assistant. Use tools when helpful."),
+		openagent.WithInstructions("You are a capable assistant with access to shell, read, write, ls, and grep tools. The shell starts in the workspace root — use relative paths for all operations. Explore files, run commands, and edit code to help the user. Be concise and action-oriented."),
 		openagent.WithMemory(h.mem),
 		openagent.WithRunObserver(&webuiObserver{bus: h.bus, sid: id}),
 		openagent.WithApprover(&webApprover{
@@ -406,6 +407,12 @@ func (h *hub) handleChat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *hub) handleEvents(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("PANIC in SSE handler for session %s: %v", r.URL.Query().Get("session"), rec)
+		}
+	}()
+
 	sid := r.URL.Query().Get("session")
 	if sid == "" {
 		http.Error(w, "session required", 400)
@@ -420,6 +427,8 @@ func (h *hub) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(200)
+	flusher.Flush()
 
 	// ── Replay full history from Memory (authoritative source) ──
 	// Memory is the source of truth; EventBus only handles live events.
@@ -439,7 +448,7 @@ func (h *hub) handleEvents(w http.ResponseWriter, r *http.Request) {
 			case openagent.RoleAssistant:
 				writeSSE(w, sseEvent{Type: "message", Text: msg.Content})
 			case openagent.RoleTool:
-				writeSSE(w, sseEvent{Type: "tool_result", Text: msg.Content})
+				writeSSE(w, sseEvent{Type: "tool_result", Text: msg.Content, ToolCallID: msg.ToolCallID})
 			}
 			flusher.Flush()
 		}
@@ -666,7 +675,7 @@ func (h *hub) handlePlanCommand(s *session, goal string, feedback string, curren
 	}
 	h.bus.Publish(s.id, sseEvent{Type: "plan_planning", Text: label})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	// Build the planner prompt. When replanning (feedback + current plan),
@@ -784,6 +793,7 @@ func (h *hub) handlePlanExecute(w http.ResponseWriter, r *http.Request) {
 				openagent.WithInstructions(ag.Instructions),
 				openagent.WithMaxTurns(ag.MaxTurns),
 				openagent.WithTools(ag.Tools...),
+				openagent.WithRunObserver(&webuiObserver{bus: h.bus, sid: body.Session}),
 				openagent.WithApprover(&webApprover{
 					workDir:   h.workDir,
 					permStore: h.permStore,
@@ -994,7 +1004,7 @@ func (h *hub) handlePlanReplan(w http.ResponseWriter, r *http.Request) {
 	}
 	p := plan.NewPlan(planOpts...)
 
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
 
 	newDef, err := p.ReplanWithFeedback(ctx, def, state, body.StepID, body.Feedback)
@@ -1147,12 +1157,16 @@ func (a *webApprover) pathWithinWorkspace(rawArgs string) bool {
 		return false
 	}
 	p := filepath.Clean(args.Path)
-	// Absolute paths are rejected by tools anyway, but don't let them bypass
-	// the workspace check here (Go ≥1.26 changed filepath.Join behaviour).
+
+	// Resolve to absolute: join with workDir for relative paths,
+	// or use directly for absolute paths.
+	var abs string
+	var err error
 	if filepath.IsAbs(p) {
-		return false
+		abs, err = filepath.Abs(p)
+	} else {
+		abs, err = filepath.Abs(filepath.Join(a.workDir, p))
 	}
-	abs, err := filepath.Abs(filepath.Join(a.workDir, p))
 	if err != nil {
 		return false
 	}
@@ -1174,7 +1188,7 @@ func streamToSSE(evt openagent.StreamEvent) sseEvent {
 			return sseEvent{Type: "tool_call", ToolCall: tcj}
 		}
 	case openagent.StreamToolResult:
-		return sseEvent{Type: "tool_result", Text: evt.Message.Content}
+		return sseEvent{Type: "tool_result", Text: evt.Message.Content, ToolCallID: evt.Message.ToolCallID}
 	case openagent.StreamRetrying:
 		return sseEvent{Type: "retrying", Text: evt.Error.Error()}
 	case openagent.StreamDone:
@@ -1235,8 +1249,11 @@ func (h *teamHub) getOrCreate(id string) *teamSession {
 	// for ACP agents (external processes) which cannot be recreated per message.
 	s.team = h.buildTeam(s)
 	s.agentList = []agentInfoJSON{
-		{Name: "researcher", Description: "Analyzes questions, decides if calculation is needed", Type: "internal"},
-		{Name: "calculator", Description: "Performs arithmetic calculations with the calc tool", Type: "internal"},
+		{Name: "analyst", Description: "Understands requirements and produces specifications", Type: "internal"},
+		{Name: "designer", Description: "Designs architecture, components, and data flow", Type: "internal"},
+		{Name: "coder", Description: "Writes clean, idiomatic Go code with error handling", Type: "internal"},
+		{Name: "tester", Description: "Writes tests, identifies edge cases, reports results", Type: "internal"},
+		{Name: "reviewer", Description: "Reviews code for correctness, style, and security", Type: "internal"},
 	}
 	h.sessions[id] = s
 	return s
@@ -1289,8 +1306,6 @@ func (h *teamHub) handleChat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *teamHub) buildTeam(ts *teamSession) *openagent.Team {
-	calcTool := &calcTeamTool{}
-
 	// Per-session approver closure.
 	makeApprove := func() openagent.Approver {
 		return &webApprover{sid: ts.id,
@@ -1299,31 +1314,74 @@ func (h *teamHub) buildTeam(ts *teamSession) *openagent.Team {
 			}}
 	}
 
-	researcher := openagent.NewAgent("researcher",
+	analyst := openagent.NewAgent("analyst",
 		openagent.WithModel(h.llm),
 		openagent.WithMemory(h.mem),
-		openagent.WithInstructions(`You are a researcher. Analyze the user's question.
-If it involves calculation, hand off to the calculator with a clear math expression.
-If it's a knowledge question, answer it yourself.
-Be concise.`),
+		openagent.WithInstructions(`You are a requirements analyst. Your job:
+1. Understand the user's request
+2. Break it down into clear, testable requirements
+3. Hand off to the designer with a structured specification
+Be specific — include constraints, edge cases, and acceptance criteria.`),
+		openagent.WithMaxTurns(2),
+		openagent.WithApprover(makeApprove()),
+	)
+
+	designer := openagent.NewAgent("designer",
+		openagent.WithModel(h.llm),
+		openagent.WithMemory(h.mem),
+		openagent.WithInstructions(`You are a software designer. Your job:
+1. Take the analyst's specification and design the architecture
+2. Define components, interfaces, and data flow
+3. Hand off to the coder with a clear design document
+Be specific about types, function signatures, and module boundaries.`),
+		openagent.WithMaxTurns(2),
+		openagent.WithApprover(makeApprove()),
+	)
+
+	coder := openagent.NewAgent("coder",
+		openagent.WithModel(h.llm),
+		openagent.WithMemory(h.mem),
+		openagent.WithInstructions(`You are a software developer. Your job:
+1. Take the designer's spec and write clean, idiomatic Go code
+2. Include error handling, comments, and tests
+3. Hand off the complete implementation to the tester
+Output ONLY code with brief inline comments.`),
+		openagent.WithMaxTurns(5),
+		openagent.WithApprover(makeApprove()),
+	)
+
+	tester := openagent.NewAgent("tester",
+		openagent.WithModel(h.llm),
+		openagent.WithMemory(h.mem),
+		openagent.WithInstructions(`You are a QA engineer. Your job:
+1. Review the coder's implementation
+2. Identify edge cases and write tests for them
+3. If all tests pass, hand off to the reviewer with your test report
+4. If tests fail, report the failures clearly — do NOT fix the code
+Be thorough. List what you tested and why.`),
+		openagent.WithMaxTurns(2),
+		openagent.WithApprover(makeApprove()),
+	)
+
+	reviewer := openagent.NewAgent("reviewer",
+		openagent.WithModel(h.llm),
+		openagent.WithMemory(h.mem),
+		openagent.WithInstructions(`You are a code reviewer. Your job:
+1. Review the complete implementation and test results
+2. Check for correctness, style, performance, and security
+3. Produce a final review summary: approved, changes requested, or rejected
+4. If approved, present the complete deliverable to the user
+Do NOT hand off — you are the final gate.`),
 		openagent.WithMaxTurns(1),
 		openagent.WithApprover(makeApprove()),
 	)
 
-	calculator := openagent.NewAgent("calculator",
-		openagent.WithModel(h.llm),
-		openagent.WithMemory(h.mem),
-		openagent.WithInstructions(`You are a calculator. Use the calc tool for arithmetic.
-After getting the result, explain it clearly to the user.
-Do NOT hand off to anyone — just give the answer.`),
-		openagent.WithTools(calcTool),
-		openagent.WithMaxTurns(3),
-		openagent.WithApprover(makeApprove()),
-	)
-
 	return openagent.NewTeam(
-		openagent.WithTeamAgent("researcher", "Analyzes questions, decides if calculation is needed", researcher),
-		openagent.WithTeamAgent("calculator", "Performs arithmetic calculations with the calc tool", calculator),
+		openagent.WithTeamAgent("analyst", "Understands requirements and produces specifications", analyst),
+		openagent.WithTeamAgent("designer", "Designs architecture, components, and data flow", designer),
+		openagent.WithTeamAgent("coder", "Writes clean, idiomatic Go code with error handling", coder),
+		openagent.WithTeamAgent("tester", "Writes tests, identifies edge cases, reports results", tester),
+		openagent.WithTeamAgent("reviewer", "Reviews code for correctness, style, and security", reviewer),
 		openagent.WithTeamMaxHandoffs(5),
 	)
 }
@@ -1721,63 +1779,3 @@ func (t *echoTool) Execute(_ context.Context, args json.RawMessage) (string, err
 	return fmt.Sprintf("you said: %s", p.Message), nil
 }
 
-// ── Team calc tool ──
-
-type calcTeamTool struct{}
-
-func (t *calcTeamTool) Definition() openagent.FunctionDefinition {
-	return openagent.FunctionDefinition{
-		Name:        "calc",
-		Description: "Evaluate a math expression. Supports +, -, *, /. Example: '15*23+100/4'",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"expression":{"type":"string","description":"The expression to evaluate"}},"required":["expression"]}`),
-	}
-}
-
-func (t *calcTeamTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
-	var p struct{ Expression string }
-	json.Unmarshal(args, &p)
-	return evaluate(p.Expression), nil
-}
-
-func evaluate(expr string) string {
-	expr = strings.ReplaceAll(expr, " ", "")
-	if expr == "" { return "0" }
-	if n, ok := parseNum(expr); ok && len(expr) == len(fmt.Sprint(n)) {
-		return fmt.Sprint(n)
-	}
-	for i := len(expr) - 1; i >= 0; i-- {
-		if expr[i] == '+' {
-			return fmt.Sprint(mustInt(evaluate(expr[:i])) + mustInt(evaluate(expr[i+1:])))
-		}
-		if expr[i] == '-' && i > 0 && !isOp(expr[i-1]) {
-			return fmt.Sprint(mustInt(evaluate(expr[:i])) - mustInt(evaluate(expr[i+1:])))
-		}
-	}
-	for i := len(expr) - 1; i >= 0; i-- {
-		if expr[i] == '*' {
-			return fmt.Sprint(mustInt(evaluate(expr[:i])) * mustInt(evaluate(expr[i+1:])))
-		}
-		if expr[i] == '/' {
-			div := mustInt(evaluate(expr[i+1:]))
-			if div == 0 { return "error: division by zero" }
-			return fmt.Sprint(mustInt(evaluate(expr[:i])) / div)
-		}
-	}
-	return expr
-}
-
-func isOp(b byte) bool { return b == '+' || b == '-' || b == '*' || b == '/' }
-
-func parseNum(s string) (int, bool) {
-	var n int
-	for _, c := range s {
-		if c < '0' || c > '9' { return 0, false }
-		n = n*10 + int(c-'0')
-	}
-	return n, true
-}
-
-func mustInt(s string) int {
-	n, _ := parseNum(s)
-	return n
-}

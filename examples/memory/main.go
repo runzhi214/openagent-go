@@ -45,7 +45,7 @@ func main() {
 
 	agent := openagent.NewAgent("memory-demo",
 		openagent.WithModel(model),
-		openagent.WithInstructions("You are a helpful assistant. Keep responses concise."),
+		openagent.WithInstructions("You are a concise assistant. Answer directly without filler. Use previous conversation context when relevant."),
 		openagent.WithMemory(mem),
 	)
 

@@ -30,12 +30,12 @@ func (t *Shell) WithLanguage(lang string) *Shell {
 }
 
 func (t *Shell) Definition() openagent.FunctionDefinition {
-	desc := "Execute a shell command in a sandboxed environment."
+	desc := "Execute a shell command. The shell starts in the workspace root — use relative paths."
 	if t.language != "" {
-		desc = fmt.Sprintf("Execute a shell command in a %s sandbox.", t.language)
+		desc = fmt.Sprintf("Execute a shell command in a %s sandbox. CWD is the workspace root.", t.language)
 	}
 	if t.workDir != "" {
-		desc += fmt.Sprintf(" Working directory: %s.", t.workDir)
+		desc += fmt.Sprintf(" (CWD: %s)", t.workDir)
 	}
 	if t.sandbox == nil {
 		desc += " [UNAVAILABLE: no sandbox configured]"
