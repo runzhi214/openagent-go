@@ -219,12 +219,13 @@ func buildGoalInstructions(original, goal string, maxTurns int) string {
 
 // RunResult is the output of an Agent.Run call.
 type RunResult struct {
-	AgentName   string    // name of the agent that produced this result
-	Messages    []Message // all messages from this run
-	FinalOutput string    // last assistant message content
-	TurnCount   int
-	Usage       Usage  // total tokens used
-	StopReason  string // "end_turn", "refusal", "cancelled", etc. (ACP agents)
+	AgentName     string    // name of the agent that produced this result
+	Messages      []Message // all messages from this run
+	FinalOutput   string    // last assistant message content
+	TurnCount     int
+	Usage         Usage  // total tokens used
+	ContextWindow int    // model's context window size (0 if unknown)
+	StopReason    string // "end_turn", "refusal", "cancelled", etc. (ACP agents)
 }
 
 // ── Stream events ──

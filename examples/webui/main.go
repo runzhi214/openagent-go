@@ -151,16 +151,18 @@ func main() {
 // ── Shared types ──
 
 type sseEvent struct {
-	Type       string          `json:"type"`
-	Text       string          `json:"text,omitempty"`
-	Agent      string          `json:"agent,omitempty"`
-	ToolCall   *toolCallJSON   `json:"tool_call,omitempty"`
-	ToolCallID string          `json:"tool_call_id,omitempty"`
-	HandoffTo  string          `json:"handoff_to,omitempty"`
-	StepID     string          `json:"step_id,omitempty"`
-	PlanDef    json.RawMessage `json:"plan_def,omitempty"` // plan_generated
-	Error      string          `json:"error,omitempty"`
-	Stage      json.RawMessage `json:"stage,omitempty"` // stage event detail (pipeline panel)
+	Type         string          `json:"type"`
+	Text         string          `json:"text,omitempty"`
+	Agent        string          `json:"agent,omitempty"`
+	ToolCall     *toolCallJSON   `json:"tool_call,omitempty"`
+	ToolCallID   string          `json:"tool_call_id,omitempty"`
+	HandoffTo    string          `json:"handoff_to,omitempty"`
+	StepID       string          `json:"step_id,omitempty"`
+	PlanDef      json.RawMessage `json:"plan_def,omitempty"` // plan_generated
+	Error        string          `json:"error,omitempty"`
+	Stage        json.RawMessage `json:"stage,omitempty"`    // stage event detail (pipeline panel)
+	PromptTokens int             `json:"prompt_tokens,omitempty"`
+	ContextWindow int            `json:"context_window,omitempty"`
 }
 
 // stageData is the JSON payload for "stage" SSE events.
@@ -1192,7 +1194,13 @@ func streamToSSE(evt openagent.StreamEvent) sseEvent {
 	case openagent.StreamRetrying:
 		return sseEvent{Type: "retrying", Text: evt.Error.Error()}
 	case openagent.StreamDone:
-		return sseEvent{Type: "done", Text: evt.Result.FinalOutput}
+		se := sseEvent{Type: "done", Text: evt.Result.FinalOutput}
+		if evt.Result != nil {
+			se.PromptTokens = evt.Result.Usage.PromptTokens
+			se.ContextWindow = evt.Result.ContextWindow
+			log.Printf("usage: prompt=%d ctx_window=%d", evt.Result.Usage.PromptTokens, evt.Result.ContextWindow)
+		}
+		return se
 	case openagent.StreamError:
 		return sseEvent{Type: "error", Text: evt.Error.Error()}
 	}

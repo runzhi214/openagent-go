@@ -75,7 +75,9 @@ type SSEEvent struct {
 	ToolCallID string `json:"tool_call_id,omitempty"`
 
 	// done
-	FinalOutput string `json:"final_output,omitempty"`
+	FinalOutput   string `json:"final_output,omitempty"`
+	PromptTokens  int    `json:"prompt_tokens,omitempty"`
+	ContextWindow int    `json:"context_window,omitempty"`
 
 	// agent_start, agent_end (team mode)
 	Agent string `json:"agent,omitempty"`

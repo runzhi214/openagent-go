@@ -340,6 +340,7 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 	}
 
 	result.TurnCount = turn
+		result.ContextWindow = r.agent.Model.ContextWindow()
 	if ch != nil {
 		ch <- StreamEvent{Type: StreamDone, Result: result}
 	}

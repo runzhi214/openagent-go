@@ -387,11 +387,13 @@ func streamToSSE(evt openagent.StreamEvent) SSEEvent {
 		return SSEEvent{Type: "retrying", Text: msg}
 
 	case openagent.StreamDone:
-		output := ""
+		se := SSEEvent{Type: "done"}
 		if evt.Result != nil {
-			output = evt.Result.FinalOutput
+			se.FinalOutput = evt.Result.FinalOutput
+			se.PromptTokens = evt.Result.Usage.PromptTokens
+			se.ContextWindow = evt.Result.ContextWindow
 		}
-		return SSEEvent{Type: "done", FinalOutput: output}
+		return se
 
 	case openagent.StreamError:
 		msg := "unknown error"

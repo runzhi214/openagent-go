@@ -158,6 +158,12 @@ body{font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgr
 .pnode-rect.done .pn-bg{animation:popIn .35s ease-out}
 .pnode-rect.error .pn-bg{animation:popIn .35s ease-out}
 .pinfo-text{fill:#3a3f4a;font-size:9px;text-anchor:end}
+#usage-bar{display:none;align-items:center;gap:10px;padding:6px 16px;font-size:12px;color:#c9d1d9;background:#161b22;border-top:1px solid #21262d}
+#usage-bar.visible{display:flex}
+#usage-bar .usage-pct{font-weight:600;color:#58a6ff;min-width:42px}
+#usage-bar .usage-outer{flex:1;max-width:200px;height:6px;background:#21262d;border-radius:3px;overflow:hidden}
+#usage-bar .usage-inner{height:100%;background:linear-gradient(90deg,#58a6ff,#3fb950);border-radius:3px;transition:width .4s ease}
+#usage-bar .usage-info{font-size:11px;color:#8b949e;margin-left:auto}
 </style>
 </head>
 <body>
@@ -170,6 +176,7 @@ body{font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgr
 </div>
 <div id="main">
   <div id="msgs"><div class="empty-state">Select or create a session to start chatting</div></div>
+  <div id="usage-bar"><span class="usage-pct"></span><span class="usage-outer"><span class="usage-inner"></span></span><span class="usage-info"></span></div>
   <div id="pipeline-wrap"><svg id="pipeline-svg"></svg></div>
   <div id="input-box">
     <div id="input-wrap">
@@ -455,6 +462,15 @@ function connect() {
       case 'done':
         streamEl = null; running = false;
         document.getElementById('send').disabled = false;
+        if (msg.context_window) {
+          var tokens = msg.prompt_tokens || 0;
+          var pct = (tokens / msg.context_window * 100).toFixed(1);
+          var ub = document.getElementById('usage-bar');
+          ub.classList.add('visible');
+          ub.querySelector('.usage-pct').textContent = pct + '%';
+          ub.querySelector('.usage-inner').style.width = Math.min(pct, 100) + '%';
+          ub.querySelector('.usage-info').textContent = tokens.toLocaleString() + ' / ' + (msg.context_window/1000).toFixed(0) + 'K tokens';
+        }
         break;
       case 'error':
         append('agent', 'Error: ' + (msg.error || msg.text));
