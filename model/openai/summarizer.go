@@ -15,8 +15,9 @@ import (
 
 // Summarizer implements openagent.Summarizer via OpenAI ChatCompletion.
 type Summarizer struct {
-	client  openaisdk.Client
-	modelID string
+	client   openaisdk.Client
+	modelID  string
+	maxTokens int // 0 = default (1024)
 }
 
 // NewSummarizer creates a Summarizer. modelID defaults to the same model
@@ -29,6 +30,14 @@ func NewSummarizer(apiKey, modelID, baseURL string) *Summarizer {
 		),
 		modelID: modelID,
 	}
+}
+
+// WithMaxTokens sets the max output tokens for summarization.
+// Default is 1024. Set this to match the agent's MaxCompressedTokens
+// to keep the summary within the configured budget.
+func (s *Summarizer) WithMaxTokens(n int) *Summarizer {
+	s.maxTokens = n
+	return s
 }
 
 // Summarize compresses messages into a summary with retrieval hints.
@@ -63,6 +72,10 @@ func (s *Summarizer) Summarize(ctx context.Context, messages []openagent.Message
 		systemPrompt = summarizerIncrementalPrompt(previous)
 	}
 
+	maxTok := s.maxTokens
+	if maxTok <= 0 {
+		maxTok = 1024
+	}
 	params := openaisdk.ChatCompletionNewParams{
 		Model: openaisdk.ChatModel(s.modelID),
 		Messages: []openaisdk.ChatCompletionMessageParamUnion{
@@ -70,7 +83,7 @@ func (s *Summarizer) Summarize(ctx context.Context, messages []openagent.Message
 			openaisdk.UserMessage(transcript.String()),
 		},
 		Temperature: param.NewOpt(0.3),
-		MaxTokens:   param.NewOpt(int64(1024)),
+		MaxTokens:   param.NewOpt(int64(maxTok)),
 	}
 
 	completion, err := s.client.Chat.Completions.New(ctx, params)

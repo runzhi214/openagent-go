@@ -793,6 +793,7 @@ func (h *hub) handlePlanExecute(w http.ResponseWriter, r *http.Request) {
 			runner = openagent.NewAgent(ag.Name,
 				openagent.WithModel(ag.Model),
 				openagent.WithInstructions(ag.Instructions),
+				openagent.WithMemory(h.mem),
 				openagent.WithMaxTurns(ag.MaxTurns),
 				openagent.WithTools(ag.Tools...),
 				openagent.WithRunObserver(&webuiObserver{bus: h.bus, sid: body.Session}),
@@ -1199,6 +1200,15 @@ func streamToSSE(evt openagent.StreamEvent) sseEvent {
 			se.Text = evt.Error.Error()
 		}
 		return se
+
+	case openagent.StreamToolProgress:
+		return sseEvent{Type: "tool_progress", Text: evt.Text, ToolCallID: evt.ToolCallID}
+
+	case openagent.StreamAborted:
+		se := sseEvent{Type: "aborted"}
+		if evt.Error != nil {
+			se.Text = evt.Error.Error()
+		}
 		return se
 
 	case openagent.StreamDone:
@@ -1423,7 +1433,10 @@ func (h *teamHub) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	sub := h.bus.Subscribe(sid)
+	// SubscribeLive — no history replay. Team events are live-only;
+	// replaying old terminal events (done/error) would close the SSE
+	// connection before the current chat's events arrive.
+	sub := h.bus.SubscribeLive(sid)
 	defer h.bus.Unsubscribe(sid, sub)
 
 	for {

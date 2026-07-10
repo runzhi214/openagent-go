@@ -106,8 +106,8 @@ func (m *Memory) Recent(ctx context.Context, sessionID string, n int) ([]openage
 		return nil, err
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	all, err := m.readAllLocked(ctx, sessionID)
 	if err != nil {
@@ -193,9 +193,9 @@ func (m *Memory) Search(ctx context.Context, sessionID, query string, limit int)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	m.mu.Lock()
+	m.mu.RLock()
 	all, err := m.readAllLocked(ctx, sessionID)
-	m.mu.Unlock()
+	m.mu.RUnlock()
 	if err != nil {
 		return nil, err
 	}
@@ -284,26 +284,6 @@ func (m *Memory) readAllLocked(ctx context.Context, sessionID string) ([]openage
 		msgs = append(msgs, msg)
 	}
 	return msgs, scanner.Err()
-}
-
-// writeAllLocked overwrites the session file. Caller must hold m.mu.
-func (m *Memory) writeAllLocked(sessionID string, msgs []openagent.Message) error {
-	f, err := os.Create(m.sessionPath(sessionID))
-	if err != nil {
-		return fmt.Errorf("file memory write: %w", err)
-	}
-	defer f.Close()
-
-	for _, msg := range msgs {
-		b, err := json.Marshal(msg)
-		if err != nil {
-			return err
-		}
-		if _, err := f.Write(append(b, '\n')); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (m *Memory) writeCompressed(sessionID string, cc *openagent.CompressedContext) error {

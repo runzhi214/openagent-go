@@ -376,7 +376,12 @@ func (r *runner) prepareMemory(ctx context.Context, session Session) []Message {
 	// Fetch total count and recent messages — one Recent() call for both
 	// compaction and working-set trimming.
 	totalCount, err := r.agent.Memory.Count(ctx, session.ID)
-	if err != nil || totalCount == 0 {
+	if err != nil {
+		r.observe(ctx, StageMemoryFetch, "leave",
+			map[string]any{"error": err.Error()}, time.Now(), err)
+		return nil
+	}
+	if totalCount == 0 {
 		return nil
 	}
 	fetchN := totalCount
@@ -752,6 +757,7 @@ func toolDefinitions(tools []Tool) []FunctionDefinition {
 // tokenizer is unavailable.
 func countMessageTokens(modelID string, m Message) int {
 	n := tokenizer.Count(modelID, m.Content)
+	n += tokenizer.Count(modelID, m.ReasoningContent)
 	for _, tc := range m.ToolCalls {
 		n += tokenizer.Count(modelID, tc.Function.Name)
 		n += tokenizer.Count(modelID, tc.Function.Arguments)
