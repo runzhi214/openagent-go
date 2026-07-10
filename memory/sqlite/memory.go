@@ -32,7 +32,6 @@ type Memory struct {
 	db            *sql.DB
 	embedder      openagent.Embedder
 	summarizer    openagent.Summarizer
-	workingN      int
 	maxVectorScan int // max rows to scan for vector similarity, default 2000
 }
 
@@ -44,7 +43,7 @@ func New(path string) (*Memory, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open: %w", err)
 	}
-	m := &Memory{db: db, workingN: 20, maxVectorScan: 2000}
+	m := &Memory{db: db, maxVectorScan: 2000}
 	if err := m.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -58,15 +57,10 @@ func (m *Memory) WithEmbedder(e openagent.Embedder) *Memory {
 	return m
 }
 
-// WithSummarizer enables auto-compaction. nil (default) disables it.
+// WithSummarizer enables compaction. nil (default) disables it. The Runner
+// triggers compaction via Compact() when the working set exceeds the token budget.
 func (m *Memory) WithSummarizer(s openagent.Summarizer) *Memory {
 	m.summarizer = s
-	return m
-}
-
-// WithWorkingMemN sets the max uncompressed messages before compaction. Default 20.
-func (m *Memory) WithWorkingMemN(n int) *Memory {
-	m.workingN = n
 	return m
 }
 
@@ -126,6 +120,18 @@ func (m *Memory) DeleteSession(ctx context.Context, sessionID string) error {
 
 // ── openagent.Memory ──
 
+// Count returns the total number of messages for a session.
+func (m *Memory) Count(ctx context.Context, sessionID string) (int, error) {
+	var count int
+	err := m.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM messages WHERE session_id = ?`, sessionID,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite count: %w", err)
+	}
+	return count, nil
+}
+
 func (m *Memory) Append(ctx context.Context, sessionID string, msg openagent.Message) error {
 	toolCallsJSON, _ := json.Marshal(msg.ToolCalls)
 	if toolCallsJSON == nil {
@@ -181,48 +187,6 @@ func (m *Memory) Append(ctx context.Context, sessionID string, msg openagent.Mes
 }
 
 func (m *Memory) Recent(ctx context.Context, sessionID string, n int) ([]openagent.Message, error) {
-	// Count first
-	var count int
-	if err := m.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM messages WHERE session_id = ?`, sessionID,
-	).Scan(&count); err != nil {
-		return nil, fmt.Errorf("sqlite recent: %w", err)
-	}
-
-	// Auto-compact if summarizer is set and over the limit
-	if m.summarizer != nil && count > m.workingN {
-		limit := count - m.workingN
-		rows, err := m.db.QueryContext(ctx,
-			`SELECT role, content, content_parts, tool_calls, tool_call_id
-			 FROM messages WHERE session_id = ?
-			 ORDER BY id ASC LIMIT ?`,
-			sessionID, limit,
-		)
-		if err == nil {
-			old, _ := scanMessages(rows)
-			rows.Close()
-			if len(old) > 0 {
-				if cc, err := m.summarizer.Summarize(ctx, old); err == nil {
-					m.storeCompressed(ctx, sessionID, cc)
-					// Delete FTS5 entries first (they lack foreign keys).
-					// vectors rows cascade automatically via PRAGMA foreign_keys=ON.
-					m.db.ExecContext(ctx,
-						`DELETE FROM messages_fts WHERE rowid IN
-						 (SELECT id FROM messages WHERE session_id = ?
-						  ORDER BY id ASC LIMIT ?)`,
-						sessionID, limit,
-					)
-					m.db.ExecContext(ctx,
-						`DELETE FROM messages WHERE id IN
-						 (SELECT id FROM messages WHERE session_id = ?
-						  ORDER BY id ASC LIMIT ?)`,
-						sessionID, limit,
-					)
-				}
-			}
-		}
-	}
-
 	// Fetch most recent messages in reverse-chronological order,
 	// then reverse to chronological. Fetch 2×n so we can trim
 	// incomplete tool_call/tool_result pairs at boundaries.
@@ -264,6 +228,83 @@ func (m *Memory) Recent(ctx context.Context, sessionID string, n int) ([]openage
 	}
 
 	return msgs, nil
+}
+
+// Compact compresses messages up to throughIndex into a summary. The Runner
+// calls this when the working set exceeds the token budget. Compression is
+// incremental (rolling): new overflow messages are summarized together with
+// the previous CompressedContext. Original messages are NEVER deleted.
+func (m *Memory) Compact(ctx context.Context, sessionID string, throughIndex int, messages []openagent.Message) error {
+	if m.summarizer == nil {
+		return nil
+	}
+
+	// Load previous compression marker.
+	prev, _ := m.Compressed(ctx, sessionID)
+	lastIdx := 0
+	if prev != nil {
+		lastIdx = prev.ThroughIndex
+	}
+
+	if lastIdx >= throughIndex {
+		return nil // nothing new to compress
+	}
+
+	// Use pre-fetched messages if available, otherwise query.
+	var all []openagent.Message
+	if messages != nil {
+		all = messages
+	} else {
+		var count int
+		if err := m.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM messages WHERE session_id = ?`, sessionID,
+		).Scan(&count); err != nil {
+			return fmt.Errorf("sqlite compact: %w", err)
+		}
+		if count == 0 || throughIndex <= 0 || throughIndex > count {
+			return nil
+		}
+		fetchCount := throughIndex + 20
+		if fetchCount > count {
+			fetchCount = count
+		}
+		rows, err := m.db.QueryContext(ctx,
+			`SELECT role, content, content_parts, tool_calls, tool_call_id
+			 FROM messages WHERE session_id = ?
+			 ORDER BY id ASC LIMIT ?`,
+			sessionID, fetchCount,
+		)
+		if err != nil {
+			return fmt.Errorf("sqlite compact: %w", err)
+		}
+		all, _ = scanMessages(rows)
+		rows.Close()
+	}
+
+	if len(all) == 0 || throughIndex > len(all) {
+		return nil
+	}
+
+	// Adjust to safe boundary (don't cut tool_call/tool_result pairs).
+	safeIdx := openagent.SafeCompressionBoundary(all, throughIndex)
+	if safeIdx <= 0 || safeIdx > len(all) {
+		return nil
+	}
+
+	// Only compress newly overflowed messages.
+	if lastIdx < safeIdx {
+		newMsgs := all[lastIdx:safeIdx]
+		cc, sumErr := m.summarizer.Summarize(ctx, newMsgs, prev)
+		if sumErr != nil {
+			return sumErr
+		}
+		if cc != nil {
+			cc.ThroughIndex = safeIdx
+			m.storeCompressed(ctx, sessionID, cc)
+		}
+	}
+
+	return nil
 }
 
 func (m *Memory) Compressed(ctx context.Context, sessionID string) (*openagent.CompressedContext, error) {
@@ -384,11 +425,13 @@ func (m *Memory) vectorSearch(ctx context.Context, sessionID, query string, limi
 }
 
 func (m *Memory) ftsSearch(ctx context.Context, sessionID, query string, limit int) ([]openagent.SearchResult, error) {
-	// Escape FTS5 query: wrap in double quotes
-	ftsQuery := `"` + strings.ReplaceAll(query, `"`, `""`) + `"`
+	// Pass query directly to FTS5. It tokenizes, stems, and ranks
+	// natively. Only strip characters that break FTS5 query syntax.
+	ftsQuery := strings.ReplaceAll(query, "\x00", " ")
+	ftsQuery = strings.ReplaceAll(ftsQuery, `"`, " ")
 
 	rows, err := m.db.QueryContext(ctx,
-		`SELECT m.role, m.content, m.tool_calls, m.tool_call_id
+		`SELECT m.role, m.content, m.content_parts, m.tool_calls, m.tool_call_id
 		 FROM messages_fts f
 		 JOIN messages m ON f.rowid = m.id
 		 WHERE m.session_id = ? AND messages_fts MATCH ?

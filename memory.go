@@ -7,11 +7,14 @@ import (
 
 // Memory stores and retrieves conversation history. Three-layer model:
 //
-//	Layer 1: Working    — recent N turns, kept verbatim in context.
-//	                       Recent() auto-compacts when messages exceed the limit.
-//	Layer 2: Compressed — summary + retrieval hints for older turns.
-//	                       Updated automatically by Recent() when Summarizer is configured.
-//	Layer 3: Archive    — full history, searchable on demand via Search().
+//	Layer 1: Working    — recent context, kept verbatim. The Runner manages
+//	                       the working set by token budget, not message count.
+//	                       Recent() is a pure query — it does not trigger compaction.
+//	Layer 2: Compressed — summary + retrieval hints for history beyond Working.
+//	                       Updated by Compact() when the Runner detects the working
+//	                       set exceeds the token budget (incremental/rolling compression).
+//	Layer 3: Archive    — full history, searchable on demand via Search() and
+//	                       the recall_memory tool. Original messages are NEVER deleted.
 //
 // All methods are scoped by sessionID. nil Memory = no persistence,
 // each run starts fresh.
@@ -23,14 +26,22 @@ import (
 type Memory interface {
 	io.Closer
 
-	// Layer 1: Working memory — most recent N turns, uncompressed.
-	// If a Summarizer is configured and stored messages exceed the limit,
-	// old messages are automatically compressed and the result is saved
-	// via Layer 2.
+	// Layer 1: Working memory — returns up to n most recent messages.
+	// Pure query, no side effects. The Runner manages compaction separately
+	// via Compact() based on token budget.
 	Recent(ctx context.Context, sessionID string, n int) ([]Message, error)
 
-	// Layer 2: Compressed context — summary + hints for history beyond Working.
-	// Returns nil, nil if no compression has occurred yet.
+	// Count returns the total number of stored messages for a session.
+	Count(ctx context.Context, sessionID string) (int, error)
+
+	// Layer 2: Compact compresses messages up to throughIndex into a summary.
+	// messages is an optional pre-fetched slice (from the caller) to avoid
+	// a redundant read. When nil, the backend fetches messages internally.
+	// The backend records throughIndex as the new ThroughIndex marker.
+	// Original messages are NEVER deleted.
+	Compact(ctx context.Context, sessionID string, throughIndex int, messages []Message) error
+
+	// Compressed returns the stored CompressedContext, or nil if none exists.
 	Compressed(ctx context.Context, sessionID string) (*CompressedContext, error)
 
 	// Layer 3: Archive search — full-text / vector search over all stored messages.
@@ -40,15 +51,20 @@ type Memory interface {
 	Append(ctx context.Context, sessionID string, msg Message) error
 
 	// DeleteSession removes all data for the given session. After this call,
-	// Recent, Compressed, Search, and Append all operate on a clean slate.
+	// Recent, Compressed, Search, Compact, and Append all operate on a clean slate.
 	// It is safe to call on a session that doesn't exist.
 	DeleteSession(ctx context.Context, sessionID string) error
 }
 
 // CompressedContext bundles a summary with retrieval hints for the model.
 type CompressedContext struct {
-	Summary string          `json:"summary"`
-	Hints   []RetrievalHint `json:"hints"`
+	Summary      string          `json:"summary"`
+	Hints        []RetrievalHint `json:"hints"`
+	ThroughIndex int             `json:"through_index"`
+	// ThroughIndex marks how many messages have been covered by this summary.
+	// The next compression pass only compresses messages after this index.
+	// 0 means no compression has occurred (or the summary was produced by
+	// an older version that didn't track this value).
 }
 
 // SearchResult is a single match from Memory.Search.
@@ -56,4 +72,35 @@ type SearchResult struct {
 	Message  Message `json:"message"`
 	Score    float64 `json:"score"`
 	Turn     int     `json:"turn"`
+}
+
+// SafeCompressionBoundary adjusts the overflow index so compression doesn't
+// break tool_call/tool_result pairs. If the last message in the compression
+// range is an assistant with tool_calls, the boundary extends forward to
+// include all consecutive tool results so the summary captures the complete
+// tool exchange. all is in chronological order.
+//
+// Returns the adjusted overflow index (may be larger than input).
+func SafeCompressionBoundary(all []Message, overflow int) int {
+	if overflow <= 0 || overflow >= len(all) {
+		return overflow
+	}
+
+	lastCompressed := all[overflow-1]
+
+	// If the last compressed message is an assistant with tool_calls,
+	// its tool results (RoleTool) are in the working window. Extend
+	// the boundary to include them so the summary captures the complete
+	// tool exchange.
+	if lastCompressed.Role == RoleAssistant && len(lastCompressed.ToolCalls) > 0 {
+		for i := overflow; i < len(all); i++ {
+			if all[i].Role == RoleTool {
+				overflow = i + 1
+			} else {
+				break
+			}
+		}
+	}
+
+	return overflow
 }

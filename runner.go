@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yusheng-g/openagent-go/tokenizer"
 )
 
 // runner is the internal mainline loop executor. Users call Agent.Run(),
@@ -19,8 +21,7 @@ type runner struct {
 	skills       []SkillInfo         // Discover result, refreshed by reload_skills
 	loadedSkills map[string]string   // name → body, populated by use_skill
 	builtinTools []FunctionDefinition // auto-injected tools (use_skill, reload_skills)
-	facts        []string            // Memory.Search result, set once on turn 1
-	compressed   *CompressedContext  // Memory.Compressed result, set once on turn 1
+	compressed   *CompressedContext  // Memory.Compressed result, set once per Run()
 }
 
 // observe emits a stage event to the agent's RunObserver if configured.
@@ -55,6 +56,9 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 		r.skills = skills
 		r.loadedSkills = make(map[string]string)
 		r.builtinTools = builtinSkillToolDefs()
+	}
+	if r.agent.Memory != nil {
+		r.builtinTools = append(r.builtinTools, builtinRecallDef)
 	}
 
 	result := &RunResult{
@@ -110,6 +114,10 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 		// ── ① Build working message set on first turn ──
 		// Order: memory history → prefix (transient, not persisted) → input
 		if turn == 1 {
+			// Token-based compaction: compress overflow before fetching
+			// the working set. Compact() is explicit; Recent() is pure query.
+			r.compactIfNeeded(ctx, session)
+
 			mfStart := time.Now()
 			r.observe(ctx, StageMemoryFetch, "enter", nil, time.Time{}, nil)
 
@@ -117,15 +125,12 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 			var compErr error
 			if r.agent.Memory != nil {
 				history = r.fetchMemory(ctx, session)
-				// history may include the just-appended input.
-				// Strip it if present — we add it back after prefix.
-				// Use content matching rather than assuming position
-				// (async backends may not have persisted yet).
-				if len(history) > 0 && history[len(history)-1].Role == RoleUser &&
-					history[len(history)-1].Content == input.Content {
+				// The input was just appended to memory — strip it
+				// from history since we add it back after prefix.
+				if len(history) > 0 && history[len(history)-1].Role == RoleUser {
 					history = history[:len(history)-1]
 				}
-				r.facts = r.searchMemory(ctx, session, input)
+
 
 				// Fetch compressed context (Layer 2 of the memory model).
 				// Errors are collected and reported in the leave event below —
@@ -190,7 +195,7 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 
 		// Warn if approaching the model context window.
 		if cw := r.agent.Model.ContextWindow(); cw > 0 {
-			est := estimateTokens(messages)
+			est := countMessages(session.ModelID, messages)
 			if est > cw {
 				r.observe(ctx, StageModelCall, "enter",
 					map[string]any{"warning": "context window exceeded", "estimated_tokens": est, "window": cw},
@@ -343,34 +348,108 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 
 // ── Internal helpers ──
 
+// workingTokenBudget returns the token budget for the working message set.
+// If MaxWorkingTokens is set explicitly, use it. Otherwise, use 70% of the
+// model's context window. Falls back to 20000 if the model doesn't report
+// its context window.
+func (r *runner) workingTokenBudget() int {
+	if r.agent.MaxWorkingTokens > 0 {
+		return r.agent.MaxWorkingTokens
+	}
+	if cw := r.agent.Model.ContextWindow(); cw > 0 {
+		return cw * 7 / 10 // 70%
+	}
+	return 20000
+}
+
+// compactIfNeeded triggers incremental compression when the working set
+// exceeds the token budget. It determines the cutoff point by counting
+// tokens backward from the most recent message, then adjusts to a safe
+// boundary (not cutting tool_call/tool_result pairs) before calling
+// Memory.Compact(). Messages are NEVER deleted.
+func (r *runner) compactIfNeeded(ctx context.Context, session Session) {
+	if r.agent.Memory == nil {
+		return
+	}
+
+	budget := r.workingTokenBudget()
+
+	// Fetch total count and recent messages for token counting.
+	totalCount, err := r.agent.Memory.Count(ctx, session.ID)
+	if err != nil || totalCount == 0 {
+		return
+	}
+	// Fetch enough to cover the token budget. At ~4 token/chars with
+	// ~100 tokens/msg, 5000 messages > any practical context window.
+	fetchN := totalCount
+	if fetchN > 5000 {
+		fetchN = 5000
+	}
+	msgs, err := r.agent.Memory.Recent(ctx, session.ID, fetchN)
+	if err != nil || len(msgs) == 0 {
+		return
+	}
+
+	// Count tokens backward to find the working set boundary.
+	tokens := 0
+	cutoff := len(msgs)
+	for i := len(msgs) - 1; i >= 0; i-- {
+		tokens += countMessageTokens(session.ModelID, msgs[i])
+		if tokens > budget {
+			cutoff = i + 1 // messages before this index are overflow
+			break
+		}
+	}
+
+	if cutoff == 0 {
+		return // nothing overflows
+	}
+
+	// Ensure safe boundary (don't cut tool_call/tool_result pairs).
+	cutoff = SafeCompressionBoundary(msgs, cutoff)
+	if cutoff == 0 {
+		return
+	}
+
+	// Convert slice-relative cutoff to global throughIndex.
+	// msgs represents positions [totalCount - fetchN, totalCount) or
+	// [0, totalCount) if fetchN >= totalCount.
+	globalOffset := totalCount - len(msgs)
+	globalCutoff := globalOffset + cutoff
+
+	// Pass the full message set to Compact to avoid a redundant read.
+	// Compact reads from the backend only when msgs doesn't cover the full
+	// range up to throughIndex (we use Recent fetch for the full set when
+	// fetchN >= totalCount, which is the common case).
+	_ = r.agent.Memory.Compact(ctx, session.ID, globalCutoff, msgs)
+}
+
 func (r *runner) fetchMemory(ctx context.Context, session Session) []Message {
 	if r.agent.Memory == nil {
 		return nil
 	}
-	n := r.agent.WorkingMemN
-	if n <= 0 {
-		n = 10
-	}
-	msgs, err := r.agent.Memory.Recent(ctx, session.ID, n)
-	if err != nil {
+	// Fetch generously, then trim by token budget.
+	// 5000 messages at ~100 tokens/msg covers any practical context window.
+	msgs, err := r.agent.Memory.Recent(ctx, session.ID, 5000)
+	if err != nil || len(msgs) == 0 {
 		return nil
+	}
+
+	budget := r.workingTokenBudget()
+	// Count tokens backward from most recent; trim when budget exceeded.
+	tokens := 0
+	for i := len(msgs) - 1; i >= 0; i-- {
+		tokens += countMessageTokens(session.ModelID, msgs[i])
+		if tokens > budget {
+			// Trim at safe boundary to not break tool pairs.
+			cutoff := SafeCompressionBoundary(msgs, i+1)
+			if cutoff > i+1 && cutoff <= len(msgs) {
+				return msgs[cutoff:]
+			}
+			return msgs[i+1:]
+		}
 	}
 	return msgs
-}
-
-func (r *runner) searchMemory(ctx context.Context, session Session, input Message) []string {
-	if r.agent.Memory == nil {
-		return nil
-	}
-	results, err := r.agent.Memory.Search(ctx, session.ID, input.Content, 5)
-	if err != nil || len(results) == 0 {
-		return nil
-	}
-	facts := make([]string, len(results))
-	for i, sr := range results {
-		facts[i] = sr.Message.Content
-	}
-	return facts
 }
 
 func (r *runner) buildPrompt(ctx context.Context, session Session, working []Message) []Message {
@@ -386,10 +465,6 @@ func (r *runner) buildPrompt(ctx context.Context, session Session, working []Mes
 
 	if r.compressed != nil {
 		input.Compressed = r.compressed
-	}
-
-	if len(r.facts) > 0 {
-		input.RelevantFacts = r.facts
 	}
 
 	if len(r.skills) > 0 {
@@ -420,17 +495,6 @@ func defaultBuildPrompt(input PromptInput) []Message {
 
 	if input.ProjectContext != "" {
 		msgs = append(msgs, Message{Role: RoleSystem, Content: input.ProjectContext})
-	}
-
-	if len(input.RelevantFacts) > 0 {
-		var facts string
-		for i, f := range input.RelevantFacts {
-			facts += fmt.Sprintf("%d. %s\n", i+1, f)
-		}
-		msgs = append(msgs, Message{
-			Role:    RoleSystem,
-			Content: "## Relevant Context\n" + facts,
-		})
 	}
 
 	if input.Compressed != nil && input.Compressed.Summary != "" {
@@ -571,6 +635,11 @@ func (r *runner) executeOneTool(ctx context.Context, session Session, call ToolC
 		msg := r.executeReloadSkills(ctx, call)
 		r.fireToolHooksEnd(ctx, *def, args, msg.Content, toolStart, nil)
 		return msg
+	case "recall_memory":
+		toolStart := r.fireToolHooks(ctx, *def, args)
+		msg := r.executeRecall(ctx, session, call)
+		r.fireToolHooksEnd(ctx, *def, args, msg.Content, toolStart, nil)
+		return msg
 	}
 
 	tool := r.findTool(call.Function.Name)
@@ -662,6 +731,11 @@ var (
 		Description: "Rescan the skills directory for newly installed or removed skills. Use after installing or uninstalling a skill.",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
 	}
+	builtinRecallDef = FunctionDefinition{
+		Name:        "recall_memory",
+		Description: "Search past conversation history for relevant information. Use this when you need to remember previously discussed facts, user preferences, decisions, or context that may not be in the current conversation window. Returns ranked results with relevance scores.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"Search query to find relevant memories (e.g. 'user favourite colour', 'database version', 'project deadline')"}},"required":["query"]}`),
+	}
 )
 
 func (r *runner) findTool(name string) Tool {
@@ -681,6 +755,8 @@ func (r *runner) toolDef(name string) *FunctionDefinition {
 		return &builtinUseSkillDef
 	case "reload_skills":
 		return &builtinReloadSkillsDef
+	case "recall_memory":
+		return &builtinRecallDef
 	}
 	if t := r.findTool(name); t != nil {
 		d := t.Definition()
@@ -710,17 +786,26 @@ func toolDefinitions(tools []Tool) []FunctionDefinition {
 	return defs
 }
 
-// estimateTokens returns a rough token count for a set of messages.
-// Uses ~4 chars per token as a fast heuristic.
-func estimateTokens(msgs []Message) int {
+// countMessageTokens returns the token count for a message using the
+// model-specific tokenizer (tiktoken). Falls back to a heuristic if the
+// tokenizer is unavailable.
+func countMessageTokens(modelID string, m Message) int {
+	n := tokenizer.Count(modelID, m.Content)
+	for _, tc := range m.ToolCalls {
+		n += tokenizer.Count(modelID, tc.Function.Name)
+		n += tokenizer.Count(modelID, tc.Function.Arguments)
+	}
+	// Message formatting overhead: role prefix, JSON structure (~4 tokens).
+	return n + 4
+}
+
+// countMessages returns the total token count for a set of messages.
+func countMessages(modelID string, msgs []Message) int {
 	n := 0
 	for _, m := range msgs {
-		n += len(m.Content)
-		for _, tc := range m.ToolCalls {
-			n += len(tc.Function.Name) + len(tc.Function.Arguments)
-		}
+		n += countMessageTokens(modelID, m)
 	}
-	return n / 4
+	return n
 }
 
 // ── Streaming + retry ──
@@ -942,4 +1027,56 @@ func (r *runner) executeReloadSkills(ctx context.Context, call ToolCall) Message
 	}
 
 	return Message{Role: RoleTool, ToolCallID: call.ID, Content: summary}
+}
+
+// executeRecall handles the recall_memory builtin tool. It searches the agent's
+// memory backend and returns ranked results with relevance scores.
+func (r *runner) executeRecall(ctx context.Context, session Session, call ToolCall) Message {
+	var args struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil || args.Query == "" {
+		return Message{
+			Role:       RoleTool,
+			ToolCallID: call.ID,
+			Content:    "recall_memory: a non-empty 'query' is required",
+		}
+	}
+
+	if r.agent.Memory == nil {
+		return Message{
+			Role:       RoleTool,
+			ToolCallID: call.ID,
+			Content:    "recall_memory: memory is not configured",
+		}
+	}
+
+	results, err := r.agent.Memory.Search(ctx, session.ID, args.Query, 5)
+	if err != nil {
+		return Message{
+			Role:       RoleTool,
+			ToolCallID: call.ID,
+			Content:    fmt.Sprintf("recall_memory: search failed: %v", err),
+		}
+	}
+
+	if len(results) == 0 {
+		return Message{
+			Role:       RoleTool,
+			ToolCallID: call.ID,
+			Content:    fmt.Sprintf("recall_memory: no results found for %q", args.Query),
+		}
+	}
+
+	var buf strings.Builder
+	buf.WriteString(fmt.Sprintf("Found %d relevant memories for %q:\n\n", len(results), args.Query))
+	for i, r := range results {
+		if r.Score > 0 {
+			buf.WriteString(fmt.Sprintf("%d. [score: %.2f] %s\n", i+1, r.Score, r.Message.Content))
+		} else {
+			buf.WriteString(fmt.Sprintf("%d. %s\n", i+1, r.Message.Content))
+		}
+	}
+
+	return Message{Role: RoleTool, ToolCallID: call.ID, Content: buf.String()}
 }

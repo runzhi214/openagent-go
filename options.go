@@ -76,7 +76,16 @@ func WithMaxTurns(n int) AgentOption {
 	return func(a *Agent) { a.MaxTurns = n }
 }
 
-// WithWorkingMemory sets the number of recent turns kept in working memory.
-func WithWorkingMemory(n int) AgentOption {
-	return func(a *Agent) { a.WorkingMemN = n }
+// WithMaxWorkingTokens sets the max token budget for the working message set.
+// When exceeded, the runner triggers incremental compression via Memory.Compact().
+// 0 (default) means auto: 70% of the model's context window, or 20000 as fallback.
+func WithMaxWorkingTokens(n int) AgentOption {
+	return func(a *Agent) { a.MaxWorkingTokens = n }
+}
+
+// WithMaxCompressedTokens sets the maximum token budget for the compressed
+// summary. The summarizer will merge and de-duplicate facts when the budget
+// is exceeded. 0 means no explicit limit (default 2048).
+func WithMaxCompressedTokens(n int) AgentOption {
+	return func(a *Agent) { a.MaxCompressedTokens = n }
 }

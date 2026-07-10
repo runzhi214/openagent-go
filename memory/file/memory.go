@@ -7,8 +7,7 @@
 // Usage:
 //
 //	mem, err := file.New("/path/to/memory/dir")
-//	mem.WithWorkingMemN(10)                        // optional, default 20
-//	mem.WithSummarizer(openai.NewSummarizer(...))  // optional, enables auto-compaction
+//	mem.WithSummarizer(openai.NewSummarizer(...))  // optional, enables compaction
 //	agent := openagent.NewAgent("bot", openagent.WithMemory(mem))
 package file
 
@@ -29,9 +28,7 @@ import (
 type Memory struct {
 	dir        string
 	mu         sync.RWMutex
-	summarizer openagent.Summarizer // nil = no auto-compaction
-	workingN   int                  // max uncompressed messages
-
+	summarizer openagent.Summarizer // nil = compaction is a no-op
 }
 
 // New creates a Memory store at dir. Directory is created if missing.
@@ -39,19 +36,13 @@ func New(dir string) (*Memory, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("file memory: %w", err)
 	}
-	return &Memory{dir: dir, workingN: 20}, nil
+	return &Memory{dir: dir}, nil
 }
 
-// WithSummarizer enables auto-compaction. nil (default) disables it.
+// WithSummarizer enables compaction. nil (default) disables it. The Runner
+// triggers compaction via Compact() when the working set exceeds the token budget.
 func (m *Memory) WithSummarizer(s openagent.Summarizer) *Memory {
 	m.summarizer = s
-	return m
-}
-
-// WithWorkingMemN sets the max number of uncompressed messages before
-// auto-compaction kicks in. Default is 20.
-func (m *Memory) WithWorkingMemN(n int) *Memory {
-	m.workingN = n
 	return m
 }
 
@@ -67,6 +58,20 @@ func (m *Memory) DeleteSession(ctx context.Context, sessionID string) error {
 	_ = os.Remove(m.sessionPath(sessionID))
 	_ = os.Remove(m.compressedPath(sessionID))
 	return ctx.Err()
+}
+
+// Count returns the total number of messages for a session.
+func (m *Memory) Count(ctx context.Context, sessionID string) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	all, err := m.readAllLocked(ctx, sessionID)
+	if err != nil {
+		return 0, err
+	}
+	return len(all), nil
 }
 
 // Append writes a message to the session's JSONL file.
@@ -95,8 +100,7 @@ func (m *Memory) Append(ctx context.Context, sessionID string, msg openagent.Mes
 }
 
 // Recent returns the last n messages for a session, oldest first.
-// If a Summarizer is configured and stored messages exceed workingN,
-// old messages are automatically compressed and removed from the file.
+// Pure query — compaction is triggered separately via Compact() by the Runner.
 func (m *Memory) Recent(ctx context.Context, sessionID string, n int) ([]openagent.Message, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -110,26 +114,67 @@ func (m *Memory) Recent(ctx context.Context, sessionID string, n int) ([]openage
 		return nil, err
 	}
 
-	// Auto-compact if summarizer is set and we're over the limit
-	if m.summarizer != nil && len(all) > m.workingN {
-		split := len(all) - m.workingN
-		old, recent := all[:split], all[split:]
-
-		cc, err := m.summarizer.Summarize(ctx, old)
-		if err == nil {
-			// Persist compressed context
-			m.writeCompressed(sessionID, cc)
-			// Rewrite file with only recent messages
-			m.writeAllLocked(sessionID, recent)
-			all = recent
-		}
-		// On summarization error, keep all messages — no data loss
-	}
-
 	if len(all) <= n {
 		return all, nil
 	}
 	return all[len(all)-n:], nil
+}
+
+// Compact compresses messages up to throughIndex into a summary. The Runner
+// calls this when the working set exceeds the token budget. Compression is
+// incremental (rolling): new overflow messages are summarized together with
+// the previous CompressedContext. Original messages are NEVER deleted.
+//
+// messages is an optional pre-fetched slice to avoid a redundant read.
+// When nil, the backend fetches messages internally.
+func (m *Memory) Compact(ctx context.Context, sessionID string, throughIndex int, messages []openagent.Message) error {
+	if m.summarizer == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	all := messages
+	var err error
+	if all == nil {
+		all, err = m.readAllLocked(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+	}
+
+	if len(all) == 0 || throughIndex <= 0 || throughIndex > len(all) {
+		return nil
+	}
+
+	// Adjust to safe boundary (don't cut tool_call/tool_result pairs).
+	safeIdx := openagent.SafeCompressionBoundary(all, throughIndex)
+	if safeIdx <= 0 {
+		return nil
+	}
+
+	// Load previous compression marker for incremental compression.
+	prev, _ := m.readCompressed(sessionID)
+	lastIdx := 0
+	if prev != nil {
+		lastIdx = prev.ThroughIndex
+	}
+
+	// Only compress newly overflowed messages.
+	if lastIdx < safeIdx {
+		newMsgs := all[lastIdx:safeIdx]
+		cc, err := m.summarizer.Summarize(ctx, newMsgs, prev)
+		if err == nil && cc != nil {
+			cc.ThroughIndex = safeIdx
+			m.writeCompressed(sessionID, cc)
+		}
+	}
+
+	return nil
 }
 
 // Compressed returns the stored CompressedContext, or nil if none exists.
@@ -143,6 +188,7 @@ func (m *Memory) Compressed(ctx context.Context, sessionID string) (*openagent.C
 }
 
 // Search finds messages containing query as a case-insensitive substring.
+// This is the simplest possible search — no tokenization hacks.
 func (m *Memory) Search(ctx context.Context, sessionID, query string, limit int) ([]openagent.SearchResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

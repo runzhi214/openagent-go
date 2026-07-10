@@ -29,15 +29,14 @@ Both coexist. Compile-time interfaces are the "backbone"; runtime plugins are on
 Agent.Run(ctx, session, input)
   │
   ├─ turn 1 only:
-  │   ① Memory.Recent()     ← restore history + auto-compaction (Summarizer)
-  │   ① Memory.Search()     ← semantic / keyword retrieval
+  │   ① Memory.Compact()    ← token-based compaction (Runner-driven)
+ │      Memory.Recent()    ← pure query, no side effects
   │   ③ Guard.in.Check()    ← input safety check
   │
   └─ for turn in 1..maxTurns:
       ② PromptBuilder() or defaultBuildPrompt()
          ├─ system instructions
-         ├─ compressed summary + hints
-         ├─ relevant facts (from Search)
+         ├─ compressed summary + hints (auto-injected)
          ├─ skill catalog + loaded skills
          └─ working messages
       ④ Model.ChatCompletionStream()  → fallback ChatCompletion()
@@ -73,7 +72,8 @@ type Agent struct {
     Observer    RunObserver      // nil = no stage events
     SkillLoader SkillLoader
     MaxTurns    int             // default 20
-    WorkingMemN int             // default 10
+    MaxWorkingTokens    int    // default 0 = 70% of context window
+    MaxCompressedTokens int    // default 2048
 }
 
 agent.Run(ctx, session, input) → (*RunResult, error)
@@ -121,15 +121,17 @@ Pure data carrier. The application layer owns CRUD. The Runner does not create S
 ### ① Memory (Three-Layer Model)
 
 ```
-Layer 1: Working    — Recent() returns last N messages; triggers auto-compaction
-Layer 2: Compressed — Compressed() returns summary + hints; auto-updated by Layer 1
-Layer 3: Archive    — Search() full-text / vector; Append() writes
+Layer 1: Working    — Recent() pure query; Runner manages token budget via MaxWorkingTokens
+Layer 2: Compressed — Compressed() auto-injected; Compact() incremental/rolling via Summarizer
+Layer 3: Archive    — Search() + recall_memory tool; original messages NEVER deleted
 ```
 
 ```go
 type Memory interface {
     io.Closer
-    Recent(ctx, sessionID, n int) ([]Message, error)
+    Count(ctx, sessionID) (int, error)
+    Recent(ctx, sessionID, n int) ([]Message, error)                  // pure query
+    Compact(ctx, sessionID, throughIndex int, messages []Message) error  // Runner-driven
     Compressed(ctx, sessionID) (*CompressedContext, error)
     Search(ctx, sessionID, query string, limit int) ([]SearchResult, error)
     Append(ctx, sessionID, msg Message) error
@@ -137,7 +139,12 @@ type Memory interface {
 }
 ```
 
-The Runner does not know about compaction. `Recent()` internally: message count > workingN + Summarizer configured → call `Summarizer.Summarize()` → store `CompressedContext` → delete old messages → return trimmed result.
+The Runner drives compaction via token budget. It counts tokens backward from the
+most recent message against MaxWorkingTokens (default: 70% of model context window),
+adjusts to a safe boundary (not cutting tool_call/tool_result pairs via
+SafeCompressionBoundary), and calls Compact(). The backend compresses only newly
+overflowed messages with the previous summary for incremental/rolling compression.
+Original messages are NEVER deleted.
 
 Implementations: `memory/file` (JSONL, zero-dependency), `memory/sqlite` (SQLite + FTS5, optional vector search via `WithEmbedder`).
 
@@ -145,11 +152,13 @@ Implementations: `memory/file` (JSONL, zero-dependency), `memory/sqlite` (SQLite
 
 ```go
 type Summarizer interface {
-    Summarize(ctx context.Context, messages []Message) (*CompressedContext, error)
+    Summarize(ctx context.Context, messages []Message, previous *CompressedContext) (*CompressedContext, error)
 }
 ```
 
 nil = no compaction. Configured on Memory via `WithSummarizer()`.
+When previous is non-nil, this is incremental/rolling compression — the implementation
+should preserve existing facts and incorporate new messages.
 
 ### Embedder (Memory dependency)
 
@@ -171,7 +180,6 @@ type PromptInput struct {
     AgentName, AgentDescription, Instructions string
     WorkingMessages   []Message
     Compressed        *CompressedContext
-    RelevantFacts     []string
     Tools             []FunctionDefinition
     AvailableSkills   []SkillInfo
     LoadedSkills      map[string]string
@@ -286,10 +294,11 @@ Workflow: Discover → inject catalog into prompt → model calls `use_skill(nam
 The Runner is the sole mediator. Modules never call each other:
 
 ```
+Runner.compactIfNeeded:
+  → count tokens backward → adjust boundary → Memory.Compact()
 Runner.buildPrompt:
-  msgs = Memory.Recent()      ← Memory may call Summarizer internally
+  msgs = Memory.Recent()      ← pure query, no side effects
   cc   = Memory.Compressed()
-  facts = Memory.Search()      ← Memory may call Embedder internally
   input = PromptInput{...}
   result = PromptBuilder(input)
 
@@ -314,6 +323,7 @@ openagent-go/
 ├── tool.go               Tool interface + FunctionDefinition + StreamExecutor
 ├── sandbox.go            Sandbox interface + Command/Result types
 ├── memory.go             Memory interface + CompressedContext
+├── tokenizer/            Model-aware token counting (tiktoken)
 ├── prompt.go             PromptInput + PromptBuilder + RetrievalHint
 ├── guard.go              InputGuard / OutputGuard
 ├── approver.go           Approver
@@ -383,19 +393,21 @@ All interfaces in root package. Implementations in sub-packages. No circular dep
 
 **1. Why is Runner private?** Users call `Agent.Run()`, never construct a Runner. Runner is an internal implementation detail.
 
-**2. Why is compaction inside Memory?** The Runner should not know storage strategy. Memory manages when to compact and how to store summaries. Clean module boundary.
+**2. Why does the Runner trigger compaction?** Token budget depends on the model's context window, which only the Runner knows. The Runner counts tokens and decides when to compact; Memory just executes the compaction. Clean separation: Runner owns the decision, Memory owns the storage.
 
-**3. Why aren't Embedder/Summarizer on Agent?** They are Memory dependencies, not Agent capabilities. Memory decides whether it needs embeddings or summaries. Preserves "modules don't call each other".
+**3. Why no auto-search (RelevantFacts)?** Archive retrieval is model-driven via the `recall_memory` tool. The model decides when and what to search. Compressed context already provides passive reminders. Dual Archive search channels (auto + tool) are redundant.
 
-**4. Why streaming by default?** `callModelOnce` prefers `ChatCompletionStream`, falls back to non-streaming. Lowest time-to-first-token.
+**4. Why aren't Embedder/Summarizer on Agent?** They are Memory dependencies, not Agent capabilities. Memory decides whether it needs embeddings or summaries. Preserves "modules don't call each other".
 
-**5. Why is PromptBuilder a function type?** One method, no state. Function types are simpler.
+**5. Why streaming by default?** `callModelOnce` prefers `ChatCompletionStream`, falls back to non-streaming. Lowest time-to-first-token.
 
-**6. Why is Handoff a Tool rather than Router choosing each step?** The model has full context and makes better handoff decisions than a router. Router only does two things: initial message routing and policy vetoes.
+**6. Why is PromptBuilder a function type?** One method, no state. Function types are simpler.
 
-**7. Why inject hints instead of erroring on loops?** Two-layer loop detection: first give the model a hint ("you're in a loop, answer directly"), then remove transfer_to_* tools if it persists. Graceful degradation.
+**7. Why is Handoff a Tool rather than Router choosing each step?** The model has full context and makes better handoff decisions than a router. Router only does two things: initial message routing and policy vetoes.
 
-**8. Why independent Memory per Agent instead of shared Team Memory?** Keep it simple. Agent already supports independent Memory. Add shared memory later if needed, without breaking existing interfaces.
+**8. Why inject hints instead of erroring on loops?** Two-layer loop detection: first give the model a hint ("you're in a loop, answer directly"), then remove transfer_to_* tools if it persists. Graceful degradation.
+
+**9. Why independent Memory per Agent instead of shared Team Memory?** Keep it simple. Agent already supports independent Memory. Add shared memory later if needed, without breaking existing interfaces.
 
 ---
 
@@ -405,8 +417,8 @@ All interfaces in root package. Implementations in sub-packages. No circular dep
 
 | Node | Interface | Status | Notes |
 |------|-----------|--------|-------|
-| ①② | Memory | ✅ | file / sqlite |
-| ① | Embedder | ✅ | nil = keyword fallback |
+| ①② | Memory | ✅ | file / sqlite + Compact + recall_memory |
+| ① | Embedder | ✅ | nil = FTS5 fallback |
 | ① | Summarizer | ✅ | nil = no compaction |
 | ② | PromptBuilder | ✅ | function type, nil = default |
 | ④ | Model | ✅ | OpenAI implementation |

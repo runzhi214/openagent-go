@@ -13,7 +13,6 @@ type PromptInput struct {
 	// From Memory
 	WorkingMessages []Message
 	Compressed      *CompressedContext
-	RelevantFacts   []string
 
 	// Available tools and skills
 	Tools           []FunctionDefinition

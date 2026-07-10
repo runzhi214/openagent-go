@@ -104,8 +104,13 @@ type Embedder interface {
 
 // Summarizer compresses old messages into a summary for context window management.
 // nil means auto-compaction is disabled.
+//
+// When previous is non-nil, this is an incremental (rolling) compression —
+// the implementation should incorporate the existing summary rather than
+// re-summarizing from scratch. The returned CompressedContext.ThroughIndex
+// should be set by the caller (memory backend), not the implementation.
 type Summarizer interface {
-	Summarize(ctx context.Context, messages []Message) (*CompressedContext, error)
+	Summarize(ctx context.Context, messages []Message, previous *CompressedContext) (*CompressedContext, error)
 }
 
 // ── Retry ──

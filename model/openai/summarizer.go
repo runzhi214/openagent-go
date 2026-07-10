@@ -32,7 +32,9 @@ func NewSummarizer(apiKey, modelID, baseURL string) *Summarizer {
 }
 
 // Summarize compresses messages into a summary with retrieval hints.
-func (s *Summarizer) Summarize(ctx context.Context, messages []openagent.Message) (*openagent.CompressedContext, error) {
+// When previous is non-nil, this is an incremental compression — the existing
+// summary is prepended as context so the LLM can update it with the new messages.
+func (s *Summarizer) Summarize(ctx context.Context, messages []openagent.Message, previous *openagent.CompressedContext) (*openagent.CompressedContext, error) {
 	// Build conversation transcript
 	var transcript strings.Builder
 	for _, m := range messages {
@@ -54,10 +56,17 @@ func (s *Summarizer) Summarize(ctx context.Context, messages []openagent.Message
 		transcript.WriteString("\n")
 	}
 
+	// Build the system prompt. For incremental compression, include the
+	// previous summary so the LLM can preserve and update existing facts.
+	systemPrompt := summarizerPrompt
+	if previous != nil && previous.Summary != "" {
+		systemPrompt = summarizerIncrementalPrompt(previous)
+	}
+
 	params := openaisdk.ChatCompletionNewParams{
 		Model: openaisdk.ChatModel(s.modelID),
 		Messages: []openaisdk.ChatCompletionMessageParamUnion{
-			openaisdk.SystemMessage(summarizerPrompt),
+			openaisdk.SystemMessage(systemPrompt),
 			openaisdk.UserMessage(transcript.String()),
 		},
 		Temperature: param.NewOpt(0.3),
@@ -106,5 +115,41 @@ Rules:
 - Preserve user preferences, personal info, and factual claims verbatim.
 - Hints should be specific search queries, not generic descriptions.
 - If the conversation is trivial (greetings, chitchat), hints can be empty.`
+
+// summarizerIncrementalPrompt builds a prompt that asks the LLM to update an
+// existing summary with new messages, rather than starting from scratch.
+// This enables rolling/incremental compression without information decay.
+func summarizerIncrementalPrompt(previous *openagent.CompressedContext) string {
+	var hintsStr strings.Builder
+	for _, h := range previous.Hints {
+		hintsStr.WriteString(fmt.Sprintf("    {\"description\": %q, \"query\": %q},\n", h.Description, h.Query))
+	}
+	return fmt.Sprintf(`You are a conversation summarizer updating an existing summary.
+
+EXISTING SUMMARY (from earlier in the conversation):
+%s
+
+EXISTING RETRIEVAL HINTS:
+[
+%s
+]
+
+Below are NEW messages that occurred after the existing summary. Update the summary to incorporate the new information.
+
+Rules:
+- PRESERVE all key facts from the existing summary. Only add or modify to reflect new info.
+- Merge related facts rather than duplicating.
+- If new messages contradict old ones, prefer the newer information.
+- Produce 0-5 retrieval hints total (merge old + new, keep the most useful).
+- If the new messages are trivial, keep the existing summary unchanged.
+
+Respond with ONLY valid JSON (no markdown, no commentary):
+{
+  "summary": "string",
+  "hints": [
+    {"description": "short label", "query": "search terms"}
+  ]
+}`, previous.Summary, hintsStr.String())
+}
 
 var _ openagent.Summarizer = (*Summarizer)(nil)

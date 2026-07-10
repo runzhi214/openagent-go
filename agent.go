@@ -38,8 +38,9 @@ type Agent struct {
 	SkillLoader SkillLoader
 
 	// Configuration
-	MaxTurns    int // max loop iterations, 0 = default (20)
-	WorkingMemN int // recent turns for working memory, 0 = default (10)
+	MaxTurns             int // max loop iterations, 0 = default (20)
+	MaxWorkingTokens     int // max tokens for working set before compaction; 0 = 70% of model context window
+	MaxCompressedTokens  int // max tokens for compressed summary, 0 = no limit (default 2048)
 }
 
 // Clone returns a shallow copy of the Agent that is safe to mutate.
@@ -60,9 +61,10 @@ func (a *Agent) Clone() *Agent {
 // NewAgent creates an Agent with the given name and options.
 func NewAgent(name string, opts ...AgentOption) *Agent {
 	a := &Agent{
-		Name:        name,
-		MaxTurns:    20,
-		WorkingMemN: 10,
+		Name:                name,
+		MaxTurns:            20,
+		MaxWorkingTokens:    0, // 0 = auto: 70% of model context window
+		MaxCompressedTokens: 2048,
 	}
 	for _, o := range opts {
 		o(a)

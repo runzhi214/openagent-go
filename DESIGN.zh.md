@@ -29,15 +29,14 @@ openagent-go 是一个**全系统可插拔**的开源 AI Agent。核心是一条
 Agent.Run(ctx, session, input)
   │
   ├─ turn 1 only:
-  │   ① Memory.Recent()     ← 恢复历史 + 自动压缩（Summarizer）
-  │   ① Memory.Search()     ← 语义/关键词检索
+  │   ① Memory.Compact()    ← Token 驱动的增量压缩（Runner 决策）
+ │      Memory.Recent()    ← 纯查询，无副作用
   │   ③ Guard.in.Check()    ← 输入安全检查
   │
   └─ for turn in 1..maxTurns:
       ② PromptBuilder() 或 defaultBuildPrompt()
          ├─ system instructions
-         ├─ compressed summary + hints
-         ├─ relevant facts (from Search)
+         ├─ compressed summary + hints（自动注入）
          ├─ skill catalog + loaded skills
          └─ working messages
       ④ Model.ChatCompletionStream()  → fallback ChatCompletion()
@@ -75,7 +74,8 @@ type Agent struct {
     Observer    RunObserver      // nil = no stage events
     SkillLoader SkillLoader
     MaxTurns    int             // default 20
-    WorkingMemN int             // default 10
+    MaxWorkingTokens    int    // default 0 = 模型上下文窗口的 70%
+    MaxCompressedTokens int    // default 2048
 }
 
 // 非流式：阻塞返回完整结果
@@ -131,22 +131,30 @@ type Session struct {
 ### ① Memory（三层模型）
 
 ```
-Layer 1: Working    — Recent() 返回最近 N 条，内部自动触发压缩
-Layer 2: Compressed — Compressed() 返回摘要 + hints，由 Layer 1 自动更新
-Layer 3: Archive    — Search() 全文/向量检索，Append() 写入
+Layer 1: Working    — Recent() 纯查询；Runner 按 MaxWorkingTokens 管理 token 预算
+Layer 2: Compressed — Compressed() 自动注入 + Compact() Token 驱动增量压缩
+Layer 3: Archive    — Search() + recall_memory 工具；消息永不删除
+Layer 2: Compressed — Compressed() + Compact()；Runner 按 token 驱动增量压缩
+Layer 3: Archive    — Search() 全文/向量检索 + recall_memory 工具；消息永不删除
 ```
 
 ```go
 type Memory interface {
     io.Closer
-    Recent(ctx, sessionID, n int) ([]Message, error)
+    Count(ctx, sessionID) (int, error)
+    Recent(ctx, sessionID, n int) ([]Message, error)                                      // 纯查询
+    Compact(ctx, sessionID string, throughIndex int, messages []Message) error              // Runner 驱动的压缩
     Compressed(ctx, sessionID) (*CompressedContext, error)
     Search(ctx, sessionID, query string, limit int) ([]SearchResult, error)
     Append(ctx, sessionID, msg Message) error
+    DeleteSession(ctx, sessionID) error
 }
 ```
 
-**Runner 不感知压缩**。`Recent()` 内部：消息数 > workingN 且有 Summarizer → 调 `Summarizer.Summarize()` → 存 `CompressedContext` → 删旧消息 → 返回裁剪结果。
+**Runner 驱动压缩**。Runner 从末尾向前数 token，对 MaxWorkingTokens
+（默认：模型上下文窗口的 70%）进行截断，调整到安全边界（不切断 tool_call/tool_result 对），
+然后调用 Compact()。后端仅压缩新溢出的消息，与之前的摘要进行增量/滚动压缩。
+原始消息永不删除。
 
 实现：
 - ✅ `memory/file` — JSONL 文件，零依赖，子串搜索
@@ -156,11 +164,12 @@ type Memory interface {
 
 ```go
 type Summarizer interface {
-    Summarize(ctx context.Context, messages []Message) (*CompressedContext, error)
+    Summarize(ctx context.Context, messages []Message, previous *CompressedContext) (*CompressedContext, error)
 }
 ```
 
 nil = 不压缩。Memory 通过 `WithSummarizer()` 配置。✅ `model/openai/summarizer.go`
+当 previous 非 nil 时，为增量（滚动）压缩——实现应保留已有事实并融入新消息。
 
 ### Embedder（Memory 的依赖）
 
@@ -333,10 +342,11 @@ type SkillInfo struct {
 Runner 是唯一中介：
 
 ```
+Runner.compactIfNeeded:
+  → 从末尾向前数 token → 调整安全边界 → Memory.Compact()
 Runner.buildPrompt:
-  msgs = Memory.Recent()      ← Memory 内部可能调 Summarizer（但 Runner 不知道）
-  cc   = Memory.Compressed()
-  facts = Memory.Search()     ← Memory 内部可能调 Embedder（但 Runner 不知道）
+  msgs = Memory.Recent()      ← 纯查询，无副作用
+  cc   = Memory.Compressed()  ← 自动注入摘要
   input = PromptInput{...}
   result = PromptBuilder(input)
 
@@ -482,11 +492,15 @@ openagent-go/
 
 用户调用 `Agent.Run()`，不直接构造 Runner。Runner 是内部实现细节。
 
-**2. 为什么压缩在 Memory 内部？**
+**2. 为什么 Runner 触发压缩？**
 
-Runner 不应该知道存储策略。Memory 自己管理何时压缩、如何存储摘要。模块边界清晰。
+压缩触发基于 token 预算，而 token 预算取决于模型上下文窗口——只有 Runner 有这个信息。Runner 用 tiktoken 精确计数，Memory 只负责执行。关注点分离：决策在 Runner，存储在 Memory。
 
-**3. 为什么 Embedder/Summarizer 不在 Agent 上？**
+**3. 为什么砍掉自动搜索（RelevantFacts）？**
+
+Archive 的检索由模型通过 `recall_memory` 工具驱动——模型自己决定何时搜、搜什么。Compressed 已经是被动提醒。两个 Archive 搜索通道是冗余的。
+
+**4. 为什么 Embedder/Summarizer 不在 Agent 上？**
 
 它们是 Memory 的依赖，不是 Agent 的能力。Agent 只需要知道有没有 Memory。Memory 决定是否需要嵌入或摘要能力。保持"模块不互相调用"。
 
