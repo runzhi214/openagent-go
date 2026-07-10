@@ -389,6 +389,16 @@ func streamToSSE(evt openagent.StreamEvent) SSEEvent {
 		}
 		return SSEEvent{Type: "retrying", Text: msg}
 
+	case openagent.StreamToolProgress:
+		return SSEEvent{Type: "tool_progress", Text: evt.Text, ToolCallID: evt.ToolCallID}
+
+	case openagent.StreamAborted:
+		se := SSEEvent{Type: "aborted"}
+		if evt.Error != nil {
+			se.Text = evt.Error.Error()
+		}
+		return se
+
 	case openagent.StreamDone:
 		se := SSEEvent{Type: "done"}
 		if evt.Result != nil {

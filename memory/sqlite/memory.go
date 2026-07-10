@@ -425,10 +425,17 @@ func (m *Memory) vectorSearch(ctx context.Context, sessionID, query string, limi
 }
 
 func (m *Memory) ftsSearch(ctx context.Context, sessionID, query string, limit int) ([]openagent.SearchResult, error) {
-	// Pass query directly to FTS5. It tokenizes, stems, and ranks
-	// natively. Only strip characters that break FTS5 query syntax.
-	ftsQuery := strings.ReplaceAll(query, "\x00", " ")
-	ftsQuery = strings.ReplaceAll(ftsQuery, `"`, " ")
+	// Pass query to FTS5, stripping characters with special meaning
+	// in FTS5 query syntax: * (prefix), () (grouping), - (NOT),
+	// ^ (column prefix), ~ (NEAR), @ (column prefix), : (column).
+	// Double quotes and null bytes also break queries.
+	ftsQuery := strings.Map(func(r rune) rune {
+		switch r {
+		case '*', '(', ')', '-', '^', '~', '@', ':', '"', '\x00':
+			return ' '
+		}
+		return r
+	}, query)
 
 	rows, err := m.db.QueryContext(ctx,
 		`SELECT m.role, m.content, m.content_parts, m.tool_calls, m.tool_call_id

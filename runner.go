@@ -839,6 +839,7 @@ func (r *runner) callModelOnce(ctx context.Context, req ChatCompletionRequest, c
 func accumulateStream(reader StreamReader, ch chan<- StreamEvent) (*ChatCompletionResponse, error) {
 	var (
 		content      string
+		reasoning    string
 		finishReason string
 		usage        Usage
 	)
@@ -851,6 +852,7 @@ func accumulateStream(reader StreamReader, ch chan<- StreamEvent) (*ChatCompleti
 		}
 		for _, delta := range chunk.Choices {
 			content += delta.Content
+			reasoning += delta.ReasoningContent
 			if delta.FinishReason != "" {
 				finishReason = delta.FinishReason
 			}
@@ -895,7 +897,7 @@ func accumulateStream(reader StreamReader, ch chan<- StreamEvent) (*ChatCompleti
 	return &ChatCompletionResponse{
 		Choices: []Choice{{
 			Index:        0,
-			Message:      Message{Role: RoleAssistant, Content: content, ToolCalls: toolCalls},
+			Message:      Message{Role: RoleAssistant, Content: content, ReasoningContent: reasoning, ToolCalls: toolCalls},
 			FinishReason: finishReason,
 		}},
 		Usage: usage,

@@ -1194,17 +1194,28 @@ func streamToSSE(evt openagent.StreamEvent) sseEvent {
 	case openagent.StreamToolResult:
 		return sseEvent{Type: "tool_result", Text: evt.Message.Content, ToolCallID: evt.Message.ToolCallID}
 	case openagent.StreamRetrying:
-		return sseEvent{Type: "retrying", Text: evt.Error.Error()}
+		se := sseEvent{Type: "retrying"}
+		if evt.Error != nil {
+			se.Text = evt.Error.Error()
+		}
+		return se
+		return se
+
 	case openagent.StreamDone:
-		se := sseEvent{Type: "done", Text: evt.Result.FinalOutput}
+		se := sseEvent{Type: "done"}
 		if evt.Result != nil {
+			se.Text = evt.Result.FinalOutput
 			se.PromptTokens = evt.Result.Usage.PromptTokens
 			se.ContextWindow = evt.Result.ContextWindow
 			log.Printf("usage: prompt=%d ctx_window=%d", evt.Result.Usage.PromptTokens, evt.Result.ContextWindow)
 		}
 		return se
 	case openagent.StreamError:
-		return sseEvent{Type: "error", Text: evt.Error.Error()}
+		se := sseEvent{Type: "error"}
+		if evt.Error != nil {
+			se.Text = evt.Error.Error()
+		}
+		return se
 	}
 	return sseEvent{}
 }
@@ -1704,9 +1715,14 @@ func teamEventToSSE(ts *teamSession, evt openagent.TeamEvent) sseEvent {
 	case openagent.TeamToolResult:
 		return sseEvent{Type: "tool_result", Agent: evt.Agent, Text: evt.Text}
 	case openagent.TeamRetrying:
-		return sseEvent{Type: "retrying", Agent: evt.Agent, Error: evt.Error.Error()}
+		se := sseEvent{Type: "retrying", Agent: evt.Agent}
+		if evt.Error != nil {
+			se.Error = evt.Error.Error()
+		}
+		return se
 	case openagent.TeamHandoff:
 		return sseEvent{Type: "handoff", Agent: evt.Agent, HandoffTo: evt.Message}
+
 	case openagent.TeamDone:
 		se := sseEvent{Type: "done"}
 		if evt.Result != nil {
@@ -1714,7 +1730,11 @@ func teamEventToSSE(ts *teamSession, evt openagent.TeamEvent) sseEvent {
 		}
 		return se
 	case openagent.TeamError:
-		return sseEvent{Type: "error", Text: evt.Error.Error()}
+		se := sseEvent{Type: "error"}
+		if evt.Error != nil {
+			se.Text = evt.Error.Error()
+		}
+		return se
 	}
 	return sseEvent{}
 }
