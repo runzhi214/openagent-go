@@ -19,6 +19,11 @@
           </n-collapse>
         </div>
 
+        <!-- Handoff -->
+        <div v-else-if="item.kind === 'msg' && item.msg.role === 'handoff'" class="msg-handoff">
+          <div class="handoff-label">{{ item.msg.content }}</div>
+        </div>
+
         <!-- System -->
         <div v-else-if="item.kind === 'msg' && item.msg.role === 'system'" class="sys-msg">{{ item.msg.content }}</div>
 
@@ -173,6 +178,20 @@ function truncate(s: string): string {
 .sys-msg {
   text-align: center; font-size: 0.7em; opacity: 0.3;
   padding: 2px 12px;
+}
+
+.msg-handoff {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 16px; margin: 4px 0;
+}
+.handoff-label {
+  font-size: 0.8em; font-weight: 600; opacity: 0.65;
+  padding: 6px 14px; border-radius: 6px;
+  background: rgba(99, 102, 241, 0.12);
+  border: 1px solid rgba(99, 102, 241, 0.25);
+  color: rgba(255,255,255,0.75);
+  text-transform: uppercase; letter-spacing: 0.04em;
+  white-space: nowrap;
 }
 
 .thought-inline { margin-bottom: 8px; opacity: 0.6; font-size: 0.85em; }

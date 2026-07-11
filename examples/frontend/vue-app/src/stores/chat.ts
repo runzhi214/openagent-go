@@ -225,17 +225,46 @@ export const useChatStore = defineStore('chat', () => {
         break
       }
 
-      case 'agent_start':
+      case 'agent_start': {
+        // New agent taking over — reset streaming state from previous agent.
+        if (thinkingMsg) {
+          messages.value = messages.value.filter(m => m !== thinkingMsg)
+          thinkingMsg = null
+        }
+        if (currentStreamMsg) {
+          currentStreamMsg.isStreaming = false
+          currentStreamMsg = null
+        }
+        pendingThought = ''
         break
+      }
 
-      case 'agent_end':
+      case 'agent_end': {
+        // Finalize the current agent's message so the next agent
+        // starts a fresh bubble instead of appending to it.
+        if (currentStreamMsg) {
+          currentStreamMsg.isStreaming = false
+          currentStreamMsg = null
+        }
         break
+      }
 
       case 'handoff': {
+        // Reset per-agent streaming state so the next agent gets a
+        // clean message bubble with its own name and thinking.
+        if (thinkingMsg) {
+          messages.value = messages.value.filter(m => m !== thinkingMsg)
+          thinkingMsg = null
+        }
+        if (currentStreamMsg) {
+          currentStreamMsg.isStreaming = false
+          currentStreamMsg = null
+        }
+        pendingThought = ''
         pushMsg({
           id: msgId(),
-          role: 'system',
-          content: `${event.agent} → ${event.handoff_to}`,
+          role: 'handoff',
+          content: `${event.agent || '?'} → ${event.handoff_to || '?'}`,
           agent: event.agent,
           timestamp: now(),
         })

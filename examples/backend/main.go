@@ -74,25 +74,29 @@ func main() {
 	// ── Team ──
 	analyst := openagent.NewAgent("analyst",
 		openagent.WithModel(llm),
+		openagent.WithMemory(mem),
 		openagent.WithInstructions("You are a requirements analyst. Understand the user's request, break it into clear requirements, then hand off to the designer with a structured spec. Include constraints and acceptance criteria. Use transfer_to_designer when done."),
 		openagent.WithMaxTurns(2),
 	)
 	designer := openagent.NewAgent("designer",
 		openagent.WithModel(llm),
+		openagent.WithMemory(mem),
 		openagent.WithInstructions("You are a software designer. Take the specification, design the architecture with components and interfaces, then hand off to the coder with a clear design document. Use transfer_to_coder when done."),
 		openagent.WithMaxTurns(2),
 	)
 	coder := openagent.NewAgent("coder",
 		openagent.WithModel(llm),
+		openagent.WithMemory(mem),
 		openagent.WithInstructions("You are a software developer. Take the design and write clean, well-structured code. Include error handling and comments. Hand off to the reviewer with your complete implementation. Use transfer_to_reviewer when done."),
 		openagent.WithMaxTurns(5),
 	)
 	reviewer := openagent.NewAgent("reviewer",
 		openagent.WithModel(llm),
+		openagent.WithMemory(mem),
 		openagent.WithInstructions("You are a code reviewer. Review the implementation for correctness, style, and bugs. If issues found, hand off back to the coder with specific feedback. If approved, produce the final summary for the user. Do NOT hand off further — you are the final gate."),
 		openagent.WithMaxTurns(2),
 	)
-	teamHandler := rest.NewTeamHandler(nil,
+	teamHandler := rest.NewTeamHandler(mem,
 		rest.TeamAgentTemplate{Name: "analyst", Description: "Understands requirements and produces specifications", Agent: analyst},
 		rest.TeamAgentTemplate{Name: "designer", Description: "Designs architecture, components, and data flow", Agent: designer},
 		rest.TeamAgentTemplate{Name: "coder", Description: "Writes clean, well-structured code with error handling", Agent: coder},

@@ -398,7 +398,7 @@ func (h *TeamHandler) newSession(info SessionInfo) *teamSessionState {
 	teamOpts = append(teamOpts, openagent.WithTeamMaxHandoffs(10))
 
 	for _, t := range h.agents {
-		agent := cloneAgentForSession(t.Agent, s, h.submitApproval)
+		agent := cloneAgentForSession(t.Agent, h.memory, s, h.submitApproval)
 		teamOpts = append(teamOpts,
 			openagent.WithTeamAgent(t.Name, t.Description, agent),
 		)
@@ -411,10 +411,16 @@ func (h *TeamHandler) newSession(info SessionInfo) *teamSessionState {
 	return s
 }
 
-func cloneAgentForSession(tmpl *openagent.Agent, s *teamSessionState, submitFn func(*teamSessionState, openagent.ToolCall, chan approveResponse)) *openagent.Agent {
+func cloneAgentForSession(tmpl *openagent.Agent, mem openagent.Memory, s *teamSessionState, submitFn func(*teamSessionState, openagent.ToolCall, chan approveResponse)) *openagent.Agent {
+	// Use the template's memory if set; otherwise fall back to the handler's
+	// shared memory so team agents retain context across chat turns.
+	memory := tmpl.Memory
+	if memory == nil {
+		memory = mem
+	}
 	return openagent.NewAgent(tmpl.Name,
 		openagent.WithModel(tmpl.Model),
-		openagent.WithMemory(tmpl.Memory),
+		openagent.WithMemory(memory),
 		openagent.WithTools(tmpl.Tools...),
 		openagent.WithInstructions(tmpl.Instructions),
 		openagent.WithMaxTurns(tmpl.MaxTurns),
