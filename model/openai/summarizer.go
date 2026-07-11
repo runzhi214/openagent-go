@@ -91,6 +91,9 @@ func (s *Summarizer) Summarize(ctx context.Context, messages []openagent.Message
 		return nil, fmt.Errorf("summarize: %w", err)
 	}
 
+	if len(completion.Choices) == 0 {
+		return nil, fmt.Errorf("summarize: model returned no choices")
+	}
 	content := completion.Choices[0].Message.Content
 	return parseSummaryResponse(content)
 }

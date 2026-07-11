@@ -61,24 +61,21 @@ func ForModel(modelID string) *tiktoken.Tiktoken {
 // If the tokenizer cannot be loaded (e.g. no network for downloading encoder
 // files on first use), it falls back to a heuristic (~4 chars per token for
 // ASCII, ~1.5 for CJK). This is safe but less accurate.
-func Count(modelID, text string) int {
+func Count(modelID, text string) (n int) {
 	if text == "" {
 		return 0
 	}
 
 	// Panic recovery: tiktoken panics on nil encoder, and encoder loading
-	// fails when the network is unavailable.
+	// fails when the network is unavailable. Fall back to heuristic.
 	defer func() {
 		if r := recover(); r != nil {
-			// Swallow the panic and let the caller get 0 from the
-			// deferred heuristic return. This only happens when all
-			// encoding lookups fail (no network, no cache).
+			n = heuristicCount(text)
 		}
 	}()
 
 	tke := ForModel(modelID)
 	if tke == nil {
-		// Encoder not available — use heuristic.
 		return heuristicCount(text)
 	}
 	return len(tke.EncodeOrdinary(text))

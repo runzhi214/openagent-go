@@ -378,17 +378,23 @@ type teamRunner struct {
 func (tr *teamRunner) run(ctx context.Context, session Session, input Message, ch chan<- TeamEvent) (*TeamResult, error) {
 	// ── Resolve first agent ──
 	agentInfos := tr.agentInfos()
-	name, err := tr.team.router.Route(ctx, input, agentInfos)
+	rr, err := tr.team.router.Route(ctx, input, agentInfos)
 	if err != nil {
 		return nil, fmt.Errorf("router: %w", err)
 	}
+	if rr.Fallback && tr.team.observer != nil {
+		tr.team.observer.ObserveStage(ctx, StageEvent{
+			Name: "team.route", Phase: "leave",
+			Detail: map[string]any{"agent": rr.Agent, "fallback": rr.Reason},
+		})
+	}
 	tr.team.mu.Lock()
-	_, ok := tr.team.agents[name]
+	_, ok := tr.team.agents[rr.Agent]
 	tr.team.mu.Unlock()
 	if !ok {
-		return nil, fmt.Errorf("router returned unknown agent %q", name)
+		return nil, fmt.Errorf("router returned unknown agent %q", rr.Agent)
 	}
-	tr.currentName = name
+	tr.currentName = rr.Agent
 	currentInput := input
 
 	for {

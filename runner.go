@@ -350,7 +350,7 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 	}
 
 	result.TurnCount = turn
-		result.ContextWindow = r.agent.Model.ContextWindow()
+	result.ContextWindow = r.agent.Model.ContextWindow()
 	if ch != nil {
 		ch <- StreamEvent{Type: StreamDone, Result: result}
 	}
@@ -633,8 +633,6 @@ func (r *runner) executeOneTool(ctx context.Context, session Session, call ToolC
 		r.fireToolHooksEnd(ctx, *def, args, msg.Content, toolStart, nil)
 		return msg
 	}
-
-	tool = r.findTool(call.Function.Name)
 
 	if r.agent.Hooks != nil {
 		_ = r.agent.Hooks.OnToolStart(ctx, *def, args)

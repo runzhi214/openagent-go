@@ -13,6 +13,13 @@ type AgentInfo struct {
 	Type        AgentType // internal (in-process) or external (ACP/MCP)
 }
 
+// RouteResult is the output of Router.Route.
+type RouteResult struct {
+	Agent    string // selected agent name
+	Fallback bool   // true if the router fell back (error, fuzzy match, or default)
+	Reason   string // why fallback occurred (empty for confident routing)
+}
+
 // Router decides message routing in a Team.
 //
 // Two responsibilities:
@@ -22,8 +29,9 @@ type AgentInfo struct {
 // nil Router = all agents are valid targets, first agent handles all input.
 type Router interface {
 	// Route picks the initial agent for a user message.
-	// The returned name must match an agent in the Team.
-	Route(ctx context.Context, input Message, agents []AgentInfo) (string, error)
+	// The returned RouteResult.Agent must match an agent in the Team.
+	// Fallback indicates the router was not confident (model error, fuzzy match).
+	Route(ctx context.Context, input Message, agents []AgentInfo) (RouteResult, error)
 
 	// CanHandoff checks whether a handoff should proceed.
 	// Return nil if allowed. Return an error to veto — the error message
@@ -39,11 +47,11 @@ type Router interface {
 // handoff scenarios.
 type FirstAgentRouter struct{}
 
-func (FirstAgentRouter) Route(_ context.Context, _ Message, agents []AgentInfo) (string, error) {
+func (FirstAgentRouter) Route(_ context.Context, _ Message, agents []AgentInfo) (RouteResult, error) {
 	if len(agents) == 0 {
-		return "", fmt.Errorf("team has no agents")
+		return RouteResult{}, fmt.Errorf("team has no agents")
 	}
-	return agents[0].Name, nil
+	return RouteResult{Agent: agents[0].Name}, nil
 }
 
 func (FirstAgentRouter) CanHandoff(_ context.Context, _ HandoffEntry, _ []HandoffEntry, _ Session) error {
@@ -63,12 +71,12 @@ func NewLLMRouter(model Model) *LLMRouter {
 	return &LLMRouter{model: model}
 }
 
-func (r *LLMRouter) Route(ctx context.Context, input Message, agents []AgentInfo) (string, error) {
+func (r *LLMRouter) Route(ctx context.Context, input Message, agents []AgentInfo) (RouteResult, error) {
 	if len(agents) == 0 {
-		return "", fmt.Errorf("team has no agents")
+		return RouteResult{}, fmt.Errorf("team has no agents")
 	}
 	if len(agents) == 1 {
-		return agents[0].Name, nil
+		return RouteResult{Agent: agents[0].Name}, nil
 	}
 
 	prompt := buildRouterPrompt(agents)
@@ -79,25 +87,27 @@ func (r *LLMRouter) Route(ctx context.Context, input Message, agents []AgentInfo
 		},
 		MaxTokens: 64,
 	})
-	if err != nil || len(resp.Choices) == 0 {
-		// Fall back to first agent on model error or empty response
-		return agents[0].Name, nil
+	if err != nil {
+		return RouteResult{Agent: agents[0].Name, Fallback: true, Reason: fmt.Sprintf("model error: %v", err)}, nil
+	}
+	if len(resp.Choices) == 0 {
+		return RouteResult{Agent: agents[0].Name, Fallback: true, Reason: "model returned no choices"}, nil
 	}
 
 	// The model should return just the agent name
 	chosen := resp.Choices[0].Message.Content
 	for _, a := range agents {
 		if a.Name == chosen {
-			return a.Name, nil
+			return RouteResult{Agent: a.Name}, nil
 		}
 	}
 	// Fuzzy match: check if any agent name appears in the response
 	for _, a := range agents {
 		if containsWord(chosen, a.Name) {
-			return a.Name, nil
+			return RouteResult{Agent: a.Name, Fallback: true, Reason: fmt.Sprintf("fuzzy matched %q from response %q", a.Name, chosen)}, nil
 		}
 	}
-	return agents[0].Name, nil
+	return RouteResult{Agent: agents[0].Name, Fallback: true, Reason: fmt.Sprintf("unrecognized response %q", chosen)}, nil
 }
 
 func (r *LLMRouter) CanHandoff(_ context.Context, _ HandoffEntry, _ []HandoffEntry, _ Session) error {

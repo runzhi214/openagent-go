@@ -106,6 +106,12 @@ func (g *Guard) judge(ctx context.Context, systemPrompt, content string) openage
 		}
 	}
 
+	if len(resp.Choices) == 0 {
+		if g.failOpen {
+			return openagent.GuardResult{Allowed: true}
+		}
+		return openagent.GuardResult{Allowed: false, Reason: "guard judge returned no choices"}
+	}
 	return parseResult(resp.Choices[0].Message.Content)
 }
 

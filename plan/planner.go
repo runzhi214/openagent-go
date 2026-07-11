@@ -337,10 +337,11 @@ func parsePlanJSON(raw string) (*PlanDef, error) {
 	return &def, nil
 }
 
-// truncateStr truncates s to at most n runes.
+// truncateStr truncates s to at most n runes, counting by rune not byte.
 func truncateStr(s string, n int) string {
-	if len(s) <= n {
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return string(runes[:n]) + "..."
 }

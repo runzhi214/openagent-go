@@ -46,14 +46,14 @@ func (m *Model) ChatCompletion(ctx context.Context, req openagent.ChatCompletion
 		Messages: toSDKMessages(req.Messages),
 		Tools:    toSDKTools(req.Tools),
 	}
-	if req.Temperature != 0 {
-		params.Temperature = param.NewOpt(req.Temperature)
+	if req.Temperature != nil {
+		params.Temperature = param.NewOpt(*req.Temperature)
 	}
 	if req.MaxTokens != 0 {
 		params.MaxTokens = param.NewOpt(int64(req.MaxTokens))
 	}
-	if req.TopP != 0 {
-		params.TopP = param.NewOpt(req.TopP)
+	if req.TopP != nil {
+		params.TopP = param.NewOpt(*req.TopP)
 	}
 	if len(req.Stop) > 0 {
 		params.Stop = openaisdk.ChatCompletionNewParamsStopUnion{
@@ -80,14 +80,14 @@ func (m *Model) ChatCompletionStream(ctx context.Context, req openagent.ChatComp
 		Messages: toSDKMessages(req.Messages),
 		Tools:    toSDKTools(req.Tools),
 	}
-	if req.Temperature != 0 {
-		params.Temperature = param.NewOpt(req.Temperature)
+	if req.Temperature != nil {
+		params.Temperature = param.NewOpt(*req.Temperature)
 	}
 	if req.MaxTokens != 0 {
 		params.MaxTokens = param.NewOpt(int64(req.MaxTokens))
 	}
-	if req.TopP != 0 {
-		params.TopP = param.NewOpt(req.TopP)
+	if req.TopP != nil {
+		params.TopP = param.NewOpt(*req.TopP)
 	}
 	if len(req.Stop) > 0 {
 		params.Stop = openaisdk.ChatCompletionNewParamsStopUnion{

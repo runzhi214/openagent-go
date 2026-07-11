@@ -2,6 +2,7 @@ package plan
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -667,19 +668,18 @@ func (e *executor) replanAfterFailure(ctx context.Context, def *PlanDef, state *
 }
 
 // isPermanentError returns true for errors that won't be fixed by retrying.
+// It mirrors the Runner's retry logic: context cancellation is always permanent,
+// and non-RetryableError is permanent (the model/runner layer already classifies
+// transient errors via openagent.RetryableError).
 func isPermanentError(err error) bool {
 	if err == nil {
-		return false
+		return false // no error is not permanent
 	}
-	msg := err.Error()
-	// Context cancellation / deadline — not worth retrying.
-	permanent := []string{"context canceled", "deadline exceeded", "400", "401", "403", "404", "invalid API key", "does not exist"}
-	for _, p := range permanent {
-		if strings.Contains(msg, p) {
-			return true
-		}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
 	}
-	return false
+	var re *openagent.RetryableError
+	return !errors.As(err, &re)
 }
 
 // ── DAG helpers ──

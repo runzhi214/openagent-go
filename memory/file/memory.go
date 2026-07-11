@@ -55,9 +55,10 @@ func (m *Memory) Close() error { return nil }
 // DeleteSession removes the session's JSONL file and compressed file.
 // It is safe to call on a session that doesn't exist (no error).
 func (m *Memory) DeleteSession(ctx context.Context, sessionID string) error {
+	ctxErr := ctx.Err() // capture before I/O — ctx state after removal is irrelevant
 	_ = os.Remove(m.sessionPath(sessionID))
 	_ = os.Remove(m.compressedPath(sessionID))
-	return ctx.Err()
+	return ctxErr
 }
 
 // Count returns the total number of messages for a session.

@@ -50,7 +50,7 @@ type Session struct {
 
 	// Model selection (overrides Agent default if set)
 	ModelID         string  `json:"model_id,omitempty"`
-	Temperature     float64 `json:"temperature,omitempty"`
+	Temperature     *float64 `json:"temperature,omitempty"`
 	MaxTokens       int     `json:"max_tokens,omitempty"`
 
 	// Context for Prompt
