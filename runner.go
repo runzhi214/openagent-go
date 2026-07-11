@@ -201,13 +201,24 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 			if est > cw {
 				before := len(messages)
 				messages = trimToContextWindow(session.ModelID, messages, cw)
+				trimmed := before - len(messages)
+				// When using the default prompt builder, every non-system
+				// message in the model input originates from workingMessages,
+				// so trimToContextWindow drops exactly workingMessages[:trimmed].
+				// With a custom PromptBuilder this mapping doesn't hold (the
+				// builder can insert non-system messages anywhere), so we skip
+				// the sync — it's just an optimization, and the compaction
+				// pipeline normally prevents this path anyway.
+				if r.agent.Prompt == nil && trimmed > 0 && trimmed <= len(workingMessages) {
+					workingMessages = workingMessages[trimmed:]
+				}
 				lastReq = r.buildModelRequest(session, messages)
 				r.observe(ctx, StageModelCall, "enter",
 					map[string]any{
 						"warning":          "context window exceeded — messages trimmed",
 						"estimated_tokens": est,
 						"window":           cw,
-						"trimmed":          before - len(messages),
+						"trimmed":          trimmed,
 					},
 					time.Time{}, nil)
 			}
