@@ -94,6 +94,7 @@
     <!-- Tool approval (during plan execution) -->
     <ToolApprovalDialog
       v-if="plan.pendingApproval"
+      :key="plan.pendingApproval.toolCall.id"
       :tool-call="plan.pendingApproval.toolCall"
       @resolve="handleApprove"
     />

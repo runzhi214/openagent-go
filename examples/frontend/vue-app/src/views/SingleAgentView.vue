@@ -8,6 +8,7 @@
   />
   <ToolApprovalDialog
     v-if="chat.pendingApproval"
+    :key="chat.pendingApproval.toolCall.id"
     :tool-call="chat.pendingApproval.toolCall"
     @resolve="handleApprove"
   />

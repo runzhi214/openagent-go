@@ -2,50 +2,52 @@
   <div class="chat-view">
     <div class="msg-area" ref="scrollRef">
       <n-empty v-if="messages.length === 0" description="Send a message to get started" class="empty-state" />
-      <template v-for="msg in messages" :key="msg.id">
+      <template v-for="item in displayItems" :key="item.kind === 'msg' ? item.msg.id : item.id">
+        <!-- Tool batch (rendered before individual tools would appear) -->
+        <div v-if="item.kind === 'tool_batch'" class="msg-tool-batch">
+          <n-collapse>
+            <n-collapse-item :title="`🔧 Tool calls (${item.tools.length})`">
+              <div class="tc-list">
+                <n-collapse v-for="(t, i) in item.tools" :key="i">
+                  <n-collapse-item :title="t.name" class="tc-sub">
+                    <pre class="tc-args">{{ t.args }}</pre>
+                    <pre v-if="t.result" class="tc-result">{{ t.result.length > 2000 ? t.result.slice(-2000) : t.result }}</pre>
+                  </n-collapse-item>
+                </n-collapse>
+              </div>
+            </n-collapse-item>
+          </n-collapse>
+        </div>
+
         <!-- System -->
-        <div v-if="msg.role === 'system'" class="sys-msg">{{ msg.content }}</div>
+        <div v-else-if="item.kind === 'msg' && item.msg.role === 'system'" class="sys-msg">{{ item.msg.content }}</div>
 
-        <!-- Thought (deprecated standalone — now inline in agent bubble) -->
-        <n-collapse v-else-if="msg.role === 'thought'" class="msg-thought">
+        <!-- Thought -->
+        <n-collapse v-else-if="item.kind === 'msg' && item.msg.role === 'thought'" class="msg-thought">
           <n-collapse-item title="Thinking...">
-            <MarkdownContent :content="msg.content" />
-          </n-collapse-item>
-        </n-collapse>
-
-        <!-- Tool call -->
-        <n-collapse v-else-if="msg.role === 'tool_call'" class="msg-tool">
-          <n-collapse-item :title="toolTitle(msg)">
-            <pre class="tool-body">{{ toolArgs(msg) }}</pre>
-          </n-collapse-item>
-        </n-collapse>
-
-        <!-- Tool result -->
-        <n-collapse v-else-if="msg.role === 'tool_result'" class="msg-tool">
-          <n-collapse-item :title="toolResultTitle(msg)">
-            <div class="tool-body"><MarkdownContent :content="truncate(msg.content)" /></div>
+            <MarkdownContent :content="item.msg.content" />
           </n-collapse-item>
         </n-collapse>
 
         <!-- Agent -->
-        <div v-else-if="msg.role === 'agent'" class="msg-agent">
-          <div v-if="msg.agent" class="agent-label">{{ msg.agent }}</div>
-          <div v-if="msg.thoughtContent" class="thought-inline">
+        <div v-else-if="item.kind === 'msg' && item.msg.role === 'agent'" class="msg-agent">
+          <div v-if="item.msg.agent" class="agent-label">{{ item.msg.agent }}</div>
+          <div v-if="item.msg.thoughtContent" class="thought-inline">
             <n-collapse>
               <n-collapse-item title="Thinking...">
-                <div class="thought-text">{{ msg.thoughtContent }}</div>
+                <div class="thought-text">{{ item.msg.thoughtContent }}</div>
               </n-collapse-item>
             </n-collapse>
           </div>
           <div class="agent-body">
-            <MarkdownContent :content="msg.content" />
-            <span v-if="msg.isStreaming" class="cursor">▌</span>
+            <MarkdownContent :content="item.msg.content" />
+            <span v-if="item.msg.isStreaming" class="cursor">▌</span>
           </div>
         </div>
 
         <!-- User -->
-        <div v-else-if="msg.role === 'user'" class="msg-user">
-          <div class="user-body">{{ msg.content }}</div>
+        <div v-else-if="item.kind === 'msg' && item.msg.role === 'user'" class="msg-user">
+          <div class="user-body">{{ item.msg.content }}</div>
         </div>
       </template>
 
@@ -69,7 +71,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, nextTick, watch } from 'vue'
+import { ref, nextTick, watch, computed } from 'vue'
 import { NEmpty, NCollapse, NCollapseItem, NInput, NButton } from 'naive-ui'
 import type { ChatMessage, UsageInfo } from '@/types'
 import MarkdownContent from '@/components/common/MarkdownContent.vue'
@@ -103,22 +105,55 @@ function send() {
   inputText.value = ''
 }
 
-function toolTitle(m: ChatMessage): string {
-  const tc = m.toolCall
-  if (!tc) return 'Tool call'
-  try {
-    const a = JSON.parse(tc.function.arguments)
-    const p = Object.entries(a).slice(0,2).map(([k,v]) => `${k}=${JSON.stringify(v)}`).join(', ')
-    return `${tc.function.name}(${p})`
-  } catch { return tc.function.name }
+interface ToolBatchItem {
+  name: string
+  args: string
+  result: string
 }
-function toolArgs(m: ChatMessage): string {
-  if (!m.toolCall) return ''
-  try { return JSON.stringify(JSON.parse(m.toolCall.function.arguments), null, 2) } catch { return m.toolCall.function.arguments }
-}
-function toolResultTitle(m: ChatMessage): string {
-  return m.toolCall ? `${m.toolCall.function.name} result` : 'Tool result'
-}
+
+type DisplayItem =
+  | { kind: 'msg'; msg: ChatMessage }
+  | { kind: 'tool_batch'; tools: ToolBatchItem[]; id: string }
+
+// Group consecutive tool_call/tool_result messages into batches.
+// Each tool message carries toolCall (name + args) and content (result).
+// Store is unchanged — this is a pure rendering transform.
+const displayItems = computed<DisplayItem[]>(() => {
+  const items: DisplayItem[] = []
+  let batch: ToolBatchItem[] = []
+
+  function flush() {
+    if (batch.length > 0) {
+      items.push({ kind: 'tool_batch', tools: [...batch], id: items.length.toString() })
+      batch = []
+    }
+  }
+
+  for (const m of props.messages) {
+    const isTool = m.role === 'tool_call' || m.role === 'tool_result'
+    if (!isTool) {
+      flush()
+      items.push({ kind: 'msg', msg: m })
+      continue
+    }
+    // Build tool item from the message (toolCall = original call info,
+    // content = args at creation time, mutated to result on tool_result).
+    if (m.toolCall) {
+      const item: ToolBatchItem = {
+        name: m.toolCall.function.name,
+        args: (() => {
+          try { return JSON.stringify(JSON.parse(m.toolCall.function.arguments), null, 2) }
+          catch { return m.toolCall.function.arguments }
+        })(),
+        result: m.role === 'tool_result' ? m.content : '',
+      }
+      batch.push(item)
+    }
+  }
+  flush()
+  return items
+})
+
 function truncate(s: string): string {
   return s.length > 10000 ? s.slice(0, 10000) + '\n\n... (truncated)' : s
 }
@@ -142,11 +177,27 @@ function truncate(s: string): string {
 
 .thought-inline { margin-bottom: 8px; opacity: 0.6; font-size: 0.85em; }
 .thought-text { font-size: 0.9em; white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow-y: auto; }
-.msg-thought, .msg-tool { margin: 4px 16px; }
-.tool-body {
-  font-size: 0.82em; white-space: pre-wrap; word-break: break-word;
-  background: rgba(255,255,255,0.04); padding: 12px; border-radius: 6px;
-  max-height: 350px; overflow-y: auto;
+.msg-thought, .msg-tool-batch { margin: 4px 16px; }
+
+.tc-list { display: flex; flex-direction: column; gap: 2px; }
+
+.tc-sub :deep(.n-collapse-item__header) {
+  font-size: 0.73em;
+  opacity: 0.55;
+}
+
+.tc-args {
+  font-size: 0.71em; white-space: pre-wrap; word-break: break-word;
+  color: rgba(255,255,255,0.35); line-height: 1.35;
+  max-height: 150px; overflow-y: auto; margin: 0;
+}
+
+.tc-result {
+  font-size: 0.71em; white-space: pre-wrap; word-break: break-word;
+  color: rgba(255,255,255,0.4); line-height: 1.35;
+  max-height: 200px; overflow-y: auto;
+  margin: 6px 0 0; padding: 6px 8px;
+  background: rgba(0,0,0,0.15); border-radius: 4px;
 }
 
 .msg-agent { padding: 4px 16px; max-width: 85%; align-self: flex-start; }

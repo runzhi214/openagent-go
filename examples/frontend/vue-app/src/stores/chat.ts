@@ -8,6 +8,10 @@ export const useChatStore = defineStore('chat', () => {
   const messages = ref<ChatMessage[]>([])
   const streaming = ref(false)
   const pendingApproval = ref<PendingApproval | null>(null)
+  // Queue for concurrent tool approvals (SSE events and HTTP responses
+  // race on different channels). The exposed pendingApproval shows the
+  // first item; approveTool pops it after the POST completes.
+  const _approvalQueue: PendingApproval[] = []
   const usage = ref<UsageInfo | null>(null)
   const error = ref<string | null>(null)
 
@@ -47,6 +51,8 @@ export const useChatStore = defineStore('chat', () => {
   ) {
     error.value = null
     streaming.value = true
+    pendingApproval.value = null
+    _approvalQueue.length = 0
     pendingToolCalls.clear()
     currentStreamMsg = null
     thinkingMsg = null
@@ -164,10 +170,15 @@ export const useChatStore = defineStore('chat', () => {
       }
 
       case 'tool_approval': {
-        pendingApproval.value = {
+        const approval: PendingApproval = {
           toolCall: event.tool_call!,
           sessionId: '',
           sessionType: 'single',
+        }
+        _approvalQueue.push(approval)
+        // Show first in queue (the one the user must decide on).
+        if (!pendingApproval.value) {
+          pendingApproval.value = _approvalQueue[0]
         }
         break
       }
@@ -242,13 +253,16 @@ export const useChatStore = defineStore('chat', () => {
 
   async function approveTool(sessionId: string, sessionType: 'single' | 'team' | 'plan', allowed: boolean, feedback?: string) {
     if (!pendingApproval.value) return
+    // Dequeue the current approval and advance to the next (or null).
+    _approvalQueue.shift()
+    pendingApproval.value = _approvalQueue[0] || null
+    // POST asynchronously — the UI is already updated.
     try {
       switch (sessionType) {
         case 'single': await api.approveTool(sessionId, allowed, feedback); break
         case 'team': await api.approveTeamTool(sessionId, allowed, feedback); break
         case 'plan': await api.approvePlanTool(sessionId, allowed, feedback); break
       }
-      pendingApproval.value = null
     } catch (e) {
       console.error('approveTool:', e)
     }
@@ -259,6 +273,7 @@ export const useChatStore = defineStore('chat', () => {
     messages.value = []
     streaming.value = false
     pendingApproval.value = null
+    _approvalQueue.length = 0
     usage.value = null
     error.value = null
     pendingToolCalls.clear()

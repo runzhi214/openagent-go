@@ -12,6 +12,7 @@ export const usePlanStore = defineStore('plan', () => {
   const waitingRetry = ref<string | null>(null)
   const planDone = ref(false)
   const pendingApproval = ref<PendingApproval | null>(null)
+  const _approvalQueue: PendingApproval[] = []
   const replanning = ref(false)
   const thinkingText = ref('')
 
@@ -133,10 +134,14 @@ export const usePlanStore = defineStore('plan', () => {
 
       case 'tool_approval': {
         if (event.tool_call) {
-          pendingApproval.value = {
+          const approval: PendingApproval = {
             toolCall: event.tool_call,
             sessionId: '',
             sessionType: 'plan',
+          }
+          _approvalQueue.push(approval)
+          if (!pendingApproval.value) {
+            pendingApproval.value = _approvalQueue[0]
           }
         }
         break
@@ -201,9 +206,10 @@ export const usePlanStore = defineStore('plan', () => {
 
   async function approveTool(sessionId: string, allowed: boolean, feedback?: string) {
     if (!pendingApproval.value) return
+    _approvalQueue.shift()
+    pendingApproval.value = _approvalQueue[0] || null
     try {
       await api.approvePlanTool(sessionId, allowed, feedback)
-      pendingApproval.value = null
     } catch (e) {
       console.error('plan approveTool:', e)
     }
@@ -249,6 +255,7 @@ export const usePlanStore = defineStore('plan', () => {
     waitingRetry.value = null
     planDone.value = false
     pendingApproval.value = null
+    _approvalQueue.length = 0
     replanning.value = false
     thinkingText.value = ''
   }
