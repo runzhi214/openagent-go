@@ -73,8 +73,6 @@
       <div v-if="error" class="error-msg">{{ error }}</div>
     </div>
 
-    <UsageBar :usage="usage" />
-
     <div class="input-area">
       <n-input
         v-model:value="inputText"
@@ -84,36 +82,66 @@
         :disabled="disabled"
         @keydown="onKeydown"
       />
-      <n-select
-        v-if="chatStore.availableModels.length > 1"
+      <n-button type="primary" :disabled="!inputText.trim() || disabled" @click="send" class="send-btn">Send</n-button>
+    </div>
+
+    <!-- Status bar: [pct] [bar] [tokens] · [model] · [msgs] -->
+    <div class="status-bar">
+      <span class="stat-item ctx" :style="{ color: ctkColor }">{{ ctkPct }}%</span>
+      <n-progress
+        type="line"
+        :percentage="ctkPct"
+        :color="ctkColor"
+        :height="6"
+        :border-radius="3"
+        :show-indicator="false"
+        style="width:80px;flex-shrink:0"
+      />
+      <span class="stat-label ctx-total">{{ ctxLabel }}</span>
+      <span class="stat-sep">·</span>
+      <n-popselect
+        v-if="chatStore.availableModels.length > 0"
         v-model:value="chatStore.selectedModelId"
         :options="chatStore.availableModels.map(m => ({ label: m.id, value: m.id }))"
-        size="small"
-        placeholder="Model"
-        class="model-select"
-      />
-      <n-button type="primary" :disabled="!inputText.trim() || disabled" @click="send" class="send-btn">Send</n-button>
+        trigger="click"
+      >
+        <span class="stat-item model">
+          {{ chatStore.selectedModelId || chatStore.availableModels[0].id }}
+        </span>
+      </n-popselect>
+      <span class="stat-sep">·</span>
+      <span class="stat-item msgs">{{ chatStore.messageCount || 0 }}</span>
+      <span class="stat-label">msgs</span>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, nextTick, watch, computed, onMounted } from 'vue'
-import { NEmpty, NCollapse, NCollapseItem, NInput, NButton, NSelect } from 'naive-ui'
+import { ref, nextTick, watch, computed, onMounted, watchEffect } from 'vue'
+import { NEmpty, NCollapse, NCollapseItem, NInput, NButton, NPopselect, NProgress } from 'naive-ui'
 import type { ChatMessage, UsageInfo } from '@/types'
 import { useChatStore } from '@/stores/chat'
 import MarkdownContent from '@/components/common/MarkdownContent.vue'
-import UsageBar from '@/components/chat/UsageBar.vue'
 
 const props = defineProps<{
   messages: ChatMessage[]
   usage: UsageInfo | null
   error: string | null
   disabled?: boolean
+  sessionId?: string
 }>()
 
-const emit = defineEmits<{ send: [text: string] }>()
+const emits = defineEmits<{ send: [text: string] }>()
 const chatStore = useChatStore()
+const ctkPct = computed(() => {
+  if (!props.usage?.contextWindow) return 0
+  return Math.round((props.usage.promptTokens / props.usage.contextWindow) * 100)
+})
+const ctkColor = computed(() => ctkPct.value > 90 ? '#ef4444' : ctkPct.value > 70 ? '#f59e0b' : '#22c55e')
+const ctxLabel = computed(() => {
+  if (!props.usage?.contextWindow) return ''
+  return `${props.usage.promptTokens.toLocaleString()} / ${props.usage.contextWindow.toLocaleString()}`
+})
 
 const inputText = ref('')
 const scrollRef = ref<HTMLElement | null>(null)
@@ -132,7 +160,7 @@ onMounted(() => { chatStore.fetchModels() })
 function send() {
   const t = inputText.value.trim()
   if (!t || props.disabled) return
-  emit('send', t)
+  emits('send', t)
   inputText.value = ''
 }
 
@@ -147,8 +175,6 @@ type DisplayItem =
   | { kind: 'tool_batch'; tools: ToolBatchItem[]; id: string }
 
 // Group consecutive tool_call/tool_result messages into batches.
-// Each tool message carries toolCall (name + args) and content (result).
-// Store is unchanged — this is a pure rendering transform.
 const displayItems = computed<DisplayItem[]>(() => {
   const items: DisplayItem[] = []
   let batch: ToolBatchItem[] = []
@@ -167,8 +193,6 @@ const displayItems = computed<DisplayItem[]>(() => {
       items.push({ kind: 'msg', msg: m })
       continue
     }
-    // Build tool item from the message (toolCall = original call info,
-    // content = args at creation time, mutated to result on tool_result).
     if (m.toolCall) {
       const item: ToolBatchItem = {
         name: m.toolCall.function.name,
@@ -324,7 +348,19 @@ function truncate(s: string): string {
   align-items: flex-end; flex-shrink: 0;
 }
 .send-btn { flex-shrink: 0; }
-.model-select { width: 160px; flex-shrink: 0; }
+
+.status-bar {
+  display: flex; align-items: center; gap: 8px; padding: 6px 16px; flex-shrink: 0;
+}
+.stat-item { font-size: 0.78em; font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat-label { font-size: 0.68em; opacity: 0.4; }
+.stat-sep { color: rgba(255,255,255,0.12); font-size: 0.7em; }
+.model { cursor: pointer; }
+.model:hover { opacity: 0.8; }
+.dim { opacity: 0.35; }
+.ctx { font-size: 0.78em; font-weight: 700; }
+.ctx-total { font-size: 0.7em; opacity: 0.4; font-variant-numeric: tabular-nums; }
+.msgs { color: rgba(255,255,255,0.55); }
 
 .error-msg {
   background: rgba(239, 68, 68, 0.12); color: #ef4444;

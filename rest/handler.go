@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"sync"
@@ -84,6 +85,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /sessions", h.handleCreateSession)
 	mux.HandleFunc("GET /sessions", h.handleListSessions)
 	mux.HandleFunc("GET /sessions/{id}", h.handleGetSession)
+	mux.HandleFunc("PATCH /sessions/{id}", h.handleUpdateSession)
+	mux.HandleFunc("GET /sessions/{id}/messages", h.handleListMessages)
 	mux.HandleFunc("DELETE /sessions/{id}", h.handleDeleteSession)
 	mux.HandleFunc("POST /sessions/{id}/chat", h.handleChat)
 	mux.HandleFunc("POST /sessions/{id}/approve", h.handleApprove)
@@ -183,8 +186,104 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	detail := SessionDetail{SessionInfo: s.info}
+	if s.agent != nil && s.agent.Model != nil {
+		detail.ContextWindow = s.agent.Model.ContextWindow()
+	}
+	if h.memory != nil {
+		if n, err := h.memory.Count(context.Background(), s.info.ID); err == nil {
+			detail.MessageCount = n
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(detail)
+}
+
+func (h *Handler) handleUpdateSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	var body struct {
+		Title string `json:"title"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
+		return
+	}
+
+	h.mu.RLock()
+	s, ok := h.sessions[id]
+	h.mu.RUnlock()
+	if !ok {
+		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+		return
+	}
+
+	s.mu.Lock()
+	s.info.Title = body.Title
+	if body.Title != "" {
+		s.info.UpdatedAt = time.Now()
+	}
+	s.mu.Unlock()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(s.info)
+}
+
+func (h *Handler) handleListMessages(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	h.mu.RLock()
+	_, ok := h.sessions[id]
+	h.mu.RUnlock()
+	if !ok {
+		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+		return
+	}
+	if h.memory == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]openagent.Message{})
+		return
+	}
+
+	limit := 50
+	if l, err := parseIntParam(r, "limit", 1, 200); err == nil {
+		limit = l
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	msgs, err := h.memory.Recent(ctx, id, limit)
+	if err != nil {
+		http.Error(w, `{"error":"failed to fetch messages"}`, http.StatusInternalServerError)
+		return
+	}
+	if msgs == nil {
+		msgs = []openagent.Message{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(msgs)
+}
+
+// parseIntParam parses an integer query parameter with bounds.
+func parseIntParam(r *http.Request, name string, min, max int) (int, error) {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return 0, fmt.Errorf("missing")
+	}
+	var n int
+	if _, err := fmt.Sscanf(raw, "%d", &n); err != nil {
+		return 0, fmt.Errorf("invalid integer")
+	}
+	if n < min {
+		n = min
+	}
+	if n > max {
+		n = max
+	}
+	return n, nil
 }
 
 func (h *Handler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
@@ -246,8 +345,14 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	h.mu.RUnlock()
 	if model == nil {
 		model = h.defaultModel
-		modelID = "default"
+		modelID = ""
 	}
+
+	// Persist the resolved model so GET /sessions reflects the actual model.
+	s.mu.Lock()
+	s.modelID = modelID
+	s.info.ModelID = modelID
+	s.mu.Unlock()
 
 	// Start the agent run in a background goroutine.
 	go func() {

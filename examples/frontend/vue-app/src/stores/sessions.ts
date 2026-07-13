@@ -5,26 +5,42 @@ import * as api from '@/api'
 
 export type AgentMode = 'single' | 'team' | 'plan'
 
+const emptyList: SessionInfo[] = []
+
 export const useSessionsStore = defineStore('sessions', () => {
-  const sessions = ref<SessionInfo[]>([])
+  const singleSessions = ref<SessionInfo[]>([])
+  const teamSessions   = ref<SessionInfo[]>([])
+  const planSessions   = ref<SessionInfo[]>([])
+
   const currentSessionId = ref<string | null>(null)
   const loading = ref(false)
 
-  const currentSession = computed(() =>
-    sessions.value.find(s => s.id === currentSessionId.value) ?? null,
-  )
+  function sessionsFor(mode: AgentMode) {
+    switch (mode) {
+      case 'single': return singleSessions
+      case 'team':   return teamSessions
+      case 'plan':   return planSessions
+    }
+  }
+
+  const currentSession = computed(() => {
+    const all = [...singleSessions.value, ...teamSessions.value, ...planSessions.value]
+    return all.find(s => s.id === currentSessionId.value) ?? null
+  })
 
   async function fetchSessions(mode: AgentMode) {
     loading.value = true
     try {
+      let list: SessionInfo[]
       switch (mode) {
-        case 'single': sessions.value = await api.listSessions(); break
-        case 'team': sessions.value = await api.listTeamSessions(); break
-        case 'plan': sessions.value = await api.listPlanSessions(); break
+        case 'single': list = await api.listSessions(); break
+        case 'team':   list = await api.listTeamSessions(); break
+        case 'plan':   list = await api.listPlanSessions(); break
       }
+      sessionsFor(mode).value = list
     } catch (e) {
       console.error('fetchSessions:', e)
-      sessions.value = []
+      sessionsFor(mode).value = []
     } finally {
       loading.value = false
     }
@@ -35,10 +51,10 @@ export const useSessionsStore = defineStore('sessions', () => {
       let info: SessionInfo
       switch (mode) {
         case 'single': info = await api.createSession({ title }); break
-        case 'team': info = await api.createTeamSession({ title }); break
-        case 'plan': info = await api.createPlanSession({ title }); break
+        case 'team':   info = await api.createTeamSession({ title }); break
+        case 'plan':   info = await api.createPlanSession({ title }); break
       }
-      sessions.value.unshift(info)
+      sessionsFor(mode).value.unshift(info)
       currentSessionId.value = info.id
       return info
     } catch (e) {
@@ -51,10 +67,11 @@ export const useSessionsStore = defineStore('sessions', () => {
     try {
       switch (mode) {
         case 'single': await api.deleteSession(id); break
-        case 'team': await api.deleteTeamSession(id); break
-        case 'plan': await api.deletePlanSession(id); break
+        case 'team':   await api.deleteTeamSession(id); break
+        case 'plan':   await api.deletePlanSession(id); break
       }
-      sessions.value = sessions.value.filter(s => s.id !== id)
+      const s = sessionsFor(mode)
+      s.value = s.value.filter(x => x.id !== id)
       if (currentSessionId.value === id) {
         currentSessionId.value = null
       }
@@ -68,7 +85,7 @@ export const useSessionsStore = defineStore('sessions', () => {
   }
 
   return {
-    sessions, currentSessionId, currentSession, loading,
+    sessionsFor, currentSessionId, currentSession, loading,
     fetchSessions, createSession, deleteSession, selectSession,
   }
 })

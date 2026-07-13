@@ -83,6 +83,7 @@ func (h *PlanHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /plan/sessions", h.handleCreateSession)
 	mux.HandleFunc("GET /plan/sessions", h.handleListSessions)
 	mux.HandleFunc("GET /plan/sessions/{id}", h.handleGetSession)
+	mux.HandleFunc("GET /plan/sessions/{id}/messages", h.handlePlanMessages)
 	mux.HandleFunc("PATCH /plan/sessions/{id}", h.handleUpdateSession)
 	mux.HandleFunc("DELETE /plan/sessions/{id}", h.handleDeleteSession)
 	mux.HandleFunc("POST /plan/sessions/{id}/generate", h.handleGenerate)
@@ -161,7 +162,13 @@ func (h *PlanHandler) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(s.info)
+	detail := SessionDetail{SessionInfo: s.info}
+	if h.memory != nil {
+		if n, err := h.memory.Count(context.Background(), s.info.ID); err == nil {
+			detail.MessageCount = n
+		}
+	}
+	json.NewEncoder(w).Encode(detail)
 }
 
 func (h *PlanHandler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
@@ -207,6 +214,43 @@ func (h *PlanHandler) handleUpdateSession(w http.ResponseWriter, r *http.Request
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+}
+
+func (h *PlanHandler) handlePlanMessages(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	h.mu.RLock()
+	_, ok := h.sessions[id]
+	h.mu.RUnlock()
+	if !ok {
+		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+		return
+	}
+	if h.memory == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]openagent.Message{})
+		return
+	}
+
+	limit := 50
+	if l, err := parseIntParam(r, "limit", 1, 200); err == nil {
+		limit = l
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	msgs, err := h.memory.Recent(ctx, id, limit)
+	if err != nil {
+		http.Error(w, `{"error":"failed to fetch messages"}`, http.StatusInternalServerError)
+		return
+	}
+	if msgs == nil {
+		msgs = []openagent.Message{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(msgs)
 }
 
 // ── Plan generation ──

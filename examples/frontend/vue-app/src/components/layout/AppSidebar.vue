@@ -28,7 +28,22 @@
             :class="{ active: s.id === currentId }"
             @click="selectSession(s.id)"
           >
-            <n-ellipsis class="session-title">{{ s.title || s.id.slice(0, 8) }}</n-ellipsis>
+            <div class="session-info">
+              <div v-if="editingId !== s.id" class="session-title" @dblclick.stop="startEdit(s)">{{ s.title || 'untitled' }}</div>
+              <input
+                v-else
+                ref="editInput"
+                v-model="editTitle"
+                class="session-title-input"
+                @keydown.enter="saveEdit(s.id)"
+                @keydown.escape="cancelEdit"
+                @blur="saveEdit(s.id)"
+                @click.stop
+              />
+              <div class="session-meta">
+                <span v-if="s.modelId" class="meta-tag model">{{ s.modelId }}</span>
+              </div>
+            </div>
             <n-button size="tiny" text class="delete-btn" @click.stop="handleDelete(s.id)">
               <template #icon><span style="font-size:14px">&times;</span></template>
             </n-button>
@@ -42,11 +57,13 @@
 </template>
 
 <script setup lang="ts">
-import { computed, watch, ref, onMounted } from 'vue'
+import { computed, watch, ref, onMounted, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { NLayoutSider, NButton, NButtonGroup, NSpin, NEmpty, NText, NEllipsis } from 'naive-ui'
 import { useSessionsStore, type AgentMode } from '@/stores/sessions'
 import { useChatStore } from '@/stores/chat'
+import * as api from '@/api'
+import type { SessionInfo } from '@/types'
 import PipelinePanel from '@/components/pipeline/PipelinePanel.vue'
 
 const router = useRouter()
@@ -55,6 +72,8 @@ const store = useSessionsStore()
 const chat = useChatStore()
 const pipelineRef = ref<InstanceType<typeof PipelinePanel> | null>(null)
 const currentId = ref<string | null>(null)
+const editingId = ref<string | null>(null)
+const editTitle = ref('')
 
 const modes = [
   { key: 'single' as AgentMode, label: 'Chat' },
@@ -69,9 +88,20 @@ const currentMode = computed<AgentMode>(() => {
   return 'single'
 })
 
-const sessions = computed(() => store.sessions)
+const sessions = computed(() => store.sessionsFor(currentMode.value).value)
 
-watch(currentMode, (mode) => { store.fetchSessions(mode) }, { immediate: true })
+watch(currentMode, async (mode) => {
+  chat.clearChat()
+  store.currentSessionId = null // clear before fetch so old sessionId doesn't leak
+  await store.fetchSessions(mode)
+  const s = sessions.value
+  if (s.length > 0) {
+    store.selectSession(s[0].id)
+    router.push(`/${mode}/${s[0].id}`)
+  } else {
+    await handleCreate()
+  }
+}, { immediate: true })
 
 watch(currentId, () => { pipelineRef.value?.reset() })
 
@@ -100,6 +130,32 @@ async function handleDelete(id: string) {
   await store.deleteSession(id, currentMode.value)
   if (currentId.value === id) router.push(`/${currentMode.value}`)
 }
+
+function startEdit(s: SessionInfo) {
+  editingId.value = s.id
+  editTitle.value = s.title || ''
+  nextTick(() => {
+    const el = document.querySelector<HTMLInputElement>('.session-title-input')
+    el?.focus()
+    el?.select()
+  })
+}
+function cancelEdit() { editingId.value = null }
+async function saveEdit(id: string) {
+  if (editingId.value !== id) return
+  const title = editTitle.value.trim()
+  editingId.value = null
+  if (!title) return
+  try {
+    const m = currentMode.value
+    if (m === 'single') await api.updateSession(id, title)
+    else if (m === 'team') await api.updateTeamSession(id, title)
+    else if (m === 'plan') await api.updatePlanSession(id, title)
+    // Update the session in the local list.
+    const s = sessions.value.find(x => x.id === id)
+    if (s) { s.title = title; s.updatedAt = new Date().toISOString() }
+  } catch { /* ignore */ }
+}
 </script>
 
 <style scoped>
@@ -119,7 +175,15 @@ async function handleDelete(id: string) {
 }
 .session-item:hover { background: var(--n-color-pressed); }
 .session-item.active { background: color-mix(in srgb, var(--n-color-target) 20%, transparent); }
-.session-title { flex: 1; font-size: 0.88em; }
+.session-info { flex: 1; min-width: 0; }
+.session-title { font-size: 0.88em; cursor: text; }
+.session-title-input {
+  font-size: 0.88em; width: 100%; background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.15); border-radius: 4px;
+  padding: 2px 6px; color: inherit; outline: none;
+}
+.session-meta { display: flex; gap: 4px; margin-top: 2px; }
+.meta-tag { font-size: 0.68em; opacity: 0.45; padding: 0 4px; border-radius: 3px; background: rgba(255,255,255,0.05); }
 .delete-btn { opacity: 0; transition: opacity 0.15s; }
 .session-item:hover .delete-btn { opacity: 1; }
 </style>

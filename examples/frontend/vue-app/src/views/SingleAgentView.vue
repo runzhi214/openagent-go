@@ -4,6 +4,7 @@
     :usage="chat.usage"
     :error="chat.error"
     :disabled="chat.streaming || !sessionId"
+    :session-id="sessionId || undefined"
     @send="handleSend"
   />
   <ToolApprovalDialog
@@ -15,7 +16,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, watch, onBeforeUnmount } from 'vue'
+import { computed, watchEffect, onBeforeUnmount } from 'vue'
 import { useRoute } from 'vue-router'
 import { useChatStore } from '@/stores/chat'
 import { useSessionsStore } from '@/stores/sessions'
@@ -28,7 +29,13 @@ const sessions = useSessionsStore()
 
 const sessionId = computed(() => (route.params.sessionId as string) || sessions.currentSessionId)
 
-watch(sessionId, () => { chat.clearChat() })
+watchEffect(() => {
+  const sid = sessionId.value
+  if (!sid) return
+  chat.clearChat()
+  chat.fetchSessionDetail(sid, 'single')
+  chat.fetchMessages(sid, 'single')
+})
 onBeforeUnmount(() => { chat.clearChat() })
 
 function handleSend(text: string) {

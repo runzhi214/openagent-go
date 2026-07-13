@@ -92,6 +92,17 @@ func main() {
 		openagent.WithMaxTurns(10),
 	)
 	handler := rest.NewHandler(agent)
+	// Register additional models so the frontend model selector shows >1 option.
+	// These share the same API key and base URL — only the model ID differs.
+	if apiKey != "" && baseURL != "" {
+		opts := []struct{ id, label string }{
+			{"deepseek-v4-flash", "deepseek"},
+			{"deepseek-v4-pro", "deepseek"},
+		}
+		for _, o := range opts {
+			handler.RegisterModel(o.id, openai.New(apiKey, o.id, baseURL), o.label)
+		}
+	}
 
 	// ── Team ──
 	analyst := openagent.NewAgent("analyst",
@@ -180,6 +191,28 @@ func main() {
 	handler.Register(mux)
 	teamHandler.Register(mux)
 	planHandler.Register(mux)
+
+	// Frontend static files (optional, env FRONTEND_DIR)
+	if frontendDir := os.Getenv("FRONTEND_DIR"); frontendDir != "" {
+		root := http.FileServer(http.Dir(frontendDir))
+		mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+			http.ServeFile(w, r, filepath.Join(frontendDir, "index.html"))
+		})
+		mux.Handle("GET /{path...}", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path := r.PathValue("path")
+			if path == "" {
+				http.ServeFile(w, r, filepath.Join(frontendDir, "index.html"))
+				return
+			}
+			full := filepath.Join(frontendDir, path)
+			if _, err := os.Stat(full); os.IsNotExist(err) {
+				http.ServeFile(w, r, filepath.Join(frontendDir, "index.html"))
+				return
+			}
+			root.ServeHTTP(w, r)
+		}))
+		log.Printf("  Frontend: serving %s", frontendDir)
+	}
 
 	// ── Middleware stack (outermost first) ──
 	var h http.Handler = mux

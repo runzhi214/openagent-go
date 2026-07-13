@@ -237,20 +237,23 @@ func stubList(w http.ResponseWriter, r *http.Request) {
 }
 
 func serveFrontend(mux *http.ServeMux, frontendDir string) {
-	fsrv := http.FileServer(http.Dir(frontendDir))
+	root := http.FileServer(http.Dir(frontendDir))
+
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, filepath.Join(frontendDir, "index.html"))
+	})
+
 	mux.Handle("GET /{path...}", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.PathValue("path")
-		full := filepath.Join(frontendDir, path)
-		if _, err := os.Stat(full); os.IsNotExist(err) {
-			for _, ext := range []string{".js", ".css", ".svg", ".ico", ".png", ".woff", ".woff2"} {
-				if len(path) >= len(ext) && path[len(path)-len(ext):] == ext {
-					http.NotFound(w, r)
-					return
-				}
-			}
+		if path == "" {
 			http.ServeFile(w, r, filepath.Join(frontendDir, "index.html"))
 			return
 		}
-		fsrv.ServeHTTP(w, r)
+		full := filepath.Join(frontendDir, path)
+		if _, err := os.Stat(full); os.IsNotExist(err) {
+			http.ServeFile(w, r, filepath.Join(frontendDir, "index.html"))
+			return
+		}
+		root.ServeHTTP(w, r)
 	}))
 }

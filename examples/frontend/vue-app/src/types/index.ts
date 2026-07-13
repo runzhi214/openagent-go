@@ -11,6 +11,11 @@ export interface SessionInfo {
   updatedAt: string
 }
 
+export interface SessionDetail extends SessionInfo {
+  contextWindow: number
+  messageCount: number
+}
+
 export interface CreateSessionRequest {
   agentName?: string
   title?: string

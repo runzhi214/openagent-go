@@ -9,6 +9,8 @@ export const useChatStore = defineStore('chat', () => {
   const streaming = ref(false)
   const selectedModelId = ref<string>('')
   const availableModels = ref<Array<{ id: string; provider?: string }>>([])
+  const contextWindow = ref(0)
+  const messageCount = ref(0)
   const pendingApproval = ref<PendingApproval | null>(null)
   // Queue for concurrent tool approvals (SSE events and HTTP responses
   // race on different channels). The exposed pendingApproval shows the
@@ -45,12 +47,16 @@ export const useChatStore = defineStore('chat', () => {
     return messages.value[messages.value.length - 1]!
   }
 
+  const currentSessionId = ref<string | null>(null)
+  const currentSessionType = ref<'single' | 'team' | 'plan'>('single')
+
   function sendMessage(
     sessionId: string,
     text: string,
     sessionType: 'single' | 'team' | 'plan',
   ) {
-    const modelId = selectedModelId.value || undefined
+    currentSessionType.value = sessionType
+    const modelId = selectedModelId.value || availableModels.value[0]?.id
     error.value = null
     streaming.value = true
     pendingApproval.value = null
@@ -331,7 +337,56 @@ export const useChatStore = defineStore('chat', () => {
     try {
       const data = await api.listModels()
       availableModels.value = data.models || []
+      if (availableModels.value.length > 0 && !selectedModelId.value) {
+        selectedModelId.value = availableModels.value[0].id
+      }
     } catch { /* /models not available — use empty list */ }
+  }
+
+  async function fetchSessionDetail(sessionId: string, type?: 'single' | 'team' | 'plan') {
+    const t = type || currentSessionType.value
+    try {
+      const fn = t === 'team' ? api.getTeamSessionDetail :
+                t === 'plan' ? api.getPlanSessionDetail :
+                api.getSessionDetail
+      const d = await fn(sessionId)
+      contextWindow.value = d.contextWindow || 0
+      messageCount.value = d.messageCount || 0
+      if (d.modelId) selectedModelId.value = d.modelId
+    } catch { /* ignore */ }
+  }
+
+   async function fetchMessages(sessionId: string, type?: 'single' | 'team' | 'plan') {
+    const t = type || currentSessionType.value
+    try {
+      const fn = t === 'team' ? api.listTeamMessages :
+                t === 'plan' ? api.listPlanMessages :
+                api.listMessages
+      const msgs = await fn(sessionId, 100, 0)
+      const converted: ChatMessage[] = []
+      for (const m of msgs) {
+        const role = m.role === 'user' ? 'user' :
+                     m.role === 'assistant' && m.tool_calls?.length > 0 ? 'tool_call' :
+                     m.role === 'assistant' ? 'agent' :
+                     m.role === 'tool' ? 'tool_result' : m.role
+        const msg: ChatMessage = {
+          id: `${sessionId}-${converted.length}`,
+          role: role as any,
+          content: m.content || '',
+          thoughtContent: m.reasoning_content || undefined,
+          toolCallId: m.tool_call_id || undefined,
+          timestamp: Date.now() - converted.length,
+        }
+        if (m.tool_calls && m.tool_calls.length > 0) {
+          msg.toolCall = {
+            id: m.tool_call_id || '',
+            function: { name: m.tool_calls[0].function.name, arguments: m.tool_calls[0].function.arguments },
+          }
+        }
+        converted.push(msg)
+      }
+      messages.value = converted
+    } catch { /* ignore — keep current messages */ }
   }
 
   function clearChat() {
@@ -350,7 +405,8 @@ export const useChatStore = defineStore('chat', () => {
 
   return {
     messages, streaming, pendingApproval, usage, error,
-    selectedModelId, availableModels,
-    sendMessage, approveTool, clearChat, setStageHandler, fetchModels,
+    selectedModelId, availableModels, contextWindow, messageCount,
+    sendMessage, approveTool, clearChat, setStageHandler, fetchModels, fetchSessionDetail,
+    fetchMessages,
   }
 })

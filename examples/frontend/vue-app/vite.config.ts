@@ -12,6 +12,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      '/models':     'http://localhost:8080',
       '/sessions':   'http://localhost:8080',  // single-agent API
       '/team/sessions': 'http://localhost:8080',  // team API only
       '/plan/sessions': 'http://localhost:8080',  // plan API only

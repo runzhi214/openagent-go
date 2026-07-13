@@ -36,6 +36,13 @@ type SessionInfo struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
+// SessionDetail is a single session with runtime info.
+type SessionDetail struct {
+	SessionInfo
+	ContextWindow int `json:"contextWindow"`
+	MessageCount  int `json:"messageCount"`
+}
+
 // ── Request / Response types ── [satirize]
 
 // CreateSessionRequest is the optional body for POST /sessions.

@@ -187,8 +187,61 @@ export function retryPlanStep(sessionId: string, stepId: string): Promise<{ stat
   return request(`/plan/sessions/${sessionId}/steps/${stepId}/retry`, { method: 'POST' })
 }
 
+export function getSessionDetail(sessionId: string): Promise<SessionInfo & { contextWindow: number; messageCount: number }> {
+  return request(`/sessions/${sessionId}`)
+}
+
+export function getTeamSessionDetail(sessionId: string): Promise<SessionInfo & { contextWindow: number; messageCount: number }> {
+  return request(`/team/sessions/${sessionId}`)
+}
+
+export function getPlanSessionDetail(sessionId: string): Promise<SessionInfo & { contextWindow: number; messageCount: number }> {
+  return request(`/plan/sessions/${sessionId}`)
+}
+
+export function updateSession(sessionId: string, title: string): Promise<SessionInfo> {
+  return request<SessionInfo>(`/sessions/${sessionId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ title }),
+  })
+}
+
+export function updateTeamSession(sessionId: string, title: string): Promise<SessionInfo> {
+  return request<SessionInfo>(`/team/sessions/${sessionId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ title }),
+  })
+}
+
+export function updatePlanSession(sessionId: string, title: string): Promise<SessionInfo> {
+  return request<SessionInfo>(`/plan/sessions/${sessionId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ title }),
+  })
+}
+
 export function listModels(): Promise<{ models: Array<{ id: string; provider?: string }> }> {
   return request('/models')
+}
+
+export function listMessages(sessionId: string, limit?: number, before?: number): Promise<any[]> {
+  return _listMessages('/sessions', sessionId, limit, before)
+}
+
+export function listTeamMessages(sessionId: string, limit?: number, before?: number): Promise<any[]> {
+  return _listMessages('/team/sessions', sessionId, limit, before)
+}
+
+export function listPlanMessages(sessionId: string, limit?: number, before?: number): Promise<any[]> {
+  return _listMessages('/plan/sessions', sessionId, limit, before)
+}
+
+function _listMessages(base: string, sessionId: string, limit?: number, before?: number): Promise<any[]> {
+  const params = new URLSearchParams()
+  if (limit) params.set('limit', String(limit))
+  if (before && before > 0) params.set('before', String(before))
+  const qs = params.toString()
+  return request(`${base}/${sessionId}/messages${qs ? '?' + qs : ''}`)
 }
 
 export function replan(sessionId: string, feedback: string): Promise<{ status: string }> {
