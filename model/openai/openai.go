@@ -34,6 +34,10 @@ func New(apiKey, modelID, baseURL string) *Model {
 
 func (m *Model) WithContextWindow(tokens int) *Model { m.contextWindow = tokens; return m }
 func (m *Model) ContextWindow() int                  { return m.contextWindow }
+func (m *Model) TokenizerModel() string               { return m.modelID }
+
+// Ensure *Model implements the optional TokenizerModeler interface.
+var _ openagent.TokenizerModeler = (*Model)(nil)
 
 func (m *Model) ChatCompletion(ctx context.Context, req openagent.ChatCompletionRequest) (*openagent.ChatCompletionResponse, error) {
 	modelID := req.Model

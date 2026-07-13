@@ -22,6 +22,9 @@ type runner struct {
 	loadedSkills map[string]string   // name → body, populated by use_skill
 	builtinTools []FunctionDefinition // auto-injected tools (use_skill, reload_skills)
 	compressed   *CompressedContext  // Memory.Compressed result, set once per Run()
+
+	// Per-run state
+	runModel Model // resolved model for this run (session override > agent default)
 }
 
 // compactionInfo carries compaction outcome from prepareMemory back to run().
@@ -56,6 +59,12 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 	maxTurns := r.agent.MaxTurns
 	if maxTurns <= 0 {
 		maxTurns = 20
+	}
+
+	// Resolve model for this run.
+	r.runModel = r.agent.Model
+	if session.Model != nil {
+		r.runModel = session.Model
 	}
 
 	// Init: cache skills if loader present
@@ -214,11 +223,11 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 		// pipeline normally keeps the working set within budget; this triggers
 		// only when system prompts, compressed context, or large tool results
 		// push it past the hard limit.
-		if cw := r.agent.Model.ContextWindow(); cw > 0 {
-			est := countMessages(session.ModelID, messages)
+		if cw := r.runModel.ContextWindow(); cw > 0 {
+			est := countMessages(tokenizerModelID(r.runModel), messages)
 			if est > cw {
 				before := len(messages)
-				messages = trimToContextWindow(session.ModelID, messages, cw)
+				messages = trimToContextWindow(tokenizerModelID(r.runModel), messages, cw)
 				trimmed := before - len(messages)
 				// When using the default prompt builder, every non-system
 				// message in the model input originates from workingMessages,
@@ -387,7 +396,7 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 	}
 
 	result.TurnCount = turn
-	result.ContextWindow = r.agent.Model.ContextWindow()
+	result.ContextWindow = r.runModel.ContextWindow()
 	if ch != nil {
 		ch <- StreamEvent{Type: StreamDone, Result: result}
 	}
@@ -404,7 +413,7 @@ func (r *runner) workingTokenBudget() int {
 	if r.agent.MaxWorkingTokens > 0 {
 		return r.agent.MaxWorkingTokens
 	}
-	if cw := r.agent.Model.ContextWindow(); cw > 0 {
+	if cw := r.runModel.ContextWindow(); cw > 0 {
 		return cw * 7 / 10 // 70%
 	}
 	return 20000
@@ -453,7 +462,7 @@ func (r *runner) prepareMemory(ctx context.Context, session Session) ([]Message,
 	overflow := len(msgs)
 	tokens := 0
 	for i := len(msgs) - 1; i >= 0; i-- {
-		tokens += countMessageTokens(session.ModelID, msgs[i])
+		tokens += countMessageTokens(tokenizerModelID(r.runModel), msgs[i])
 		if tokens > budget {
 			overflow = i + 1 // messages[0:i] overflow, messages[i+1:] fit
 			break
@@ -832,6 +841,18 @@ func toolDefinitions(tools []Tool) []FunctionDefinition {
 	return defs
 }
 
+// tokenizerModelID returns the canonical encoding name for token counting.
+// Uses the optional TokenizerModeler interface, falling back to "gpt-4"
+// (cl100k_base, which covers most modern LLMs).
+func tokenizerModelID(model Model) string {
+	if tm, ok := model.(TokenizerModeler); ok {
+		if name := tm.TokenizerModel(); name != "" {
+			return name
+		}
+	}
+	return "gpt-4"
+}
+
 // countMessageTokens returns the token count for a message using the
 // model-specific tokenizer (tiktoken). Falls back to a heuristic if the
 // tokenizer is unavailable.
@@ -962,7 +983,7 @@ func (r *runner) callModel(ctx context.Context, req ChatCompletionRequest, ch ch
 
 // callModelOnce tries streaming first, falls back to non-streaming.
 func (r *runner) callModelOnce(ctx context.Context, req ChatCompletionRequest, ch chan<- StreamEvent) (*ChatCompletionResponse, error) {
-	reader, err := r.agent.Model.ChatCompletionStream(ctx, req)
+	reader, err := r.runModel.ChatCompletionStream(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -973,7 +994,7 @@ func (r *runner) callModelOnce(ctx context.Context, req ChatCompletionRequest, c
 	// Non-streaming fallback: the model doesn't support streaming.
 	// Emit the full response as a single text_delta so consumers (WebUI, TUI)
 	// see output immediately rather than waiting for StreamDone.
-	resp, err := r.agent.Model.ChatCompletion(ctx, req)
+	resp, err := r.runModel.ChatCompletion(ctx, req)
 	if err != nil {
 		return nil, err
 	}

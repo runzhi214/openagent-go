@@ -53,6 +53,14 @@ type Model interface {
 	ContextWindow() int
 }
 
+// TokenizerModeler is an optional interface for Models that know which
+// tokenizer encoding to use. The Runner calls this to get a canonical
+// model name for tiktoken rather than using session.ModelID (which may
+// be a user-assigned label like "deepseek-v3" that tiktoken doesn't map).
+type TokenizerModeler interface {
+	TokenizerModel() string
+}
+
 // ── Streaming types ──
 
 // StreamReader is an iterator over response deltas.

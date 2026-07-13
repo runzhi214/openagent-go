@@ -24,8 +24,17 @@ import (
 //	mux := http.NewServeMux()
 //	handler.Register(mux)
 //	http.ListenAndServe(":8080", mux)
+// ModelInfo describes a registered model for the frontend.
+type ModelInfo struct {
+	ID       string `json:"id"`
+	Provider string `json:"provider,omitempty"`
+}
+
 type Handler struct {
-	model        openagent.Model
+	defaultModel openagent.Model
+	models       map[string]openagent.Model // modelID → model instance
+	modelList    []ModelInfo                // ordered list for /models endpoint
+
 	memory       openagent.Memory
 	tools        []openagent.Tool
 	instructions string
@@ -47,7 +56,9 @@ type Handler struct {
 // are captured as the template for per-session Agent instances.
 func NewHandler(agent *openagent.Agent) *Handler {
 	return &Handler{
-		model:        agent.Model,
+		defaultModel: agent.Model,
+		models:       map[string]openagent.Model{"default": agent.Model},
+		modelList:    []ModelInfo{{ID: "default", Provider: ""}},
 		memory:       agent.Memory,
 		tools:        agent.Tools,
 		instructions: agent.Instructions,
@@ -58,6 +69,16 @@ func NewHandler(agent *openagent.Agent) *Handler {
 	}
 }
 
+// RegisterModel adds a model to the handler's registry.
+// id is the string the frontend sends as modelID (e.g. "deepseek-v3").
+// provider is optional metadata shown in /models (e.g. "openai", "anthropic").
+func (h *Handler) RegisterModel(id string, model openagent.Model, provider string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.models[id] = model
+	h.modelList = append(h.modelList, ModelInfo{ID: id, Provider: provider})
+}
+
 // Register adds the handler's routes to mux using Go 1.22+ patterns.
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /sessions", h.handleCreateSession)
@@ -66,6 +87,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /sessions/{id}", h.handleDeleteSession)
 	mux.HandleFunc("POST /sessions/{id}/chat", h.handleChat)
 	mux.HandleFunc("POST /sessions/{id}/approve", h.handleApprove)
+	mux.HandleFunc("GET /models", h.handleListModels)
 }
 
 // WithSessionTTL sets the idle duration after which inactive sessions are
@@ -214,10 +236,17 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	sub := h.bus.SubscribeLive(id)
 	defer h.bus.Unsubscribe(id, sub)
 
-	// Resolve model: chat-level override > session default.
+	// Resolve model: chat-level override > session default > handler default.
 	modelID := body.ModelID
 	if modelID == "" {
 		modelID = s.modelID
+	}
+	h.mu.RLock()
+	model := h.models[modelID]
+	h.mu.RUnlock()
+	if model == nil {
+		model = h.defaultModel
+		modelID = "default"
 	}
 
 	// Start the agent run in a background goroutine.
@@ -229,6 +258,7 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 			ID:        id,
 			AgentName: s.info.AgentName,
 			ModelID:   modelID,
+			Model:     model,
 			CreatedAt: s.info.CreatedAt,
 		}
 
@@ -300,6 +330,18 @@ func (h *Handler) handleApprove(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": reason})
 }
 
+// ── Models ──
+
+func (h *Handler) handleListModels(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	models := make([]ModelInfo, len(h.modelList))
+	copy(models, h.modelList)
+	h.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"models": models})
+}
+
 // ── Session management ──
 
 func (h *Handler) getOrCreateSession(id string) *sessionState {
@@ -329,7 +371,7 @@ func (h *Handler) newSession(info SessionInfo, modelID string) *sessionState {
 	}
 
 	s.agent = openagent.NewAgent(info.AgentName,
-		openagent.WithModel(h.model),
+		openagent.WithModel(h.defaultModel),
 		openagent.WithMemory(h.memory),
 		openagent.WithTools(h.tools...),
 		openagent.WithInstructions(h.instructions),
