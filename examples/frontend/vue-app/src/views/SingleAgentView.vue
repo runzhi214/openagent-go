@@ -32,9 +32,7 @@ const sessionId = computed(() => (route.params.sessionId as string) || sessions.
 watchEffect(() => {
   const sid = sessionId.value
   if (!sid) return
-  chat.clearChat()
-  chat.fetchSessionDetail(sid, 'single')
-  chat.fetchMessages(sid, 'single')
+  chat.activateSession(sid)
 })
 onBeforeUnmount(() => { chat.clearChat() })
 

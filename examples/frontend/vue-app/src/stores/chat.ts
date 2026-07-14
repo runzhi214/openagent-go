@@ -1,54 +1,155 @@
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import type { ChatMessage, SSEEvent, PendingApproval, UsageInfo, SSEToolCall } from '@/types'
 import { streamChat } from '@/api/sse'
 import * as api from '@/api'
 
+// ── Per-session state ──
+// Each session has its own message list, streaming state, and SSE controller.
+// Switching sessions preserves the old session's state (including live stream)
+// so you can switch back mid-generation and pick up where you left off.
+
+interface SessionPane {
+  messages: ChatMessage[]
+  streaming: boolean
+  usage: UsageInfo | null
+  error: string | null
+  abortController: AbortController | null
+  currentStreamMsg: ChatMessage | null
+  thinkingMsg: ChatMessage | null
+  pendingThought: string
+  pendingToolCalls: Map<string, ChatMessage>
+  pendingApproval: PendingApproval | null
+  _approvalQueue: PendingApproval[]
+  _fetched: boolean // true after initial message load
+}
+
 export const useChatStore = defineStore('chat', () => {
-  const messages = ref<ChatMessage[]>([])
-  const streaming = ref(false)
+  // ── Global (cross-session) state ──
   const selectedModelId = ref<string>('')
   const availableModels = ref<Array<{ id: string; provider?: string }>>([])
   const contextWindow = ref(0)
   const messageCount = ref(0)
-  const pendingApproval = ref<PendingApproval | null>(null)
-  // Queue for concurrent tool approvals (SSE events and HTTP responses
-  // race on different channels). The exposed pendingApproval shows the
-  // first item; approveTool pops it after the POST completes.
-  const _approvalQueue: PendingApproval[] = []
-  const usage = ref<UsageInfo | null>(null)
-  const error = ref<string | null>(null)
-
-  let abortController: AbortController | null = null
-  let currentStreamMsg: ChatMessage | null = null
-  let pendingThought: string = ''
-  let thinkingMsg: ChatMessage | null = null
-  let pendingToolCalls: Map<string, ChatMessage> = new Map()
+  const currentSessionId = ref<string | null>(null)
+  const currentSessionType = ref<'single' | 'team' | 'plan'>('single')
   let onStageEvent: ((event: any) => void) | null = null
 
-  function setStageHandler(fn: ((event: any) => void) | null) {
-    onStageEvent = fn
+  // ── Per-session pane cache ──
+  const _panes = new Map<string, SessionPane>()
+
+  function makePane(): SessionPane {
+    return {
+      messages: [],
+      streaming: false,
+      usage: null,
+      error: null,
+      abortController: null,
+      currentStreamMsg: null,
+      thinkingMsg: null,
+      pendingThought: '',
+      pendingToolCalls: new Map(),
+      pendingApproval: null,
+      _approvalQueue: [],
+      _fetched: false,
+    }
   }
 
-  function msgId() {
-    return crypto.randomUUID()
+  function getPane(sid: string): SessionPane {
+    let p = _panes.get(sid)
+    if (!p) {
+      p = makePane()
+      _panes.set(sid, p)
+    }
+    return p
   }
 
-  function now() {
-    return Date.now()
+  // ── Active-session views (what the UI reads) ──
+  // These are plain reactive refs — on session switch they are synced
+  // from the target pane's state. They must stay as plain refs (not
+  // computed) because handleEvent mutates them via pushMsg etc.
+  const messages = ref<ChatMessage[]>([])
+  const streaming = ref(false)
+  const usage = ref<UsageInfo | null>(null)
+  const error = ref<string | null>(null)
+  const pendingApproval = ref<PendingApproval | null>(null)
+  // Runtime helpers (not exported, but swapped on session switch)
+  let _abortController: AbortController | null = null
+  let _currentStreamMsg: ChatMessage | null = null
+  let _thinkingMsg: ChatMessage | null = null
+  let _pendingThought = ''
+  let _pendingToolCalls: Map<string, ChatMessage> = new Map()
+  let _approvalQueue: PendingApproval[] = []
+
+  /** Save current active state back into its pane. */
+  function saveActive() {
+    const sid = currentSessionId.value
+    if (!sid) return
+    const p = getPane(sid)
+    p.messages = messages.value
+    p.streaming = streaming.value
+    p.usage = usage.value
+    p.error = error.value
+    p.abortController = _abortController
+    p.currentStreamMsg = _currentStreamMsg
+    p.thinkingMsg = _thinkingMsg
+    p.pendingThought = _pendingThought
+    p.pendingToolCalls = _pendingToolCalls
+    p.pendingApproval = pendingApproval.value
+    p._approvalQueue = _approvalQueue
   }
 
-  /** Push a message to the list and return its reactive proxy.
-   *  Vue wraps objects pushed into a reactive array with a Proxy.
-   *  All callers MUST mutate the returned proxy — not the raw object —
-   *  otherwise Vue won't detect the change and won't re-render. */
+  /** Restore target session's state into the active refs.
+   *  After restoreActive, pane.messages IS the reactive proxy backed by
+   *  the ref — so mutations via pane.messages.push() trigger Vue reactivity. */
+  function restoreActive(sid: string) {
+    const p = getPane(sid)
+    messages.value = p.messages
+    p.messages = messages.value // reactive proxy, not raw array
+    streaming.value = p.streaming
+    usage.value = p.usage
+    error.value = p.error
+    _abortController = p.abortController
+    _currentStreamMsg = p.currentStreamMsg
+    _thinkingMsg = p.thinkingMsg
+    _pendingThought = p.pendingThought
+    _pendingToolCalls = p.pendingToolCalls
+    pendingApproval.value = p.pendingApproval
+    _approvalQueue = p._approvalQueue
+  }
+
+  // ── Helpers ──
+
+  function msgId() { return crypto.randomUUID() }
+  function now() { return Date.now() }
+
   function pushMsg(msg: ChatMessage): ChatMessage {
     messages.value.push(msg)
     return messages.value[messages.value.length - 1]!
   }
 
-  const currentSessionId = ref<string | null>(null)
-  const currentSessionType = ref<'single' | 'team' | 'plan'>('single')
+  function setStageHandler(fn: ((event: any) => void) | null) {
+    onStageEvent = fn
+  }
+
+  // ── Session switching ──
+
+  /** Activate a session — preserve current, restore target.
+   *  Does NOT kill the previous session's SSE stream. */
+  function activateSession(sid: string) {
+    if (currentSessionId.value === sid) return
+    saveActive()
+    currentSessionId.value = sid
+    restoreActive(sid)
+    // First activation: load history from backend.
+    const p = getPane(sid)
+    if (!p._fetched) {
+      p._fetched = true
+      fetchSessionDetail(sid)
+      fetchMessages(sid)
+    }
+  }
+
+  // ── Chat ──
 
   function sendMessage(
     sessionId: string,
@@ -57,14 +158,36 @@ export const useChatStore = defineStore('chat', () => {
   ) {
     currentSessionType.value = sessionType
     const modelId = selectedModelId.value || availableModels.value[0]?.id
-    error.value = null
-    streaming.value = true
-    pendingApproval.value = null
-    _approvalQueue.length = 0
-    pendingToolCalls.clear()
-    currentStreamMsg = null
-    thinkingMsg = null
-    pendingThought = ''
+
+    // Capture the pane for this session — SSE events will push here.
+    // saveActive already wrote the current state, so the pane is fresh.
+    const pane = getPane(sessionId)
+
+    pane.error = null
+    pane.streaming = true
+    pane.pendingApproval = null
+    pane._approvalQueue.length = 0
+    pane.pendingToolCalls.clear()
+    pane.currentStreamMsg = null
+    pane.thinkingMsg = null
+    pane.pendingThought = ''
+
+    // If this is the active session, sync pane state into active refs
+    // so the UI sees the reset. messages.value must share its reactive
+    // identity with pane.messages so SSE events (which push to
+    // pane.messages) update the UI.
+    if (sessionId === currentSessionId.value) {
+      messages.value = pane.messages
+      pane.messages = messages.value // reactive proxy
+      error.value = null
+      streaming.value = true
+      pendingApproval.value = null
+      _approvalQueue.length = 0
+      _pendingToolCalls.clear()
+      _currentStreamMsg = null
+      _thinkingMsg = null
+      _pendingThought = ''
+    }
 
     pushMsg({
       id: msgId(),
@@ -80,247 +203,234 @@ export const useChatStore = defineStore('chat', () => {
       default: url = `/sessions/${sessionId}/chat`
     }
 
-    abortController = new AbortController()
-    streamChat(url, { message: text, modelId }, handleEvent, abortController.signal)
+    pane.abortController?.abort()
+    pane.abortController = new AbortController()
+    if (sessionId === currentSessionId.value) {
+      _abortController = pane.abortController
+    }
+
+    // SSE handler pushes directly to the pane, not the active refs.
+    // This way stream events always land in the right session even
+    // if the user switches to another tab mid-stream.
+    const handler = makeHandler(pane)
+
+    streamChat(url, { message: text, modelId }, handler, pane.abortController!.signal)
       .then(() => {
-        streaming.value = false
-        currentStreamMsg = null
+        pane.streaming = false
+        pane.currentStreamMsg = null
+        if (sessionId === currentSessionId.value) {
+          streaming.value = false
+          _currentStreamMsg = null
+        }
       })
       .catch((e: Error) => {
         if (e.name === 'AbortError') return
-        error.value = e.message
-        streaming.value = false
-        currentStreamMsg = null
+        pane.error = e.message
+        pane.streaming = false
+        pane.currentStreamMsg = null
+        if (sessionId === currentSessionId.value) {
+          error.value = e.message
+          streaming.value = false
+          _currentStreamMsg = null
+        }
       })
   }
 
-  function handleEvent(event: SSEEvent) {
-    switch (event.type) {
-      case 'thought': {
-        // Real-time reasoning display. Reasoning models spend 5+ seconds
-        // generating reasoning_content before the final answer.
-        // In team mode, agent_start creates thinkingMsg with the agent name
-        // so the user immediately knows who is thinking. In single-agent
-        // mode, thought is the first event — create thinkingMsg lazily.
-        pendingThought += event.text || ''
-        if (!currentStreamMsg) {
-          if (!thinkingMsg) {
-            thinkingMsg = pushMsg({
-              id: msgId(),
-              role: 'thought',
-              content: '',
-              agent: event.agent,
-              timestamp: now(),
-            })
-          }
-          thinkingMsg.content += event.text || ''
-        }
-        break
-      }
+  // ── SSE event handler factory ──
+  // Every push into p.messages MUST read back the last element to get
+  // Vue's reactive Proxy — raw object references don't trigger reactivity.
 
-      case 'text_delta': {
-        // Convert thinkingMsg to agent message in-place so its position
-        // relative to tool calls (which were pushed AFTER thinkingMsg)
-        // is preserved. Pushing a new agent message at the end would
-        // place it after tool calls — wrong visual order.
-        if (!currentStreamMsg) {
-          if (thinkingMsg) {
-            thinkingMsg.role = 'agent'
-            thinkingMsg.thoughtContent = pendingThought || undefined
-            thinkingMsg.content = event.text || ''
-            thinkingMsg.isStreaming = true
-            currentStreamMsg = thinkingMsg
-            thinkingMsg = null
+  function panePush(p: SessionPane, msg: ChatMessage): ChatMessage {
+    p.messages.push(msg)
+    return p.messages[p.messages.length - 1]!
+  }
+
+  function makeHandler(p: SessionPane) {
+    return function handleEvent(event: SSEEvent) {
+      switch (event.type) {
+        case 'thought': {
+          p.pendingThought += event.text || ''
+          if (!p.currentStreamMsg) {
+            if (!p.thinkingMsg) {
+              p.thinkingMsg = panePush(p, {
+                id: msgId(),
+                role: 'thought',
+                content: '',
+                agent: event.agent,
+                timestamp: now(),
+              })
+            }
+            p.thinkingMsg.content += event.text || ''
+          }
+          break
+        }
+
+        case 'text_delta': {
+          if (!p.currentStreamMsg) {
+            if (p.thinkingMsg) {
+              p.thinkingMsg.role = 'agent'
+              p.thinkingMsg.thoughtContent = p.pendingThought || undefined
+              p.thinkingMsg.content = event.text || ''
+              p.thinkingMsg.isStreaming = true
+              p.currentStreamMsg = p.thinkingMsg
+              p.thinkingMsg = null
+            } else {
+              p.currentStreamMsg = panePush(p, {
+                id: msgId(),
+                role: 'agent',
+                content: event.text || '',
+                thoughtContent: p.pendingThought || undefined,
+                agent: event.agent,
+                timestamp: now(),
+                isStreaming: true,
+              })
+            }
+            p.pendingThought = ''
           } else {
-            currentStreamMsg = pushMsg({
-              id: msgId(),
-              role: 'agent',
-              content: event.text || '',
-              thoughtContent: pendingThought || undefined,
-              agent: event.agent,
-              timestamp: now(),
-              isStreaming: true,
-            })
+            p.currentStreamMsg.content += event.text || ''
           }
-          pendingThought = ''
-        } else {
-          currentStreamMsg.content += event.text || ''
+          break
         }
-        break
-      }
 
-      case 'tool_call': {
-        // Keep thinkingMsg visible — tool calls don't interrupt the
-        // agent's reasoning; they are part of the agent's working process.
-        // Only text_delta replaces the Thinking collapse with final output.
-        const tc = event.tool_call
-        if (tc) {
-          const proxy = pushMsg({
+        case 'tool_call': {
+          const tc = event.tool_call
+          if (tc) {
+            const proxy = panePush(p, {
+              id: msgId(),
+              role: 'tool_call',
+              content: tc.function.arguments || '',
+              agent: event.agent,
+              toolCall: tc,
+              timestamp: now(),
+            })
+            p.pendingToolCalls.set(tc.id, proxy)
+          }
+          break
+        }
+
+        case 'tool_progress': {
+          if (event.tool_call_id) {
+            const msg = p.pendingToolCalls.get(event.tool_call_id)
+            if (msg) msg.content += event.text || ''
+          }
+          break
+        }
+
+        case 'tool_result': {
+          if (event.tool_call_id) {
+            const msg = p.pendingToolCalls.get(event.tool_call_id)
+            if (msg) {
+              msg.role = 'tool_result'
+              msg.content = event.text || msg.content
+              p.pendingToolCalls.delete(event.tool_call_id)
+            }
+          }
+          break
+        }
+
+        case 'tool_approval': {
+          const approval: PendingApproval = {
+            toolCall: event.tool_call!,
+            sessionId: '',
+            sessionType: 'single',
+          }
+          p._approvalQueue.push(approval)
+          if (!p.pendingApproval) p.pendingApproval = p._approvalQueue[0]
+          if (currentSessionId.value && getPane(currentSessionId.value) === p) {
+            pendingApproval.value = p.pendingApproval
+          }
+          break
+        }
+
+        case 'retrying': {
+          panePush(p, {
             id: msgId(),
-            role: 'tool_call',
-            content: tc.function.arguments || '',
-            agent: event.agent,
-            toolCall: tc,
+            role: 'system',
+            content: `Retrying: ${event.text || 'transient error'}`,
             timestamp: now(),
           })
-          pendingToolCalls.set(tc.id, proxy)
+          break
         }
-        break
-      }
 
-      case 'tool_progress': {
-        if (event.tool_call_id) {
-          const msg = pendingToolCalls.get(event.tool_call_id)
-          if (msg) msg.content += event.text || ''
-        }
-        break
-      }
-
-      case 'tool_result': {
-        if (event.tool_call_id) {
-          const msg = pendingToolCalls.get(event.tool_call_id)
-          if (msg) {
-            msg.role = 'tool_result'
-            msg.content = event.text || msg.content
-            pendingToolCalls.delete(event.tool_call_id)
+        case 'aborted': {
+          p.error = event.text || 'Aborted'
+          p.streaming = false
+          if (currentSessionId.value && getPane(currentSessionId.value) === p) {
+            error.value = p.error
+            streaming.value = false
           }
+          break
         }
-        break
-      }
 
-      case 'tool_approval': {
-        const approval: PendingApproval = {
-          toolCall: event.tool_call!,
-          sessionId: '',
-          sessionType: 'single',
-        }
-        _approvalQueue.push(approval)
-        // Show first in queue (the one the user must decide on).
-        if (!pendingApproval.value) {
-          pendingApproval.value = _approvalQueue[0]
-        }
-        break
-      }
-
-      case 'retrying': {
-        pushMsg({
-          id: msgId(),
-          role: 'system',
-          content: `Retrying: ${event.text || 'transient error'}`,
-          timestamp: now(),
-        })
-        break
-      }
-
-      case 'aborted': {
-        error.value = event.text || 'Aborted'
-        streaming.value = false
-        break
-      }
-
-      case 'done': {
-        // If text_delta never arrived (e.g. tool denied, agent stopped),
-        // thinkingMsg is still in the array — keep it visible so the user
-        // can see what the agent was thinking. Normal path: thinkingMsg was
-        // already converted to currentStreamMsg (set to null in text_delta).
-        pendingThought = ''
-        if (currentStreamMsg) {
-          currentStreamMsg.isStreaming = false
-          currentStreamMsg = null
-        }
-        if (event.prompt_tokens != null && event.context_window != null) {
-          usage.value = {
-            promptTokens: event.prompt_tokens,
-            contextWindow: event.context_window,
+        case 'done': {
+          p.pendingThought = ''
+          if (p.currentStreamMsg) {
+            p.currentStreamMsg.isStreaming = false
+            p.currentStreamMsg = null
           }
+          if (event.prompt_tokens != null && event.context_window != null) {
+            p.usage = { promptTokens: event.prompt_tokens, contextWindow: event.context_window }
+          }
+          p.streaming = false
+          if (currentSessionId.value && getPane(currentSessionId.value) === p) {
+            if (event.prompt_tokens != null && event.context_window != null) usage.value = p.usage
+            streaming.value = false
+          }
+          break
         }
-        streaming.value = false
-        break
+
+        case 'error': {
+          p.error = event.text || 'Unknown error'
+          p.streaming = false
+          if (currentSessionId.value && getPane(currentSessionId.value) === p) {
+            error.value = p.error
+            streaming.value = false
+          }
+          break
+        }
+
+        case 'agent_start': {
+          // Team mode: label who acts next. Remove old thinking,
+          // push label + fresh thinking placeholder.
+          p.messages = p.messages.filter(m => m !== p.thinkingMsg)
+          p.thinkingMsg = null
+          if (p.currentStreamMsg) { p.currentStreamMsg.isStreaming = false; p.currentStreamMsg = null }
+          p.pendingThought = ''
+          panePush(p, { id: msgId(), role: 'agent_label', content: event.agent || '', agent: event.agent, timestamp: now() })
+          p.thinkingMsg = panePush(p, { id: msgId(), role: 'thought', content: '', agent: event.agent, timestamp: now() })
+          break
+        }
+
+        case 'agent_end': {
+          if (p.currentStreamMsg) { p.currentStreamMsg.isStreaming = false; p.currentStreamMsg = null }
+          break
+        }
+
+        case 'handoff': {
+          p.messages = p.messages.filter(m => m !== p.thinkingMsg)
+          p.thinkingMsg = null
+          if (p.currentStreamMsg) { p.currentStreamMsg.isStreaming = false; p.currentStreamMsg = null }
+          p.pendingThought = ''
+          panePush(p, { id: msgId(), role: 'handoff', content: `${event.agent || '?'} → ${event.handoff_to || '?'}`, agent: event.agent, timestamp: now() })
+          break
+        }
+
+        case 'stage':
+          if (onStageEvent) onStageEvent(event)
+          break
+
+        default:
+          break
       }
-
-      case 'error': {
-        error.value = event.text || 'Unknown error'
-        streaming.value = false
-        break
-      }
-
-      case 'agent_start': {
-        // New agent taking over — reset streaming state from previous agent.
-        if (thinkingMsg) {
-          messages.value = messages.value.filter(m => m !== thinkingMsg)
-          thinkingMsg = null
-        }
-        if (currentStreamMsg) {
-          currentStreamMsg.isStreaming = false
-          currentStreamMsg = null
-        }
-        pendingThought = ''
-        // Team mode only: show who is about to act. The label appears
-        // before thinking so the user never sees unlabelled reasoning.
-        pushMsg({
-          id: msgId(),
-          role: 'agent_label',
-          content: event.agent || '',
-          agent: event.agent,
-          timestamp: now(),
-        })
-        thinkingMsg = pushMsg({
-          id: msgId(),
-          role: 'thought',
-          content: '',
-          agent: event.agent,
-          timestamp: now(),
-        })
-        break
-      }
-
-      case 'agent_end': {
-        // Finalize the current agent's message so the next agent
-        // starts a fresh bubble instead of appending to it.
-        if (currentStreamMsg) {
-          currentStreamMsg.isStreaming = false
-          currentStreamMsg = null
-        }
-        break
-      }
-
-      case 'handoff': {
-        // Reset per-agent streaming state so the next agent gets a
-        // clean message bubble with its own name and thinking.
-        if (thinkingMsg) {
-          messages.value = messages.value.filter(m => m !== thinkingMsg)
-          thinkingMsg = null
-        }
-        if (currentStreamMsg) {
-          currentStreamMsg.isStreaming = false
-          currentStreamMsg = null
-        }
-        pendingThought = ''
-        pushMsg({
-          id: msgId(),
-          role: 'handoff',
-          content: `${event.agent || '?'} → ${event.handoff_to || '?'}`,
-          agent: event.agent,
-          timestamp: now(),
-        })
-        break
-      }
-
-      case 'stage':
-        if (onStageEvent) onStageEvent(event)
-        break
-
-      default:
-        break
     }
   }
 
+  // ── Approval ──
+
   async function approveTool(sessionId: string, sessionType: 'single' | 'team' | 'plan', allowed: boolean, feedback?: string) {
     if (!pendingApproval.value) return
-    // Dequeue the current approval and advance to the next (or null).
     _approvalQueue.shift()
     pendingApproval.value = _approvalQueue[0] || null
-    // POST asynchronously — the UI is already updated.
     try {
       switch (sessionType) {
         case 'single': await api.approveTool(sessionId, allowed, feedback); break
@@ -332,6 +442,8 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  // ── Data fetching ──
+
   async function fetchModels() {
     if (availableModels.value.length > 0) return
     try {
@@ -340,7 +452,7 @@ export const useChatStore = defineStore('chat', () => {
       if (availableModels.value.length > 0 && !selectedModelId.value) {
         selectedModelId.value = availableModels.value[0].id
       }
-    } catch { /* /models not available — use empty list */ }
+    } catch { /* /models not available */ }
   }
 
   async function fetchSessionDetail(sessionId: string, type?: 'single' | 'team' | 'plan') {
@@ -356,13 +468,18 @@ export const useChatStore = defineStore('chat', () => {
     } catch { /* ignore */ }
   }
 
-   async function fetchMessages(sessionId: string, type?: 'single' | 'team' | 'plan') {
+  async function fetchMessages(sessionId: string, type?: 'single' | 'team' | 'plan') {
     const t = type || currentSessionType.value
+    // Capture the session we're fetching for — stale fetch from a
+    // previous session must not overwrite the current chat.
+    const reqSession = sessionId
     try {
       const fn = t === 'team' ? api.listTeamMessages :
                 t === 'plan' ? api.listPlanMessages :
                 api.listMessages
       const msgs = await fn(sessionId, 100)
+      // Switched sessions while loading — drop stale result.
+      if (reqSession !== currentSessionId.value) return
       const converted: ChatMessage[] = []
       for (const m of msgs) {
         const role = m.role === 'user' ? 'user' :
@@ -385,28 +502,43 @@ export const useChatStore = defineStore('chat', () => {
         }
         converted.push(msg)
       }
-      messages.value = converted
-    } catch { /* ignore — keep current messages */ }
+      // Don't overwrite if a live SSE stream is active for this session.
+      if (!streaming.value) {
+        messages.value = converted
+        // Update pane cache as well.
+        const p = getPane(sessionId)
+        p.messages = messages.value // reactive proxy, not raw
+      }
+    } catch { /* ignore */ }
   }
 
+  /** Clear the current session's chat — abort stream, reset state. */
   function clearChat() {
-    abortController?.abort()
+    _abortController?.abort()
+    _abortController = null
     messages.value = []
     streaming.value = false
     pendingApproval.value = null
     _approvalQueue.length = 0
     usage.value = null
     error.value = null
-    pendingToolCalls.clear()
-    currentStreamMsg = null
-    thinkingMsg = null
-    pendingThought = ''
+    _pendingToolCalls.clear()
+    _currentStreamMsg = null
+    _thinkingMsg = null
+    _pendingThought = ''
+
+    // Also clear the pane so a subsequent activateSession doesn't restore stale state.
+    const sid = currentSessionId.value
+    if (sid) {
+      _panes.delete(sid)
+    }
   }
 
   return {
     messages, streaming, pendingApproval, usage, error,
     selectedModelId, availableModels, contextWindow, messageCount,
+    currentSessionId, currentSessionType,
     sendMessage, approveTool, clearChat, setStageHandler, fetchModels, fetchSessionDetail,
-    fetchMessages,
+    fetchMessages, activateSession,
   }
 })
