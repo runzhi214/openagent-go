@@ -60,11 +60,11 @@ func NewReadFile(workDir string) *ReadFile {
 func (t *ReadFile) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "read",
-		Description: "Read a file from the workspace. Path relative to workspace root.",
+		Description: "Read a file from the given path.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
-				"path": {"type": "string", "description": "File path relative to workspace root"}
+				"path": {"type": "string", "description": "File path"}
 			},
 			"required": ["path"]
 		}`),
@@ -82,7 +82,7 @@ func (t *ReadFile) CanSelfApprove(args json.RawMessage) bool {
 	if err != nil {
 		return false
 	}
-	return isWithinWorkspace(t.workDir, abs)
+	return isWithinWorkspace(t.workDir, abs) || isWithinArtifactDir(abs)
 }
 
 func (t *ReadFile) Execute(ctx context.Context, args json.RawMessage) (string, error) {
@@ -171,16 +171,30 @@ func NewWriteFile(workDir string) *WriteFile {
 func (t *WriteFile) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "write",
-		Description: "Write content to a file in the workspace. Creates parent directories as needed.",
+		Description: "Write content to a file. Creates parent directories as needed.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
-				"path":    {"type": "string", "description": "File path relative to workspace root"},
+				"path":    {"type": "string", "description": "File path"},
 				"content": {"type": "string", "description": "Content to write to the file"}
 			},
 			"required": ["path", "content"]
 		}`),
 	}
+}
+
+func (t *WriteFile) CanSelfApprove(args json.RawMessage) bool {
+	var params struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(args, &params); err != nil || params.Path == "" {
+		return false
+	}
+	abs, err := validatePath(t.workDir, params.Path)
+	if err != nil {
+		return false
+	}
+	return isWithinWorkspace(t.workDir, abs) || isWithinArtifactDir(abs)
 }
 
 func (t *WriteFile) Execute(ctx context.Context, args json.RawMessage) (string, error) {
@@ -235,11 +249,11 @@ func NewListDir(workDir string) *ListDir {
 func (t *ListDir) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "ls",
-		Description: "List files and directories in the workspace. Path relative to workspace root (default: root).",
+		Description: "List files and directories at the given path.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
-				"path": {"type": "string", "description": "Directory path relative to workspace root (default: root)"}
+				"path": {"type": "string", "description": "Directory path"},
 			}
 		}`),
 	}
@@ -257,7 +271,7 @@ func (t *ListDir) CanSelfApprove(args json.RawMessage) bool {
 	if err != nil {
 		return false
 	}
-	return isWithinWorkspace(t.workDir, abs)
+	return isWithinWorkspace(t.workDir, abs) || isWithinArtifactDir(abs)
 }
 
 func (t *ListDir) Execute(ctx context.Context, args json.RawMessage) (string, error) {

@@ -38,7 +38,7 @@ func (t *Grep) Definition() openagent.FunctionDefinition {
 					},
 					"path": {
 						"type": "string",
-						"description": "Subdirectory to search (default: entire workspace)"
+						"description": "Subdirectory to search"
 					},
 					"glob": {
 						"type": "string",
@@ -62,7 +62,7 @@ func (t *Grep) CanSelfApprove(args json.RawMessage) bool {
 	if err != nil {
 		return false
 	}
-	return isWithinWorkspace(t.workDir, abs)
+	return isWithinWorkspace(t.workDir, abs) || isWithinArtifactDir(abs)
 }
 
 func (t *Grep) Execute(ctx context.Context, args json.RawMessage) (string, error) {
