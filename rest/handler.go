@@ -136,6 +136,14 @@ func (h *Handler) StartJanitor(ctx context.Context, interval, maxIdle time.Durat
 	h.sm.StartJanitor(ctx, interval, maxIdle)
 }
 
+// WithCleanupDir registers a callback that is invoked when a session is
+// deleted (either via DELETE /sessions/{id} or the idle janitor). Use it
+// to clean up per-session temp/artifact directories.
+func (h *Handler) WithCleanupDir(fn func(sessionID string)) *Handler {
+	h.sm.SetCleanupDir(fn)
+	return h
+}
+
 // ── sessionState ──
 
 // sessionState holds the per-session runtime state.

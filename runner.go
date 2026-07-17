@@ -704,27 +704,31 @@ func (r *runner) executeOneToolInternal(ctx context.Context, session Session, ca
 
 	args := json.RawMessage(call.Function.Arguments)
 
+	// Inject session into ctx so tools and hooks can retrieve it via
+	// SessionFromContext — used by artifact hooks, audit logging, etc.
+	toolCtx := WithSession(ctx, session)
+
 	// Built-in tools: execute directly, share hooks/observer pipeline.
 	switch call.Function.Name {
 	case "use_skill":
-		toolStart := r.fireToolHooks(ctx, *def, args)
-		msg := r.executeUseSkill(ctx, call)
-		r.fireToolHooksEnd(ctx, *def, args, msg.Content, toolStart, nil)
+		toolStart := r.fireToolHooks(toolCtx, *def, args)
+		msg := r.executeUseSkill(toolCtx, call)
+		r.fireToolHooksEnd(toolCtx, *def, args, msg.Content, toolStart, nil)
 		return msg
 	case "reload_skills":
-		toolStart := r.fireToolHooks(ctx, *def, args)
-		msg := r.executeReloadSkills(ctx, call)
-		r.fireToolHooksEnd(ctx, *def, args, msg.Content, toolStart, nil)
+		toolStart := r.fireToolHooks(toolCtx, *def, args)
+		msg := r.executeReloadSkills(toolCtx, call)
+		r.fireToolHooksEnd(toolCtx, *def, args, msg.Content, toolStart, nil)
 		return msg
 	case "recall_memory":
-		toolStart := r.fireToolHooks(ctx, *def, args)
-		msg := r.executeRecall(ctx, session, call)
-		r.fireToolHooksEnd(ctx, *def, args, msg.Content, toolStart, nil)
+		toolStart := r.fireToolHooks(toolCtx, *def, args)
+		msg := r.executeRecall(toolCtx, session, call)
+		r.fireToolHooksEnd(toolCtx, *def, args, msg.Content, toolStart, nil)
 		return msg
 	case "subagent":
-		toolStart := r.fireToolHooks(ctx, *def, args)
-		msg := r.executeSubAgent(ctx, session, call, ch)
-		r.fireToolHooksEnd(ctx, *def, args, msg.Content, toolStart, nil)
+		toolStart := r.fireToolHooks(toolCtx, *def, args)
+		msg := r.executeSubAgent(toolCtx, session, call, ch)
+		r.fireToolHooksEnd(toolCtx, *def, args, msg.Content, toolStart, nil)
 		return msg
 	}
 
@@ -732,13 +736,11 @@ func (r *runner) executeOneToolInternal(ctx context.Context, session Session, ca
 
 	var toolHookState any
 	if r.agent.Hooks != nil {
-		toolHookState, _ = r.agent.Hooks.OnToolStart(ctx, *def, args)
+		toolHookState, _ = r.agent.Hooks.OnToolStart(toolCtx, *def, args)
 	}
 
 	teStart := time.Now()
-	r.observe(ctx, StageToolExecute, "enter", map[string]any{"tool": call.Function.Name}, time.Time{}, nil)
-
-	toolCtx := WithSession(ctx, session)
+	r.observe(toolCtx, StageToolExecute, "enter", map[string]any{"tool": call.Function.Name}, time.Time{}, nil)
 	var output string
 	var execErr error
 
@@ -771,7 +773,7 @@ func (r *runner) executeOneToolInternal(ctx context.Context, session Session, ca
 	r.observe(ctx, StageToolExecute, "leave", map[string]any{"tool": call.Function.Name}, teStart, execErr)
 
 	if r.agent.Hooks != nil {
-		r.agent.Hooks.OnToolEnd(ctx, *def, args, &output, &execErr, toolHookState)
+		r.agent.Hooks.OnToolEnd(toolCtx, *def, args, &output, &execErr, toolHookState)
 	}
 
 	content := output

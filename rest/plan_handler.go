@@ -102,6 +102,12 @@ func (h *PlanHandler) StartJanitor(ctx context.Context, interval, maxIdle time.D
 	h.sm.StartJanitor(ctx, interval, maxIdle)
 }
 
+// WithCleanupDir registers a callback invoked when a plan session is deleted.
+func (h *PlanHandler) WithCleanupDir(fn func(sessionID string)) *PlanHandler {
+	h.sm.SetCleanupDir(fn)
+	return h
+}
+
 // ── Session CRUD ──
 
 func (h *PlanHandler) handleCreateSession(w http.ResponseWriter, r *http.Request) { h.sm.create(w, r) }

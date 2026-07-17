@@ -90,6 +90,12 @@ func (h *TeamHandler) StartJanitor(ctx context.Context, interval, maxIdle time.D
 	h.sm.StartJanitor(ctx, interval, maxIdle)
 }
 
+// WithCleanupDir registers a callback invoked when a team session is deleted.
+func (h *TeamHandler) WithCleanupDir(fn func(sessionID string)) *TeamHandler {
+	h.sm.SetCleanupDir(fn)
+	return h
+}
+
 // ── teamSessionState ──
 
 type teamSessionState struct {

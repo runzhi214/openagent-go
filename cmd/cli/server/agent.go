@@ -125,7 +125,12 @@ func buildTools(sandbox *native.Sandbox, workDir string, toolList []string) []op
 // ── REST ──
 
 func runREST(ctx context.Context, cfg *config.Config, agent *openagent.Agent, modelInfos []modelReg, mem openagent.Memory, sessionStore rest.SessionStore) error {
-	handler := rest.NewHandler(agent).WithSessionStore(sessionStore)
+	handler := rest.NewHandler(agent).
+		WithSessionStore(sessionStore).
+		WithCleanupDir(func(sessionID string) {
+			dir := filepath.Join(opentool.ArtifactRoot(), sessionID)
+			_ = os.RemoveAll(dir)
+		})
 	// Evict idle single-agent sessions after 24h of inactivity.
 	handler.StartJanitor(ctx, 1*time.Hour, 24*time.Hour)
 	for _, mi := range modelInfos {

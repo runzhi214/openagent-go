@@ -30,6 +30,7 @@ type sessionHooks[E sessionEntry] struct {
 	newEntry   func(info SessionInfo) E
 	fillDetail func(e E, detail *SessionDetail)
 	onDelete   func(e E)
+	cleanupDir func(sessionID string) // optional: delete temp/artifact dirs
 }
 
 // ── sessionManager ──
@@ -64,7 +65,8 @@ func newSessionManager[E sessionEntry](
 	}
 }
 
-func (sm *sessionManager[E]) SetStore(s SessionStore)      { sm.store = s }
+func (sm *sessionManager[E]) SetStore(s SessionStore)       { sm.store = s }
+func (sm *sessionManager[E]) SetCleanupDir(fn func(string)) { sm.hooks.cleanupDir = fn }
 func (sm *sessionManager[E]) Bus() *eventbus.Bus[SSEEvent]  { return sm.bus }
 func (sm *sessionManager[E]) Memory() openagent.Memory      { return sm.memory }
 func (sm *sessionManager[E]) Store() SessionStore            { return sm.store }
@@ -328,6 +330,10 @@ func (sm *sessionManager[E]) del(w http.ResponseWriter, r *http.Request) {
 
 	// Release the bus topic.
 	sm.bus.RemoveTopic(id)
+
+	if sm.hooks.cleanupDir != nil {
+		sm.hooks.cleanupDir(id)
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }

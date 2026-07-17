@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -64,7 +65,9 @@ func (t *ReadFile) Definition() openagent.FunctionDefinition {
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
-				"path": {"type": "string", "description": "File path"}
+				"path":   {"type": "string",  "description": "File path"},
+				"offset": {"type": "integer", "description": "Start line (1-based, default: 1)"},
+				"limit":  {"type": "integer", "description": "Max lines to read (default: all remaining)"}
 			},
 			"required": ["path"]
 		}`),
@@ -87,7 +90,9 @@ func (t *ReadFile) CanSelfApprove(args json.RawMessage) bool {
 
 func (t *ReadFile) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var params struct {
-		Path string `json:"path"`
+		Path   string `json:"path"`
+		Offset int    `json:"offset"` // 1-based, 0 = default (1)
+		Limit  int    `json:"limit"`  // 0 = default (all)
 	}
 	if err := json.Unmarshal(args, &params); err != nil {
 		return "", fmt.Errorf("read: %w", err)
@@ -95,36 +100,78 @@ func (t *ReadFile) Execute(ctx context.Context, args json.RawMessage) (string, e
 	if params.Path == "" {
 		return "", fmt.Errorf("read: path is required")
 	}
+	if params.Offset < 0 {
+		params.Offset = 0
+	}
+	if params.Offset == 0 {
+		params.Offset = 1
+	}
 
 	abs, err := validatePath(t.workDir, params.Path)
 	if err != nil {
 		return "", err
 	}
-
-	data, err := os.ReadFile(abs)
+	info, err := os.Stat(abs)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", fmt.Errorf("read: file not found: %s", params.Path)
 		}
-		if os.IsPermission(err) {
-			return "", fmt.Errorf("read: permission denied: %s", params.Path)
-		}
 		return "", fmt.Errorf("read: %w", err)
 	}
 
-	// Binary detection: check first 512 bytes for null bytes.
-	// If the file is binary, return a clear message so the model doesn't
-	// try to parse garbage or mistakenly treat it as a directory.
-	if isBinary(data) {
+	file, err := os.Open(abs)
+	if err != nil {
+		return "", fmt.Errorf("read: %w", err)
+	}
+	defer file.Close()
+
+	// Binary detection: peek first 512 bytes for null bytes.
+	peek := make([]byte, 512)
+	n, _ := file.Read(peek)
+	if n > 0 && isBinary(peek[:n]) {
 		return fmt.Sprintf("[binary file: %s, %d bytes, type: %s]",
-			params.Path, len(data), detectType(data)), nil
+			params.Path, info.Size(), detectType(peek[:n])), nil
+	}
+	// Rewind to beginning.
+	file.Seek(0, 0)
+
+	var (
+		out       strings.Builder
+		lineNum   int
+		lineCount int
+		hitOffset bool
+	)
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // 1 MB max line
+
+	for scanner.Scan() {
+		lineNum++
+		if lineNum < params.Offset {
+			continue
+		}
+		hitOffset = true
+		out.WriteString(scanner.Text())
+		out.WriteByte('\n')
+		lineCount++
+		if params.Limit > 0 && lineCount >= params.Limit {
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read: %w", err)
 	}
 
-	const maxSize = 100 * 1024 // 100KB
-	if len(data) > maxSize {
-		return string(data[:maxSize]) + fmt.Sprintf("\n... [truncated, %d bytes total]", len(data)), nil
+	if !hitOffset {
+		return fmt.Sprintf("[offset %d is beyond end of file (%d lines)]", params.Offset, lineNum), nil
 	}
-	return string(data), nil
+
+	result := out.String()
+	if params.Offset > 1 || params.Limit > 0 {
+		prefix := fmt.Sprintf("[lines %d-%d, %d total, %d bytes]:\n",
+			params.Offset, params.Offset+lineCount-1, lineNum, info.Size())
+		result = prefix + result
+	}
+	return result, nil
 }
 
 func isBinary(data []byte) bool {
@@ -253,8 +300,9 @@ func (t *ListDir) Definition() openagent.FunctionDefinition {
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
-				"path": {"type": "string", "description": "Directory path"},
-			}
+				"path": {"type": "string", "description": "Directory path"}
+			},
+			"required": ["path"]
 		}`),
 	}
 }
