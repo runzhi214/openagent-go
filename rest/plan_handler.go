@@ -12,7 +12,7 @@ import (
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/session"
 	"github.com/yusheng-g/openagent-go/eventbus"
-	"github.com/yusheng-g/openagent-go/plan"
+	"github.com/yusheng-g/openagent-go/orchestrate"
 )
 
 // PlanAgentTemplate describes an agent available for plan steps.
@@ -35,8 +35,8 @@ type PlanHandler struct {
 // planSessionState holds per-session data for a plan workflow.
 type planSessionState struct {
 	info       session.SessionInfo
-	plan       *plan.Plan
-	currentDef *plan.PlanDef // nil until generated
+	plan       *orchestrate.Plan
+	currentDef *orchestrate.PlanDef // nil until generated
 
 	mu              sync.Mutex
 	pendingApproval *pendingApproval
@@ -44,8 +44,8 @@ type planSessionState struct {
 	running         bool               // true while plan is executing
 
 	// Pause/resume support (AutoReplan=false).
-	execState *plan.PlanState       // current execution state (set when paused)
-	retryCh   chan plan.RetryAction // closed/signaled to resume from pause
+	execState *orchestrate.PlanState       // current execution state (set when paused)
+	retryCh   chan orchestrate.RetryAction // closed/signaled to resume from pause
 }
 
 func (s *planSessionState) sessionInfo() *session.SessionInfo { return &s.info }
@@ -200,25 +200,25 @@ func (h *PlanHandler) handleUpdatePlan(w http.ResponseWriter, r *http.Request) {
 
 	s := h.sm.getOrCreate(id)
 
-	var def plan.PlanDef
+	var def orchestrate.PlanDef
 	if err := json.NewDecoder(r.Body).Decode(&def); err != nil {
 		http.Error(w, `{"error":"invalid plan JSON"}`, http.StatusBadRequest)
 		return
 	}
 
-	// Validate the user-edited plan.
+	// Validate the user-edited orchestrate.
 	agentNames := make(map[string]bool)
 	for _, a := range h.agents {
 		agentNames[a.Name] = true
 	}
-	if err := plan.Validate(&def, agentNames); err != nil {
+	if err := orchestrate.Validate(&def, agentNames); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
-	// Enforce max steps (same as plan.DefaultPlanConfig().MaxSteps).
-	maxSteps := plan.DefaultPlanConfig().MaxSteps
+	// Enforce max steps (same as orchestrate.DefaultPlanConfig().MaxSteps).
+	maxSteps := orchestrate.DefaultPlanConfig().MaxSteps
 	if len(def.Steps) > maxSteps {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
@@ -285,12 +285,12 @@ func (h *PlanHandler) handleExecute(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Create the plan state once and reuse across pause/resume cycles.
-		state := &plan.PlanState{
+		state := &orchestrate.PlanState{
 			ID:        id + "/plan",
 			Goal:      def.Goal,
-			Status:    plan.PlanStatusApproved,
+			Status:    orchestrate.PlanStatusApproved,
 			Steps:     def.Steps,
-			Results:   make(map[string]*plan.StepResult),
+			Results:   make(map[string]*orchestrate.StepResult),
 			CreatedAt: s.info.CreatedAt,
 			UpdatedAt: s.info.CreatedAt,
 		}
@@ -311,7 +311,7 @@ func (h *PlanHandler) handleExecute(w http.ResponseWriter, r *http.Request) {
 					// Store state and create resume channel.
 					s.mu.Lock()
 					s.execState = state
-					s.retryCh = make(chan plan.RetryAction, 1)
+					s.retryCh = make(chan orchestrate.RetryAction, 1)
 					s.mu.Unlock()
 					paused = true
 					break // exit inner loop, wait for resume
@@ -330,8 +330,8 @@ func (h *PlanHandler) handleExecute(w http.ResponseWriter, r *http.Request) {
 					// Gate step: already done, just continue to next batch.
 					// Failed step: reset to pending so executeBatches re-runs it.
 					if sr := state.Results[action.StepID]; sr != nil {
-						if sr.Status != plan.StepStatusDone {
-							sr.Status = plan.StepStatusPending
+						if sr.Status != orchestrate.StepStatusDone {
+							sr.Status = orchestrate.StepStatusPending
 							sr.Error = ""
 							sr.Retries = 0
 						}
@@ -452,13 +452,13 @@ func (h *PlanHandler) handleStepRetry(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if sr.Status != plan.StepStatusFailed && !(isGate && sr.Status == plan.StepStatusDone) {
+	if sr.Status != orchestrate.StepStatusFailed && !(isGate && sr.Status == orchestrate.StepStatusDone) {
 		http.Error(w, `{"error":"step is not in a paused state"}`, http.StatusBadRequest)
 		return
 	}
 
 	// Signal the execution goroutine to continue.
-	retryCh <- plan.RetryAction{Action: "retry", StepID: stepID}
+	retryCh <- orchestrate.RetryAction{Action: "retry", StepID: stepID}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "retrying"})
@@ -492,7 +492,7 @@ func (h *PlanHandler) handleReplan(w http.ResponseWriter, r *http.Request) {
 	// Find the failed step.
 	failedID := ""
 	for _, step := range def.Steps {
-		if sr := state.Results[step.ID]; sr != nil && sr.Status == plan.StepStatusFailed {
+		if sr := state.Results[step.ID]; sr != nil && sr.Status == orchestrate.StepStatusFailed {
 			failedID = step.ID
 			break
 		}
@@ -527,8 +527,8 @@ func (h *PlanHandler) handleReplan(w http.ResponseWriter, r *http.Request) {
 	b, _ := json.Marshal(newDef)
 	h.sm.Bus().Publish(id, SSEEvent{Type: "plan_generated", Text: string(b)})
 
-	// Signal the execution goroutine to resume with the new plan.
-	retryCh <- plan.RetryAction{Action: "replan", NewDef: newDef}
+	// Signal the execution goroutine to resume with the new orchestrate.
+	retryCh <- orchestrate.RetryAction{Action: "replan", NewDef: newDef}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "replanned"})
@@ -578,13 +578,13 @@ func (h *PlanHandler) newEntry(info session.SessionInfo) *planSessionState {
 	}
 
 	// Build plan with agents.
-	opts := make([]plan.PlanOption, 0, len(h.agents)+3)
-	opts = append(opts, plan.WithPlanner(plan.NewLLMPlanner(h.model)))
+	opts := make([]orchestrate.PlanOption, 0, len(h.agents)+3)
+	opts = append(opts, orchestrate.WithPlanner(orchestrate.NewLLMPlanner(h.model)))
 	if h.model != nil {
-		opts = append(opts, plan.WithModel(h.model))
+		opts = append(opts, orchestrate.WithModel(h.model))
 	}
-	opts = append(opts, plan.WithMaxConcurrency(8))
-	opts = append(opts, plan.WithAutoReplan(false)) // pause on failure, let user retry/replan
+	opts = append(opts, orchestrate.WithMaxConcurrency(8))
+	opts = append(opts, orchestrate.WithAutoReplan(false)) // pause on failure, let user retry/replan
 
 	mem := h.sm.Memory()
 	for _, t := range h.agents {
@@ -593,10 +593,10 @@ func (h *PlanHandler) newEntry(info session.SessionInfo) *planSessionState {
 		if ag, ok := t.Runner.(*openagent.Agent); ok {
 			runner = cloneAgentForPlan(ag, mem, s, h.submitApproval)
 		}
-		opts = append(opts, plan.WithAgent(t.Name, t.Description, runner))
+		opts = append(opts, orchestrate.WithAgent(t.Name, t.Description, runner))
 	}
 
-	s.plan = plan.NewPlan(opts...)
+	s.plan = orchestrate.NewPlan(opts...)
 	return s
 }
 
@@ -645,9 +645,9 @@ func cloneAgentForPlan(tmpl *openagent.Agent, mem openagent.Memory, s *planSessi
 
 // ── PlanEvent → SSE ──
 
-func planEventToSSE(evt plan.PlanEvent) SSEEvent {
+func planEventToSSE(evt orchestrate.PlanEvent) SSEEvent {
 	switch evt.Type {
-	case plan.PlanEventGenerated:
+	case orchestrate.PlanEventGenerated:
 		se := SSEEvent{Type: "plan_generated"}
 		if evt.Def != nil {
 			b, _ := json.Marshal(evt.Def)
@@ -655,16 +655,16 @@ func planEventToSSE(evt plan.PlanEvent) SSEEvent {
 		}
 		return se
 
-	case plan.PlanEventApproved:
+	case orchestrate.PlanEventApproved:
 		return SSEEvent{Type: "plan_approved"}
 
-	case plan.PlanEventStepStart:
+	case orchestrate.PlanEventStepStart:
 		return SSEEvent{Type: "step_start", StepID: evt.StepID, Agent: evt.Agent}
 
-	case plan.PlanEventTextDelta:
+	case orchestrate.PlanEventTextDelta:
 		return SSEEvent{Type: "step_text_delta", StepID: evt.StepID, Text: evt.Text}
 
-	case plan.PlanEventToolCall:
+	case orchestrate.PlanEventToolCall:
 		return SSEEvent{
 			Type: "step_tool_call", StepID: evt.StepID,
 			ToolCall: &SSEToolCall{
@@ -676,32 +676,32 @@ func planEventToSSE(evt plan.PlanEvent) SSEEvent {
 			},
 		}
 
-	case plan.PlanEventToolProgress:
+	case orchestrate.PlanEventToolProgress:
 		return SSEEvent{Type: "step_tool_progress", StepID: evt.StepID, Text: evt.Text}
 
-	case plan.PlanEventToolResult:
+	case orchestrate.PlanEventToolResult:
 		return SSEEvent{Type: "step_tool_result", StepID: evt.StepID, Text: evt.Text}
 
-	case plan.PlanEventStepDone:
+	case orchestrate.PlanEventStepDone:
 		se := SSEEvent{Type: "step_done", StepID: evt.StepID, Agent: evt.Agent}
 		if evt.Result != nil {
 			se.Text = evt.Result.Summary
 		}
 		return se
 
-	case plan.PlanEventStepFailed:
+	case orchestrate.PlanEventStepFailed:
 		return SSEEvent{Type: "step_failed", StepID: evt.StepID, Agent: evt.Agent, Error: evt.ErrText}
 
-	case plan.PlanEventReplanning:
+	case orchestrate.PlanEventReplanning:
 		return SSEEvent{Type: "replanning", StepID: evt.StepID}
 
-	case plan.PlanEventWaitingRetry:
+	case orchestrate.PlanEventWaitingRetry:
 		return SSEEvent{Type: "plan_waiting_retry", StepID: evt.StepID, Error: evt.ErrText}
 
-	case plan.PlanEventDone:
+	case orchestrate.PlanEventDone:
 		return SSEEvent{Type: "plan_done", FinalOutput: evt.Text}
 
-	case plan.PlanEventError:
+	case orchestrate.PlanEventError:
 		return SSEEvent{Type: "plan_error", Error: evt.ErrText}
 
 	default:

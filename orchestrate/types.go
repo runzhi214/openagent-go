@@ -8,7 +8,7 @@
 //
 // Both modes share the AgentRunner interface — a Step can be an Agent,
 // a Team, or an external ACP agent.
-package plan
+package orchestrate
 
 import (
 	"context"

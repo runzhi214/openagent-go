@@ -21,7 +21,7 @@ import (
 	"sync"
 	"time"
 
-	openacp "github.com/yusheng-g/openagent-go/acp"
+	openacp "github.com/yusheng-g/openagent-go/acp/sdk"
 )
 
 func main() {

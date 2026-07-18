@@ -1,630 +1,515 @@
-// Package acp implements the Agent Client Protocol v1.
+// Package acp provides openagent Agent ↔ ACP protocol integration.
 //
-// Server: expose an AgentHandler as an ACP-compliant agent over stdio.
-// Client: connect to external ACP agents.
+// AgentServer wraps an [openagent.Agent] as an [openacp.AgentHandler],
+// implementing the full ACP v1 protocol lifecycle.
 package acp
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log/slog"
-	"os"
 	"sync"
+	"time"
+
+	openacp "github.com/yusheng-g/openagent-go/acp/sdk"
+	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/session"
 )
 
-// AgentHandler receives ACP requests from a client. Implement this
-// interface to expose application logic as an ACP agent.
+// AgentServer wraps an [openagent.Agent] as an [openacp.AgentHandler].
 //
-// Methods map 1:1 to the ACP v1 protocol:
+// Usage:
 //
-//	https://agentclientprotocol.com/protocol/v1/schema
-type AgentHandler interface {
-	OnInitialize(ctx context.Context, req InitializeRequest) (*InitializeResponse, error)
-	OnNewSession(ctx context.Context, req NewSessionRequest) (*NewSessionResponse, error)
-	OnLoadSession(ctx context.Context, req LoadSessionRequest, sender SessionEventSender) (*LoadSessionResponse, error)
-	OnResumeSession(ctx context.Context, req ResumeSessionRequest) (*ResumeSessionResponse, error)
-	OnCloseSession(ctx context.Context, req CloseSessionRequest) (*CloseSessionResponse, error)
-	OnDeleteSession(ctx context.Context, req DeleteSessionRequest) (*DeleteSessionResponse, error)
-	OnListSessions(ctx context.Context, req ListSessionsRequest) (*ListSessionsResponse, error)
-	OnSetSessionMode(ctx context.Context, req SetSessionModeRequest) (*SetSessionModeResponse, error)
-	OnSetSessionConfigOption(ctx context.Context, req SetSessionConfigOptionRequest) (*SetSessionConfigOptionResponse, error)
-	OnPrompt(ctx context.Context, req PromptRequest, sender SessionEventSender) (*PromptResponse, error)
-	OnCancel(ctx context.Context, sid SessionId) error
-	OnAuthenticate(ctx context.Context, req AuthenticateRequest) (*AuthenticateResponse, error)
+//	srv := acp.NewAgentServer(agent, mem, sessionStore)
+//	server := openacpsdk.NewServer("my-agent", "1.0.0", srv)
+//	server.Run(ctx)
+type AgentServer struct {
+	Agent        *openagent.Agent
+	Mem          openagent.Memory
+	SessionStore session.Store
+
+	mu       sync.Mutex
+	sessions map[openacp.SessionId]*agentSession
+	nextID   int64
+
+	// clientRPC is set by the SDK mux via ClientRPCUser.
+	clientRPC openacp.ClientRequester
 }
 
-// SessionEventSender sends streaming events back to the ACP client during a
-// prompt turn. Every method maps to a session/update notification variant.
-type SessionEventSender interface {
-	SendAgentMessage(text string) error
-	SendAgentThought(text string) error
-	SendToolCall(update ToolCallUpdate) error
-	SendPlanUpdate(entries []PlanEntry) error
-	SendAvailableCommands(cmds []AvailableCommand) error
-	SendModeUpdate(modeID SessionModeId) error
-	SendConfigOptionUpdate(opts []SessionConfigOption) error
-	SendUsageUpdate(used, total int, cost *Cost) error
-	SendSessionInfo(title string, metadata map[string]any) error
+// agentSession holds per-session runtime state.
+type agentSession struct {
+	id        openacp.SessionId
+	cwd       string
+	createdAt time.Time
+	mode      string // "chat" or "plan"
+	cancel    context.CancelFunc
 }
 
-// ── Server ──
-
-// Server exposes an [AgentHandler] as an ACP agent over a transport.
-type Server struct {
-	name    string
-	version string
-	handler AgentHandler
-	logger  *slog.Logger
-}
-
-// NewServer creates an ACP [Server] with the given implementation identity.
-func NewServer(name, version string, handler AgentHandler) *Server {
-	return &Server{name: name, version: version, handler: handler}
-}
-
-// SetLogger directs diagnostics to the provided logger.
-func (s *Server) SetLogger(l *slog.Logger) { s.logger = l }
-
-// Run starts the ACP server on stdio. Blocks until the stream closes or ctx
-// is cancelled.
-func (s *Server) Run(ctx context.Context) error {
-	return s.RunTransport(ctx, os.Stdout, os.Stdin)
-}
-
-// RunTransport starts the ACP server on custom I/O streams.
-func (s *Server) RunTransport(ctx context.Context, w io.Writer, r io.Reader) error {
-	mux := &mux{
-		handler:       s.handler,
-		w:             w,
-		cancelPending: make(map[string]context.CancelFunc),
-		clientCalls:   make(map[string]*clientCall),
-		logger:        s.logger,
-	}
-	if u, ok := s.handler.(ClientRPCUser); ok {
-		u.SetClientRequester(mux)
-	}
-	return mux.serve(ctx, r)
-}
-
-// ── JSON-RPC 2.0 ──
-
-// jsonrpcMessage is a JSON-RPC 2.0 message. Three shapes per the spec,
-// distinguished by field presence:
-//
-//	Request:      {"jsonrpc":"2.0", "method":"...", "params":{...}, "id":"..."}
-//	Notification: {"jsonrpc":"2.0", "method":"...", "params":{...}}
-//	Response:     {"jsonrpc":"2.0", "result":{...}, "id":"..."}
-//	Error:        {"jsonrpc":"2.0", "error":{...}, "id":"..."}
-//
-// JSON-RPC id is string, number, or null. json.RawMessage preserves
-// the exact JSON representation — use [idString] to normalise for map keys.
-type jsonrpcMessage struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Method  string          `json:"method,omitempty"`
-	Params  json.RawMessage `json:"params,omitempty"`
-	Result  json.RawMessage `json:"result,omitempty"`
-	Error   *Error          `json:"error,omitempty"`
-}
-
-// idString normalises a JSON-RPC id value to a plain Go string suitable for
-// map keying. Handles string ids ("foo" → "foo"), number ids (42 → "42"),
-// and null/absent ids (→ "").
-func idString(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return string(raw)
-	}
-	if v == nil {
-		return ""
-	}
-	switch x := v.(type) {
-	case string:
-		return x
-	case float64:
-		return fmt.Sprintf("%.0f", x)
-	default:
-		return fmt.Sprint(v)
+// NewAgentServer creates an AgentServer wrapping the given agent.
+func NewAgentServer(agent *openagent.Agent, mem openagent.Memory, store session.Store) *AgentServer {
+	return &AgentServer{
+		Agent:        agent,
+		Mem:          mem,
+		SessionStore: store,
+		sessions:     make(map[openacp.SessionId]*agentSession),
 	}
 }
 
-// clientCall tracks an in-flight agent→client JSON-RPC request.
-type clientCall struct {
-	resp rpcResponse
-	done chan struct{}
+// SetClientRequester implements [openacp.ClientRPCUser].
+func (s *AgentServer) SetClientRequester(r openacp.ClientRequester) {
+	s.clientRPC = r
 }
 
-// mux reads JSON-RPC 2.0 messages from stdin, routes them to handler
-// methods, and writes responses (and notifications) to stdout.
-type mux struct {
-	handler AgentHandler
-	w       io.Writer
-	mu      sync.Mutex // guards writes to w
+var _ openacp.ClientRPCUser = (*AgentServer)(nil)
+var _ openacp.AgentHandler = (*AgentServer)(nil)
 
-	// Prompt cancellation: client sends $/cancel_request with the
-	// JSON-RPC id of the original session/prompt request. Keys are
-	// normalised via idString.
-	cancelPending map[string]context.CancelFunc
+// ── Session helpers ──
 
-	// Agent→Client RPC state.
-	clientNextID int64
-	clientMu     sync.Mutex
-	clientCalls  map[string]*clientCall
-
-	// Per-session mutex: ACP requires sequential processing of prompts
-	// within a session. LoadOrStore acquires the session lock.
-	sessionLocks sync.Map // SessionId → *sync.Mutex
-
-	logger *slog.Logger
-}
-
-func (m *mux) logf(format string, args ...any) {
-	if m.logger != nil {
-		m.logger.Debug(fmt.Sprintf("acp: "+format, args...))
-	}
-}
-
-// serve reads newline-delimited JSON-RPC 2.0 messages from r until EOF
-// or ctx cancellation.
-func (m *mux) serve(ctx context.Context, r io.Reader) error {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
-
-	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-
-		var msg jsonrpcMessage
-		if err := json.Unmarshal(line, &msg); err != nil {
-			m.logf("parse error: %v", err)
-			continue
-		}
-
-		switch {
-		case msg.Method != "":
-			m.route(msg)
-		case len(msg.ID) > 0:
-			m.deliverResponse(msg)
-		default:
-			m.logf("unrecognised message (no method, no id)")
-		}
-	}
-	return scanner.Err()
-}
-
-// route dispatches a JSON-RPC 2.0 request or notification by method name.
-func (m *mux) route(msg jsonrpcMessage) {
-	isReq := len(msg.ID) > 0
-
-	switch msg.Method {
-	case "initialize":
-		m.handleInit(msg)
-	case "authenticate":
-		if isReq {
-			dispatch(m, msg, func(ctx context.Context, req AuthenticateRequest) (*AuthenticateResponse, error) {
-				return m.handler.OnAuthenticate(ctx, req)
-			})
-		}
-	case "session/new":
-		if isReq {
-			dispatch(m, msg, func(ctx context.Context, req NewSessionRequest) (*NewSessionResponse, error) {
-				return m.handler.OnNewSession(ctx, req)
-			})
-		}
-	case "session/load":
-		if isReq {
-			m.handleLoadSession(msg)
-		}
-	case "session/resume":
-		if isReq {
-			dispatch(m, msg, func(ctx context.Context, req ResumeSessionRequest) (*ResumeSessionResponse, error) {
-				return m.handler.OnResumeSession(ctx, req)
-			})
-		}
-	case "session/close":
-		if isReq {
-			dispatch(m, msg, func(ctx context.Context, req CloseSessionRequest) (*CloseSessionResponse, error) {
-				return m.handler.OnCloseSession(ctx, req)
-			})
-		}
-	case "session/delete":
-		if isReq {
-			dispatch(m, msg, func(ctx context.Context, req DeleteSessionRequest) (*DeleteSessionResponse, error) {
-				return m.handler.OnDeleteSession(ctx, req)
-			})
-		}
-	case "session/list":
-		if isReq {
-			dispatch(m, msg, func(ctx context.Context, req ListSessionsRequest) (*ListSessionsResponse, error) {
-				return m.handler.OnListSessions(ctx, req)
-			})
-		}
-	case "session/prompt":
-		if isReq {
-			m.handlePrompt(msg)
-		}
-	case "session/set_mode":
-		if isReq {
-			dispatch(m, msg, func(ctx context.Context, req SetSessionModeRequest) (*SetSessionModeResponse, error) {
-				return m.handler.OnSetSessionMode(ctx, req)
-			})
-		}
-	case "session/set_config_option":
-		if isReq {
-			dispatch(m, msg, func(ctx context.Context, req SetSessionConfigOptionRequest) (*SetSessionConfigOptionResponse, error) {
-				return m.handler.OnSetSessionConfigOption(ctx, req)
-			})
-		}
-	case "session/cancel":
-		m.handleCancel(msg)
-	case "$/cancel_request":
-		m.handleCancelRequest(msg)
-	default:
-		if isReq {
-			m.writeError(msg.ID, ErrorCodeMethodNotFound, fmt.Sprintf("method %q not found", msg.Method))
-		}
-		// Unrecognised notifications → silently ignored per spec.
-	}
-}
-
-// ── Handlers ──
-
-func (m *mux) handleInit(msg jsonrpcMessage) {
-	dispatch(m, msg, func(ctx context.Context, req InitializeRequest) (*InitializeResponse, error) {
-		return m.handler.OnInitialize(ctx, req)
-	})
-}
-
-func (m *mux) handleLoadSession(msg jsonrpcMessage) {
-	var req LoadSessionRequest
-	if err := json.Unmarshal(msg.Params, &req); err != nil {
-		m.writeError(msg.ID, ErrorCodeInvalidParams, err.Error())
-		return
-	}
-	sender := &promptSender{mu: &m.mu, w: m.w, sid: req.SessionID}
-	resp, err := m.handler.OnLoadSession(context.Background(), req, sender)
-	if err != nil {
-		m.writeError(msg.ID, ErrorCodeInternal, err.Error())
-		return
-	}
-	m.writeResult(msg.ID, resp)
-}
-
-// handlePrompt processes a session/prompt request. Per ACP spec, prompts on
-// the same session are serialised.
-func (m *mux) handlePrompt(msg jsonrpcMessage) {
-	var req PromptRequest
-	if err := json.Unmarshal(msg.Params, &req); err != nil {
-		m.writeError(msg.ID, ErrorCodeInvalidParams, err.Error())
-		return
-	}
-
-	// Serialise prompts per session. The protocol requires sequential
-	// processing within a session.
-	muI, _ := m.sessionLocks.LoadOrStore(req.SessionID, &sync.Mutex{})
-	mu := muI.(*sync.Mutex)
-	mu.Lock()
-	defer mu.Unlock()
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	reqID := idString(msg.ID)
-	m.mu.Lock()
-	m.cancelPending[reqID] = cancel
-	m.mu.Unlock()
-
-	sender := &promptSender{mu: &m.mu, w: m.w, sid: req.SessionID}
-	resp, err := m.handler.OnPrompt(ctx, req, sender)
-
-	m.mu.Lock()
-	delete(m.cancelPending, reqID)
-	m.mu.Unlock()
-	cancel()
-
-	if err != nil {
-		if ctx.Err() != nil {
-			m.writeResult(msg.ID, PromptResponse{StopReason: StopReasonCancelled})
-			return
-		}
-		m.writeError(msg.ID, ErrorCodeInternal, err.Error())
-		return
-	}
-	m.writeResult(msg.ID, resp)
-}
-
-func (m *mux) handleCancel(msg jsonrpcMessage) {
-	var notif CancelNotification
-	if json.Unmarshal(msg.Params, &notif) != nil {
-		return
-	}
-	_ = m.handler.OnCancel(context.Background(), notif.SessionID)
-}
-
-// handleCancelRequest processes $/cancel_request. The client sends the
-// JSON-RPC id of the original request as a plain string (per ACP spec,
-// CancelRequestNotification.RequestID is a string). We match it against
-// cancelPending keys normalised via idString.
-func (m *mux) handleCancelRequest(msg jsonrpcMessage) {
-	var notif CancelRequestNotification
-	if json.Unmarshal(msg.Params, &notif) != nil {
-		return
-	}
-	m.mu.Lock()
-	cancel, ok := m.cancelPending[string(notif.RequestID)]
-	m.mu.Unlock()
-	if ok {
-		cancel()
-	}
-}
-
-// ── Generic dispatcher ──
-
-func dispatch[Req, Resp any](m *mux, msg jsonrpcMessage, fn func(context.Context, Req) (Resp, error)) {
-	var req Req
-	if err := json.Unmarshal(msg.Params, &req); err != nil {
-		m.writeError(msg.ID, ErrorCodeInvalidParams, err.Error())
-		return
-	}
-	resp, err := fn(context.Background(), req)
-	if err != nil {
-		m.writeError(msg.ID, ErrorCodeInternal, err.Error())
-		return
-	}
-	m.writeResult(msg.ID, resp)
-}
-
-// ── Response writers ──
-
-func (m *mux) writeResult(id json.RawMessage, result any) {
-	body, _ := json.Marshal(result)
-	resp := jsonrpcMessage{
-		JSONRPC: "2.0",
-		ID:      id,
-		Result:  body,
-	}
-	data, _ := json.Marshal(resp)
-	m.mu.Lock()
-	m.w.Write(append(data, '\n'))
-	m.mu.Unlock()
-}
-
-func (m *mux) writeError(id json.RawMessage, code ErrorCode, message string) {
-	resp := jsonrpcMessage{
-		JSONRPC: "2.0",
-		ID:      id,
-		Error:   &Error{Code: code, Message: message},
-	}
-	data, _ := json.Marshal(resp)
-	m.mu.Lock()
-	m.w.Write(append(data, '\n'))
-	m.mu.Unlock()
-}
-
-// ── Agent→Client RPC ──
-
-// nextID returns the next request ID for agent→client calls. The return
-// value is marshalled as a JSON-RPC string id.
-func (m *mux) nextID() string {
-	m.clientMu.Lock()
-	m.clientNextID++
-	id := m.clientNextID
-	m.clientMu.Unlock()
-	return fmt.Sprintf("ac-%d", id)
-}
-
-// request sends a JSON-RPC 2.0 request to the client, registers a pending
-// call, and blocks until the response arrives or ctx is cancelled.
-func (m *mux) request(ctx context.Context, method string, params any) (rpcResponse, error) {
-	id := m.nextID()
-	idJSON, _ := json.Marshal(id)
-
-	req := jsonrpcMessage{
-		JSONRPC: "2.0",
-		ID:      idJSON,
-		Method:  method,
-	}
-	if params != nil {
-		p, _ := json.Marshal(params)
-		req.Params = p
-	}
-
-	data, _ := json.Marshal(req)
-
-	callKey := idString(idJSON)
-	call := &clientCall{done: make(chan struct{})}
-	m.clientMu.Lock()
-	m.clientCalls[callKey] = call
-	m.clientMu.Unlock()
-
-	defer func() {
-		m.clientMu.Lock()
-		delete(m.clientCalls, callKey)
-		m.clientMu.Unlock()
-	}()
-
-	m.mu.Lock()
-	m.w.Write(append(data, '\n'))
-	m.mu.Unlock()
-
-	select {
-	case <-call.done:
-	case <-ctx.Done():
-		return rpcResponse{}, ctx.Err()
-	}
-	return call.resp, nil
-}
-
-// deliverResponse routes an incoming JSON-RPC 2.0 response to the
-// waiting agent→client call.
-func (m *mux) deliverResponse(msg jsonrpcMessage) {
-	callKey := idString(msg.ID)
-	m.clientMu.Lock()
-	call := m.clientCalls[callKey]
-	m.clientMu.Unlock()
-	if call == nil {
-		return
-	}
-	if msg.Error != nil {
-		call.resp.Error = msg.Error
-	} else {
-		call.resp.Result = msg.Result
-	}
-	close(call.done)
-}
-
-// doCall sends an agent→client request and unmarshals the response.
-// JSON-RPC errors are returned as a Go error.
-func doCall[Req, Resp any](m *mux, ctx context.Context, method string, req Req) (*Resp, error) {
-	raw, err := m.request(ctx, method, req)
-	if err != nil {
-		return nil, err
-	}
-	if raw.Error != nil {
-		return nil, fmt.Errorf("acp: %s call failed: %s", method, raw.Error.Message)
-	}
-	var out Resp
-	if err := json.Unmarshal(raw.Result, &out); err != nil {
-		return nil, fmt.Errorf("acp: unmarshal %s response: %w", method, err)
-	}
-	return &out, nil
-}
-
-// ── ClientRequester implementation ──
-
-func (m *mux) RequestPermission(ctx context.Context, req RequestPermissionRequest) (*RequestPermissionResponse, error) {
-	return doCall[RequestPermissionRequest, RequestPermissionResponse](m, ctx, "session/request_permission", req)
-}
-func (m *mux) ReadTextFile(ctx context.Context, req ReadTextFileRequest) (*ReadTextFileResponse, error) {
-	return doCall[ReadTextFileRequest, ReadTextFileResponse](m, ctx, "fs/read_text_file", req)
-}
-func (m *mux) WriteTextFile(ctx context.Context, req WriteTextFileRequest) (*WriteTextFileResponse, error) {
-	return doCall[WriteTextFileRequest, WriteTextFileResponse](m, ctx, "fs/write_text_file", req)
-}
-func (m *mux) CreateTerminal(ctx context.Context, req CreateTerminalRequest) (*CreateTerminalResponse, error) {
-	return doCall[CreateTerminalRequest, CreateTerminalResponse](m, ctx, "terminal/create", req)
-}
-func (m *mux) TerminalOutput(ctx context.Context, req TerminalOutputRequest) (*TerminalOutputResponse, error) {
-	return doCall[TerminalOutputRequest, TerminalOutputResponse](m, ctx, "terminal/output", req)
-}
-func (m *mux) WaitForTerminalExit(ctx context.Context, req WaitForTerminalExitRequest) (*WaitForTerminalExitResponse, error) {
-	return doCall[WaitForTerminalExitRequest, WaitForTerminalExitResponse](m, ctx, "terminal/wait_for_exit", req)
-}
-func (m *mux) KillTerminal(ctx context.Context, req KillTerminalRequest) (*KillTerminalResponse, error) {
-	return doCall[KillTerminalRequest, KillTerminalResponse](m, ctx, "terminal/kill", req)
-}
-func (m *mux) ReleaseTerminal(ctx context.Context, req ReleaseTerminalRequest) (*ReleaseTerminalResponse, error) {
-	return doCall[ReleaseTerminalRequest, ReleaseTerminalResponse](m, ctx, "terminal/release", req)
-}
-
-var _ ClientRequester = (*mux)(nil)
-
-// ── promptSender ──
-
-type promptSender struct {
-	mu  *sync.Mutex
-	w   io.Writer
-	sid SessionId
-}
-
-func (s *promptSender) send(update SessionUpdate) {
-	notif := jsonrpcMessage{
-		JSONRPC: "2.0",
-		Method:  "session/update",
-	}
-	params, _ := json.Marshal(SessionNotification{SessionID: s.sid, Update: update})
-	notif.Params = params
-
-	data, _ := json.Marshal(notif)
+func (s *AgentServer) newSessionID() openacp.SessionId {
 	s.mu.Lock()
-	s.w.Write(append(data, '\n'))
+	s.nextID++
+	id := s.nextID
+	s.mu.Unlock()
+	return openacp.SessionId(fmt.Sprintf("acp_%d_%d", time.Now().UnixNano(), id))
+}
+
+func (s *AgentServer) saveMeta(id string, cwd string, kind string) {
+	if s.SessionStore == nil {
+		return
+	}
+	now := time.Now()
+	info := session.SessionInfo{
+		ID:        id,
+		Cwd:       cwd,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	info.SetMeta("kind", kind)
+	_ = s.SessionStore.Save(context.Background(), info)
+}
+
+func (s *AgentServer) putSession(id openacp.SessionId, ss *agentSession) {
+	s.mu.Lock()
+	s.sessions[id] = ss
 	s.mu.Unlock()
 }
 
-func (s *promptSender) SendAgentMessage(text string) error {
-	su := SessionUpdate{SessionUpdate: "agent_message_chunk"}
-	su.SetContentBlock(ContentBlock{Type: "text", Text: text})
-	s.send(su)
-	return nil
+func (s *AgentServer) getSession(id openacp.SessionId) *agentSession {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sessions[id]
 }
 
-func (s *promptSender) SendAgentThought(text string) error {
-	su := SessionUpdate{SessionUpdate: "agent_thought_chunk"}
-	su.SetContentBlock(ContentBlock{Type: "text", Text: text})
-	s.send(su)
-	return nil
-}
-
-func (s *promptSender) SendToolCall(tc ToolCallUpdate) error {
-	su := "tool_call"
-	if tc.Status != "" && tc.Status != "pending" {
-		su = "tool_call_update"
+func (s *AgentServer) removeSession(id openacp.SessionId) {
+	s.mu.Lock()
+	ss := s.sessions[id]
+	delete(s.sessions, id)
+	s.mu.Unlock()
+	if ss != nil && ss.cancel != nil {
+		ss.cancel()
 	}
-	u := SessionUpdate{
-		SessionUpdate: su,
-		ToolCallID:    tc.ToolCallID,
-		Title:         tc.Title,
-		Kind:          tc.Kind,
-		Status:        tc.Status,
-		RawInput:      tc.RawInput,
-		RawOutput:     tc.RawOutput,
-		Locations:     tc.Locations,
+}
+
+// ── openacp.AgentHandler ──
+
+func (s *AgentServer) OnInitialize(ctx context.Context, req openacp.InitializeRequest) (*openacp.InitializeResponse, error) {
+	caps := openacp.AgentCapabilities{
+		LoadSession: true,
+		PromptCapabilities: openacp.PromptCapabilities{
+			Image:           true,
+			Audio:           false,
+			EmbeddedContext: true,
+		},
+		McpCapabilities: openacp.McpCapabilities{
+			HTTP: false,
+			SSE:  false,
+		},
+		SessionCapabilities: openacp.SessionCapabilities{
+			Close:  &openacp.SessionCloseCapabilities{},
+			Delete: &openacp.SessionDeleteCapabilities{},
+			List:   &openacp.SessionListCapabilities{},
+			Resume: &openacp.SessionResumeCapabilities{},
+		},
+		Delete: map[string]bool{"supported": true},
 	}
-	u.SetToolCallContent(tc.Content)
-	s.send(u)
-	return nil
+	return &openacp.InitializeResponse{
+		ProtocolVersion:   1,
+		AgentCapabilities: caps,
+		AgentInfo: &openacp.Implementation{
+			Name:    "openagent-acp",
+			Version: "1.0.0",
+		},
+	}, nil
 }
 
-func (s *promptSender) SendPlanUpdate(entries []PlanEntry) error {
-	s.send(SessionUpdate{SessionUpdate: "plan", Entries: entries})
-	return nil
-}
+// ── Session CRUD ──
 
-func (s *promptSender) SendAvailableCommands(cmds []AvailableCommand) error {
-	s.send(SessionUpdate{SessionUpdate: "available_commands_update", AvailableCommands: cmds})
-	return nil
-}
-
-func (s *promptSender) SendModeUpdate(modeID SessionModeId) error {
-	s.send(SessionUpdate{SessionUpdate: "current_mode_update", CurrentModeID: modeID})
-	return nil
-}
-
-func (s *promptSender) SendConfigOptionUpdate(opts []SessionConfigOption) error {
-	s.send(SessionUpdate{SessionUpdate: "config_option_update", ConfigOptions: opts})
-	return nil
-}
-
-func (s *promptSender) SendUsageUpdate(used, total int, cost *Cost) error {
-	s.send(SessionUpdate{SessionUpdate: "usage_update", Used: &used, Size: &total, Cost: cost})
-	return nil
-}
-
-func (s *promptSender) SendSessionInfo(title string, metadata map[string]any) error {
-	var t *string
-	if title != "" {
-		t = &title
+func (s *AgentServer) OnNewSession(ctx context.Context, req openacp.NewSessionRequest) (*openacp.NewSessionResponse, error) {
+	id := s.newSessionID()
+	ss := &agentSession{
+		id:        id,
+		cwd:       req.Cwd,
+		createdAt: time.Now(),
+		mode:      "chat",
 	}
-	s.send(SessionUpdate{
-		SessionUpdate: "session_info_update",
-		SessionInfoUpdate: &SessionSessionInfoUpdate{
-			SessionUpdate: "sessionInfoUpdate",
-			Title:         t,
-			MetaData:      metadata,
+	s.putSession(id, ss)
+	s.saveMeta(string(id), req.Cwd, "acp")
+
+	return &openacp.NewSessionResponse{
+		SessionID:     id,
+		ConfigOptions: s.buildConfigOptions(id),
+		Modes:         s.buildModeState(id),
+	}, nil
+}
+
+func (s *AgentServer) OnLoadSession(ctx context.Context, req openacp.LoadSessionRequest, sender openacp.SessionEventSender) (*openacp.LoadSessionResponse, error) {
+	ss := s.getSession(req.SessionID)
+	if ss == nil {
+		ss = &agentSession{
+			id:        req.SessionID,
+			cwd:       req.Cwd,
+			createdAt: time.Now(),
+			mode:      "chat",
+		}
+		s.putSession(req.SessionID, ss)
+	}
+
+	// Replay history from Memory if available.
+	if s.Mem != nil {
+		msgs, _ := s.Mem.Recent(ctx, string(req.SessionID), 200, 0)
+		for i, msg := range msgs {
+			mid := fmt.Sprintf("hist_%d", i)
+			switch msg.Role {
+			case openagent.RoleUser:
+				sender.SendHistoryMessage("user_message_chunk", msg.Content, mid)
+			case openagent.RoleAssistant:
+				if msg.Content != "" {
+					sender.SendHistoryMessage("agent_message_chunk", msg.Content, mid)
+				}
+			}
+			// Tool calls and results are replayed below
+		}
+	}
+
+	return &openacp.LoadSessionResponse{
+		ConfigOptions: s.buildConfigOptions(req.SessionID),
+		Modes:         s.buildModeState(req.SessionID),
+	}, nil
+}
+
+func (s *AgentServer) OnResumeSession(ctx context.Context, req openacp.ResumeSessionRequest) (*openacp.ResumeSessionResponse, error) {
+	if s.getSession(req.SessionID) == nil {
+		ss := &agentSession{
+			id:        req.SessionID,
+			cwd:       req.Cwd,
+			createdAt: time.Now(),
+			mode:      "chat",
+		}
+		s.putSession(req.SessionID, ss)
+	}
+	return &openacp.ResumeSessionResponse{
+		ConfigOptions: s.buildConfigOptions(req.SessionID),
+		Modes:         s.buildModeState(req.SessionID),
+	}, nil
+}
+
+func (s *AgentServer) OnCloseSession(ctx context.Context, req openacp.CloseSessionRequest) (*openacp.CloseSessionResponse, error) {
+	s.removeSession(req.SessionID)
+	if s.SessionStore != nil {
+		_ = s.SessionStore.Delete(ctx, string(req.SessionID))
+	}
+	if s.Mem != nil {
+		_ = s.Mem.DeleteSession(ctx, string(req.SessionID))
+	}
+	return &openacp.CloseSessionResponse{}, nil
+}
+
+func (s *AgentServer) OnDeleteSession(ctx context.Context, req openacp.DeleteSessionRequest) (*openacp.DeleteSessionResponse, error) {
+	s.removeSession(req.SessionID)
+	if s.SessionStore != nil {
+		_ = s.SessionStore.Delete(ctx, string(req.SessionID))
+	}
+	if s.Mem != nil {
+		_ = s.Mem.DeleteSession(ctx, string(req.SessionID))
+	}
+	return &openacp.DeleteSessionResponse{}, nil
+}
+
+func (s *AgentServer) OnListSessions(ctx context.Context, req openacp.ListSessionsRequest) (*openacp.ListSessionsResponse, error) {
+	if s.SessionStore == nil {
+		return &openacp.ListSessionsResponse{Sessions: []openacp.SessionInfo{}}, nil
+	}
+	list, err := s.SessionStore.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list sessions: %w", err)
+	}
+	out := make([]openacp.SessionInfo, 0, len(list))
+	for _, si := range list {
+		cwd := si.Cwd
+		if cwd == "" {
+			cwd = "/"
+		}
+		out = append(out, openacp.SessionInfo{
+			SessionID: openacp.SessionId(si.ID),
+			Cwd:       cwd,
+			Title:     si.Title,
+			UpdatedAt: si.UpdatedAt.Format(time.RFC3339),
+		})
+	}
+	return &openacp.ListSessionsResponse{Sessions: out}, nil
+}
+
+// ── Config & modes ──
+
+func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.SessionConfigOption {
+	ss := s.getSession(sid)
+	mode := "chat"
+	if ss != nil {
+		mode = ss.mode
+	}
+	return []openacp.SessionConfigOption{
+		{
+			ID:           "mode",
+			Name:         "Session Mode",
+			Description:  "Chat mode for conversation, Plan mode for goal-driven execution",
+			Category:     "mode",
+			Type:         "select",
+			CurrentValue: mode,
+			Options: []openacp.SessionConfigOptValue{
+				{Value: "chat", Name: "Chat", Description: "Conversational agent with tools"},
+				{Value: "plan", Name: "Plan", Description: "Goal decomposition and DAG execution"},
+			},
+		},
+		{
+			ID:           "thought_level",
+			Name:         "Reasoning Level",
+			Description:  "Controls the amount of reasoning the model produces",
+			Category:     "thought_level",
+			Type:         "select",
+			CurrentValue: "medium",
+			Options: []openacp.SessionConfigOptValue{
+				{Value: "low", Name: "Low"},
+				{Value: "medium", Name: "Medium"},
+				{Value: "high", Name: "High"},
+			},
+		},
+	}
+}
+
+func (s *AgentServer) buildModeState(sid openacp.SessionId) *openacp.SessionModeState {
+	ss := s.getSession(sid)
+	current := "chat"
+	if ss != nil {
+		current = ss.mode
+	}
+	return &openacp.SessionModeState{
+		CurrentModeID: openacp.SessionModeId(current),
+		AvailableModes: []openacp.SessionMode{
+			{ID: "chat", Name: "Chat", Description: "Conversational agent with tools"},
+			{ID: "plan", Name: "Plan", Description: "Goal decomposition and DAG execution"},
+		},
+	}
+}
+
+func (s *AgentServer) OnSetSessionMode(ctx context.Context, req openacp.SetSessionModeRequest) (*openacp.SetSessionModeResponse, error) {
+	ss := s.getSession(req.SessionID)
+	if ss == nil {
+		return nil, fmt.Errorf("session %s not found", req.SessionID)
+	}
+	ss.mode = string(req.ModeID)
+	return &openacp.SetSessionModeResponse{}, nil
+}
+
+func (s *AgentServer) OnSetSessionConfigOption(ctx context.Context, req openacp.SetSessionConfigOptionRequest) (*openacp.SetSessionConfigOptionResponse, error) {
+	// Config changes are ephemeral — reflect them back.
+	return &openacp.SetSessionConfigOptionResponse{
+		ConfigOptions: s.buildConfigOptions(req.SessionID),
+	}, nil
+}
+
+// ── Prompt ──
+
+func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, sender openacp.SessionEventSender) (*openacp.PromptResponse, error) {
+	var input string
+	for _, b := range req.Prompt {
+		if b.Text != "" {
+			input = b.Text
+			break
+		}
+	}
+	if input == "" {
+		return nil, fmt.Errorf("no text in prompt")
+	}
+
+	ss := s.getSession(req.SessionID)
+	if ss == nil {
+		return nil, fmt.Errorf("session %s not found", req.SessionID)
+	}
+
+	// Per-prompt cancellable context.
+	ctx, cancel := context.WithCancel(ctx)
+	ss.cancel = cancel
+	defer func() {
+		ss.cancel = nil
+		cancel()
+	}()
+
+	// Build the agent clone for this turn — inject ACP-based approval.
+	agent := s.agentForTurn(req.SessionID)
+
+	oaSession := openagent.Session{
+		ID:        string(req.SessionID),
+		CreatedAt: ss.createdAt,
+	}
+
+	// Update session title from first user message.
+	if s.SessionStore != nil {
+		title := input
+		if len(title) > 80 {
+			title = title[:80]
+		}
+		info, _ := s.SessionStore.Get(ctx, string(req.SessionID))
+		if info != nil && info.Title == "" {
+			info.Title = title
+			info.UpdatedAt = time.Now()
+			_ = s.SessionStore.Save(ctx, *info)
+		}
+	}
+
+	ch := agent.RunStream(ctx, oaSession, openagent.UserMessage(input))
+	var usage openagent.Usage
+	for evt := range ch {
+		switch evt.Type {
+		case openagent.StreamTextDelta:
+			sender.SendAgentMessage(evt.Text)
+
+		case openagent.StreamThought:
+			sender.SendAgentThought(evt.Text)
+
+		case openagent.StreamToolCall:
+			if len(evt.Message.ToolCalls) > 0 {
+				for _, tc := range evt.Message.ToolCalls {
+					sender.SendToolCall(openacp.ToolCallUpdate{
+						ToolCallID: tc.ID,
+						Title:      tc.Function.Name,
+						Kind:       "execute",
+						Status:     "in_progress",
+						RawInput:   json.RawMessage(tc.Function.Arguments),
+					})
+				}
+			}
+
+		case openagent.StreamToolProgress:
+			// Forward as in_progress tool call update.
+			sender.SendToolCall(openacp.ToolCallUpdate{
+				ToolCallID: evt.ToolCallID,
+				Status:     "in_progress",
+				RawOutput:  map[string]any{"chunk": evt.Text},
+			})
+
+		case openagent.StreamToolResult:
+			sender.SendToolCall(openacp.ToolCallUpdate{
+				ToolCallID: evt.Message.ToolCallID,
+				Status:     "completed",
+				RawOutput:  map[string]any{"result": evt.Message.Content},
+			})
+
+		case openagent.StreamDone:
+			if evt.Result != nil {
+				usage = evt.Result.Usage
+			}
+
+		case openagent.StreamError:
+			return nil, evt.Error
+
+		case openagent.StreamAborted:
+			return &openacp.PromptResponse{StopReason: openacp.StopReasonCancelled}, nil
+		}
+	}
+
+	// Report usage if available.
+	if usage.TotalTokens > 0 {
+		cw := 0
+		if agent.Model != nil {
+			cw = agent.Model.ContextWindow()
+		}
+		sender.SendUsageUpdate(usage.TotalTokens, cw, nil)
+	}
+
+	if ctx.Err() != nil {
+		return &openacp.PromptResponse{StopReason: openacp.StopReasonCancelled}, nil
+	}
+	return &openacp.PromptResponse{StopReason: openacp.StopReasonEndTurn}, nil
+}
+
+// ── Cancel ──
+
+func (s *AgentServer) OnCancel(ctx context.Context, sid openacp.SessionId) error {
+	ss := s.getSession(sid)
+	if ss != nil && ss.cancel != nil {
+		ss.cancel()
+	}
+	return nil
+}
+
+// ── Auth ──
+
+func (s *AgentServer) OnAuthenticate(ctx context.Context, req openacp.AuthenticateRequest) (*openacp.AuthenticateResponse, error) {
+	// No authentication required for local agent.
+	return &openacp.AuthenticateResponse{}, nil
+}
+
+// ── Internal ──
+
+func (s *AgentServer) agentForTurn(sid openacp.SessionId) *openagent.Agent {
+	clone := s.Agent.Clone()
+	if s.clientRPC != nil {
+		clone.Approver = &acpApprover{client: s.clientRPC, sessionID: sid}
+	}
+	return clone
+}
+
+// ── acpApprover ──
+
+type acpApprover struct {
+	client    openacp.ClientRequester
+	sessionID openacp.SessionId
+}
+
+func (a *acpApprover) Approve(ctx context.Context, call openagent.ToolCall, def openagent.FunctionDefinition, session openagent.Session) (bool, string) {
+	if a.client == nil {
+		return true, ""
+	}
+	resp, err := a.client.RequestPermission(ctx, openacp.RequestPermissionRequest{
+		SessionID: a.sessionID,
+		ToolCall: openacp.ToolCallUpdate{
+			ToolCallID: call.ID,
+			Title:      def.Name,
+			Kind:       "execute",
+			Status:     "pending",
+			RawInput:   json.RawMessage(call.Function.Arguments),
+		},
+		Options: []openacp.PermissionOption{
+			{OptionID: "allow", Name: "Allow", Kind: openacp.PermissionAllowOnce},
+			{OptionID: "always", Name: "Allow Always", Kind: openacp.PermissionAllowAlways},
+			{OptionID: "reject", Name: "Reject", Kind: openacp.PermissionRejectOnce},
 		},
 	})
-	return nil
+	if err != nil {
+		return false, fmt.Sprintf("permission request failed: %v", err)
+	}
+	if resp.Outcome.Cancelled {
+		return false, "cancelled"
+	}
+	if resp.Outcome.OptionID == nil {
+		return false, "no option selected"
+	}
+	switch *resp.Outcome.OptionID {
+	case "allow", "always":
+		return true, ""
+	case "reject":
+		return false, "rejected by user"
+	default:
+		return false, fmt.Sprintf("unknown option: %s", *resp.Outcome.OptionID)
+	}
 }

@@ -10,7 +10,8 @@ import (
 	"strings"
 	"time"
 
-	openacp "github.com/yusheng-g/openagent-go/acp"
+	"github.com/yusheng-g/openagent-go/acp"
+	openacpsdk "github.com/yusheng-g/openagent-go/acp/sdk"
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/memory/sqlite"
 	"github.com/yusheng-g/openagent-go/model/openai"
@@ -38,7 +39,6 @@ func Run(ctx context.Context, opts Options) error {
 		defer memCleanup()
 	}
 
-	// Build models from provider config.
 	models, modelInfos := buildModels(opts.Config.Provider)
 
 	primaryModel := firstModel(models)
@@ -46,8 +46,6 @@ func Run(ctx context.Context, opts Options) error {
 		log.Println("WARNING: no models configured — server will start but chat will fail")
 	}
 
-	// Sandbox + tools. Workspace is process CWD — per-session isolation
-	// is handled by the sandbox (bwrap) and the agent's own session ID.
 	workDir, _ := os.Getwd()
 	sandbox, err := native.New(workDir)
 	var agentTools []openagent.Tool
@@ -132,7 +130,6 @@ func runREST(ctx context.Context, cfg *config.Config, agent *openagent.Agent, mo
 			dir := filepath.Join(opentool.ArtifactRoot(), sessionID)
 			_ = os.RemoveAll(dir)
 		})
-	// Evict idle single-agent sessions after 24h of inactivity.
 	handler.StartJanitor(ctx, 1*time.Hour, 24*time.Hour)
 	for _, mi := range modelInfos {
 		handler.RegisterModel(mi.ID, mi.Model, mi.Provider)
@@ -185,156 +182,8 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 // ── ACP ──
 
 func runACP(ctx context.Context, agent *openagent.Agent, mem openagent.Memory, sessionStore session.Store) error {
-	srv := &acpHandler{
-		agent:        agent,
-		mem:          mem,
-		sessionStore: sessionStore,
-	}
-	server := openacp.NewServer("openagent-acp", "1.0.0", srv)
+	srv := acp.NewAgentServer(agent, mem, sessionStore)
+	server := openacpsdk.NewServer("openagent-acp", "1.0.0", srv)
 	log.Println("ACP server starting on stdio")
 	return server.Run(ctx)
 }
-
-type acpHandler struct {
-	agent        *openagent.Agent
-	mem          openagent.Memory
-	sessionStore session.Store
-}
-
-func (h *acpHandler) OnInitialize(ctx context.Context, req openacp.InitializeRequest) (*openacp.InitializeResponse, error) {
-	return &openacp.InitializeResponse{
-		ProtocolVersion: 1,
-		AgentCapabilities: openacp.AgentCapabilities{
-			LoadSession: true,
-			SessionCapabilities: openacp.SessionCapabilities{
-				Close:  &openacp.SessionCloseCapabilities{},
-				Delete: &openacp.SessionDeleteCapabilities{},
-				List:   &openacp.SessionListCapabilities{},
-				Resume: &openacp.SessionResumeCapabilities{},
-			},
-		},
-	}, nil
-}
-
-func (h *acpHandler) OnNewSession(ctx context.Context, req openacp.NewSessionRequest) (*openacp.NewSessionResponse, error) {
-	id := fmt.Sprintf("acp_%d", time.Now().UnixNano())
-	if h.sessionStore != nil {
-		now := time.Now()
-		info := session.SessionInfo{ID: id, CreatedAt: now, UpdatedAt: now, Cwd: req.Cwd}
-		info.SetMeta("kind", "acp")
-		_ = h.sessionStore.Save(ctx, info)
-	}
-	return &openacp.NewSessionResponse{SessionID: id}, nil
-}
-
-func (h *acpHandler) OnLoadSession(ctx context.Context, req openacp.LoadSessionRequest, sender openacp.SessionEventSender) (*openacp.LoadSessionResponse, error) {
-	return &openacp.LoadSessionResponse{}, nil
-}
-
-func (h *acpHandler) OnResumeSession(ctx context.Context, req openacp.ResumeSessionRequest) (*openacp.ResumeSessionResponse, error) {
-	return &openacp.ResumeSessionResponse{}, nil
-}
-
-func (h *acpHandler) OnCloseSession(ctx context.Context, req openacp.CloseSessionRequest) (*openacp.CloseSessionResponse, error) {
-	if h.sessionStore != nil {
-		_ = h.sessionStore.Delete(ctx, req.SessionID)
-	}
-	if h.mem != nil {
-		_ = h.mem.DeleteSession(ctx, req.SessionID)
-	}
-	return &openacp.CloseSessionResponse{}, nil
-}
-
-func (h *acpHandler) OnDeleteSession(ctx context.Context, req openacp.DeleteSessionRequest) (*openacp.DeleteSessionResponse, error) {
-	if h.sessionStore != nil {
-		_ = h.sessionStore.Delete(ctx, req.SessionID)
-	}
-	if h.mem != nil {
-		_ = h.mem.DeleteSession(ctx, req.SessionID)
-	}
-	return &openacp.DeleteSessionResponse{}, nil
-}
-
-func (h *acpHandler) OnListSessions(ctx context.Context, req openacp.ListSessionsRequest) (*openacp.ListSessionsResponse, error) {
-	if h.sessionStore != nil {
-		list, err := h.sessionStore.List(ctx)
-		if err != nil {
-			return nil, err
-		}
-		out := make([]openacp.SessionInfo, 0, len(list))
-		for _, s := range list {
-			out = append(out, openacp.SessionInfo{
-				SessionID: s.ID,
-				Cwd:       "/",
-				Title:     s.Title,
-				UpdatedAt: s.UpdatedAt.Format(time.RFC3339),
-			})
-		}
-		return &openacp.ListSessionsResponse{Sessions: out}, nil
-	}
-	return &openacp.ListSessionsResponse{}, nil
-}
-
-func (h *acpHandler) OnSetSessionMode(ctx context.Context, req openacp.SetSessionModeRequest) (*openacp.SetSessionModeResponse, error) {
-	return &openacp.SetSessionModeResponse{}, nil
-}
-
-func (h *acpHandler) OnSetSessionConfigOption(ctx context.Context, req openacp.SetSessionConfigOptionRequest) (*openacp.SetSessionConfigOptionResponse, error) {
-	return &openacp.SetSessionConfigOptionResponse{}, nil
-}
-
-func (h *acpHandler) OnPrompt(ctx context.Context, req openacp.PromptRequest, sender openacp.SessionEventSender) (*openacp.PromptResponse, error) {
-	var input string
-	for _, b := range req.Prompt {
-		if b.Text != "" {
-			input = b.Text
-			break
-		}
-	}
-	if input == "" {
-		return nil, fmt.Errorf("no text in prompt")
-	}
-
-	session := openagent.Session{
-		ID:        req.SessionID,
-		CreatedAt: time.Now(),
-	}
-
-	ch := h.agent.RunStream(ctx, session, openagent.UserMessage(input))
-	for evt := range ch {
-		switch evt.Type {
-		case openagent.StreamTextDelta:
-			sender.SendAgentMessage(evt.Text)
-		case openagent.StreamToolCall:
-			if len(evt.Message.ToolCalls) > 0 {
-				tc := evt.Message.ToolCalls[0]
-				sender.SendToolCall(openacp.ToolCallUpdate{
-					ToolCallID: tc.ID,
-					Title:      tc.Function.Name,
-					Status:     "in_progress",
-					RawInput:   map[string]any{"args": tc.Function.Arguments},
-				})
-			}
-		case openagent.StreamToolResult:
-			sender.SendToolCall(openacp.ToolCallUpdate{
-				ToolCallID: evt.Message.ToolCallID,
-				Status:     "completed",
-				RawOutput:  map[string]any{"result": evt.Message.Content},
-			})
-		case openagent.StreamError:
-			return nil, evt.Error
-		case openagent.StreamAborted:
-			return &openacp.PromptResponse{StopReason: openacp.StopReasonCancelled}, nil
-		}
-	}
-	return &openacp.PromptResponse{StopReason: openacp.StopReasonEndTurn}, nil
-}
-
-func (h *acpHandler) OnCancel(ctx context.Context, sid openacp.SessionId) error {
-	return nil
-}
-
-func (h *acpHandler) OnAuthenticate(ctx context.Context, req openacp.AuthenticateRequest) (*openacp.AuthenticateResponse, error) {
-	return &openacp.AuthenticateResponse{}, nil
-}
-

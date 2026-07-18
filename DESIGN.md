@@ -365,13 +365,20 @@ openagent-go/
 ├── hooks/slog/           slog logger hooks
 ├── hooks/otel/           OpenTelemetry tracing hooks
 ├── skill/fs/             Filesystem skill loader
-├── plugin/agent/wasm/          WASM plugin runtime (wazero)
-├── acp/                  ACP protocol (Agent ↔ IDE)
-├── mcp/                  MCP protocol (tool interoperability)
-├── plan/                 Goal → DAG → parallel execution + replan
-├── eventbus/             Generic pub/sub with history replay
-├── rest/                 REST API (HTTP access layer)
-├── runner/acp/           ACP Runner: external agent as Team member
+├── plugin/wasmhost/            Shared WASM host layer (ABI + host module)
+├── plugin/agent/wasm/          Agent WASM plugin runtime
+├── plugin/cli/                 CLI plugin host + WASM runtime
+├── plugin/sdk/rust/            Plugin SDK (Rust crate for plugin authors)
+├── acp/                        ACP protocol integration (Agent ↔ IDE)
+│   ├── sdk/                    ACP v1 SDK (pure stdlib, zero deps)
+│   └── server.go               AgentServer (openagent Agent → ACP AgentHandler)
+├── mcp/                        MCP protocol (tool interoperability)
+├── orchestrate/                Goal → DAG → parallel execution + replan
+├── eventbus/                   Generic pub/sub with history replay
+├── session/                    Session metadata types + persistent Store
+│   ├── sqlite/                 SQLite session store
+│   └── file/                   File-based session store
+├── rest/                       REST API (HTTP access layer)
 │
 ├── cmd/
 │   ├── tui/              Terminal chat (bubbletea v2)
@@ -444,7 +451,7 @@ All interfaces in root package. Implementations in sub-packages. No circular dep
 | — | RunObserver | ✅ | per-stage enter/leave, Runner wired |
 | — | Router | ✅ | first-agent + LLM-based |
 | — | Team | ✅ | multi-agent with handoff + loop detection |
-| — | Plan | ✅ | goal → DAG → parallel execution + replan |
+| — | Orchestrate | ✅ | LLM-driven DAG → parallel execution + replan |
 | — | EventBus | ✅ | generic pub/sub, per-session topics |
 
 ### Runtime Extensions (WASM Plugins)
@@ -517,7 +524,7 @@ type Router interface {
 }
 ```
 
-`AgentInfo.Type` auto-populated: `WithTeamAgent` → `AgentInternal`, `AddAgent` with ACP runner → `AgentExternal`. Flows to Router, Team prompt, Plan planner, and frontend.
+`AgentInfo.Type` auto-populated: `WithTeamAgent` → `AgentInternal`, `AddAgent` with external runner → `AgentExternal`. Flows to Router, Team prompt, Orchestrate planner, and frontend.
 
 ### Agent as Tool (Parallel Delegation)
 
@@ -531,27 +538,27 @@ Three-layer isolation: new session per call, no coordinator history leaked, only
 
 ---
 
-## Plan (DAG Goal Decomposition)
+## Orchestrate (LLM-Driven DAG Execution)
 
 ```go
-p := plan.NewPlan(
-    plan.WithPlanner(plan.NewLLMPlanner(model)),
-    plan.WithAgent("coder", "writes code", coderAgent),
-    plan.WithAgent("reviewer", "reviews code", reviewerAgent),
+p := orchestrate.NewPlan(
+    orchestrate.WithPlanner(orchestrate.NewLLMPlanner(model)),
+    orchestrate.WithAgent("coder", "writes code", coderAgent),
+    orchestrate.WithAgent("reviewer", "reviews code", reviewerAgent),
 )
 result, _ := p.Run(ctx, session, "Build a REST API for todos")
 ```
 
-| | Team | Plan |
-|---|------|------|
-| Decision | Runtime, agent-initiated handoff | Pre-execution, Planner generates DAG |
+| | Team | Orchestrate |
+|---|------|------------|
+| Decision | Runtime, agent-initiated handoff | Pre-execution, LLM generates DAG |
 | Parallelism | None (serial handoff chain) | Topological batches auto-parallel |
 | Failure | Agent handles itself | Subtree replan with LLM |
 | Use case | Conversational collaboration | Structured execution pipelines |
 
 `Planner` generates a DAG from the goal. `Executor` topo-sorts into batches, runs each batch with goroutines, auto-replans on failure (up to `MaxReplans` times). `AutoReplan=false` pauses on failure for manual retry/replan.
 
-**Frontend UI:** The Plan page provides a full workflow — input a goal, watch the LLM stream its thinking via `plan_thinking` events, then review the rendered DAG. Pre-execution actions: `[Execute]` `[Replan]` `[Clear]`. Replan accepts natural language feedback to regenerate the DAG before execution begins. During execution, step cards update in real-time with status colors and expandable output. Failed steps offer `[Retry]` and `[Replan]` with feedback.
+**Frontend UI:** The Orchestrate page provides a full workflow — input a goal, watch the LLM stream its thinking via `plan_thinking` events, then review the rendered DAG. Pre-execution actions: `[Execute]` `[Replan]` `[Clear]`. Replan accepts natural language feedback to regenerate the DAG before execution begins. During execution, step cards update in real-time with status colors and expandable output. Failed steps offer `[Retry]` and `[Replan]` with feedback.
 
 ## Goal (Autonomous Mode)
 
@@ -561,7 +568,7 @@ agent.RunGoal(ctx, session, "Fix all failing tests")
 
 Unlike `Run()` where the input is a user message that may scroll out of context, `RunGoal()` injects the goal into the system prompt — it persists across all turns. The agent iterates autonomously: plan → execute → evaluate → continue until done or impossible.
 
-| | Run | RunGoal | Plan.Run |
+| | Run | RunGoal | Orchestrate.Run |
 |---|---|---|---|
 | Goal placement | User message (scrolls out) | System prompt (persistent) | Planner-generated DAG |
 | Behavior | One-shot Q&A | Autonomous iteration | DAG parallel execution |
@@ -611,8 +618,8 @@ The observer adds `turn`/`maxTurns` and `tokens_prompt`/`tokens_completion` to `
 | Sandbox | Docker SDK + macOS sandbox-exec | seccomp + namespaces | macOS Seatbelt / Linux bwrap |
 | File tools | read/write/ls/rm/mkdir | Read/Write/Glob | ReadFile/WriteFile/ListDir/Grep |
 | Streaming | PTY-based | Bash tool | Shell tool (line streaming, no PTY) |
-| Multi-agent | Handoff chain | — | Team (handoff) + Plan (DAG parallel) |
-| Goal mode | — | `/goal` | RunGoal + Plan.Run |
+| Multi-agent | Handoff chain | — | Team (handoff) + Orchestrate (LLM-driven DAG) |
+| Goal mode | — | `/goal` | RunGoal + Orchestrate.Run |
 | Observability | — | — | RunObserver + SVG pipeline panel |
 | Plugins | — | — | WASM (wazero, zero CGO) |
 
@@ -623,4 +630,4 @@ The observer adds `turn`/`maxTurns` and `tokens_prompt`/`tokens_completion` to `
 - `cmd/cli/` — CLI tool: `openagent run "msg"` and `openagent goal "task"`, streaming output
 - `cmd/tui/` — bubbletea v2 terminal chat, streaming + Y/N approval
 - `examples/backend/` — Full REST + SSE API server (single, team, plan)
-- `examples/frontend/vue-app/` — Vue 3 SPA with Chat, Team, Plan modes, streaming, DAG, pipeline monitor
+- `examples/frontend/vue-app/` — Vue 3 SPA with Chat, Team, Orchestrate modes, streaming, DAG, pipeline monitor

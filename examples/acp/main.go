@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"os"
 
-	openacp "github.com/yusheng-g/openagent-go/acp"
+	openacp "github.com/yusheng-g/openagent-go/acp/sdk"
 )
 
 func main() {
