@@ -164,10 +164,12 @@ func (m *Memory) Append(ctx context.Context, sessionID string, msg openagent.Mes
 
 	id, _ := res.LastInsertId()
 
-	// FTS5 index
+	// FTS5 index — CJK content is space-separated so
+	// unicode61 treats each character as a token.
 	if msg.Content != "" {
+		ftsContent := ftsTokenizeCJK(msg.Content)
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO messages_fts (rowid, content) VALUES (?, ?)`, id, msg.Content,
+			`INSERT INTO messages_fts (rowid, content) VALUES (?, ?)`, id, ftsContent,
 		); err != nil {
 			return fmt.Errorf("sqlite fts: %w", err)
 		}
@@ -454,6 +456,9 @@ func (m *Memory) ftsSearch(ctx context.Context, sessionID, query string, limit i
 		return nil, nil
 	}
 
+	// Apply the same CJK tokenization as at insert time so queries match.
+	ftsQuery = ftsTokenizeCJK(ftsQuery)
+
 	rows, err := m.db.QueryContext(ctx,
 		`SELECT m.id, m.role, m.name, m.content, m.content_parts, m.tool_calls, m.tool_call_id, reasoning_content
 		 FROM messages_fts f
@@ -517,6 +522,31 @@ func (m *Memory) migrate() error {
 	}
 
 	return nil
+}
+
+// ftsTokenizeCJK inserts spaces between CJK code points so the
+// unicode61 tokenizer (whitespace-based) can index each character as
+// a separate token.  Non-CJK runs pass through unchanged.  The same
+// transform is applied at insert time and search time so queries
+// match.
+func ftsTokenizeCJK(content string) string {
+	var b strings.Builder
+	b.Grow(len(content) + len(content)/3) // ~30% growth for spaces
+	for _, r := range content {
+		if (r >= 0x4E00 && r <= 0x9FFF) || // CJK Unified
+			(r >= 0x3400 && r <= 0x4DBF) || // CJK Ext-A
+			(r >= 0x20000 && r <= 0x2A6DF) || // CJK Ext-B
+			(r >= 0x3040 && r <= 0x309F) || // Hiragana
+			(r >= 0x30A0 && r <= 0x30FF) || // Katakana
+			(r >= 0xAC00 && r <= 0xD7AF) {  // Hangul
+			b.WriteByte(' ')
+			b.WriteRune(r)
+			b.WriteByte(' ')
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // ── Helpers ──

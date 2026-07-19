@@ -799,7 +799,7 @@ func (r *runner) executeOneToolInternal(ctx context.Context, session Session, ca
 		msg := r.executeReloadSkills(toolCtx, call)
 		r.fireToolHooksEnd(toolCtx, *def, args, msg.Content, toolStart, nil)
 		return msg
-	case "recall_memory":
+	case "recall":
 		toolStart := r.fireToolHooks(toolCtx, *def, args)
 		msg := r.executeRecall(toolCtx, session, call)
 		r.fireToolHooksEnd(toolCtx, *def, args, msg.Content, toolStart, nil)
@@ -905,7 +905,7 @@ var (
 		Parameters:  json.RawMessage(`{"type":"object","properties":{}}`),
 	}
 	builtinRecallDef = FunctionDefinition{
-		Name:        "recall_memory",
+		Name:        "recall",
 		Description: "Search past conversation history for relevant information. Use this when you need to remember previously discussed facts, user preferences, decisions, or context that may not be in the current conversation window. Returns ranked results with relevance scores.",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"Search query to find relevant memories (e.g. 'user favourite colour', 'database version', 'project deadline')"}},"required":["query"]}`),
 	}
@@ -928,7 +928,7 @@ func (r *runner) toolDef(name string) *FunctionDefinition {
 		return &builtinUseSkillDef
 	case "reload_skills":
 		return &builtinReloadSkillsDef
-	case "recall_memory":
+	case "recall":
 		return &builtinRecallDef
 	case "subagent":
 		return &builtinSubAgentDef
@@ -1310,7 +1310,7 @@ func (r *runner) executeRecall(ctx context.Context, session Session, call ToolCa
 		return Message{
 			Role:       RoleTool,
 			ToolCallID: call.ID,
-			Content:    "recall_memory: a non-empty 'query' is required",
+			Content:    "recall: a non-empty 'query' is required",
 		}
 	}
 
@@ -1318,7 +1318,7 @@ func (r *runner) executeRecall(ctx context.Context, session Session, call ToolCa
 		return Message{
 			Role:       RoleTool,
 			ToolCallID: call.ID,
-			Content:    "recall_memory: memory is not configured",
+			Content:    "recall: memory is not configured",
 		}
 	}
 
@@ -1327,7 +1327,7 @@ func (r *runner) executeRecall(ctx context.Context, session Session, call ToolCa
 		return Message{
 			Role:       RoleTool,
 			ToolCallID: call.ID,
-			Content:    fmt.Sprintf("recall_memory: search failed: %v", err),
+			Content:    fmt.Sprintf("recall: search failed: %v", err),
 		}
 	}
 
@@ -1335,7 +1335,7 @@ func (r *runner) executeRecall(ctx context.Context, session Session, call ToolCa
 		return Message{
 			Role:       RoleTool,
 			ToolCallID: call.ID,
-			Content:    fmt.Sprintf("recall_memory: no results found for %q", args.Query),
+			Content:    fmt.Sprintf("recall: no results found for %q", args.Query),
 		}
 	}
 
