@@ -777,6 +777,7 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 			"additionalDirectories": ss.additionalDirectories,
 			"mcpServers":            ss.mcpServers,
 		},
+		DynamicContext: s.buildDynamicContext(ss),
 	}
 
 	// ── Register plan_create tool ──
@@ -1039,15 +1040,8 @@ func (s *AgentServer) agentForTurn(sid openacp.SessionId) *openagent.Agent {
 			}
 		}
 
-		// Plan mode: overlay instructions to encourage structured planning.
-		// The agent still decides when to call plan_create — the overlay
-		// just makes it more likely to do so for complex tasks.
-		if ss.mode == "plan" {
-			clone.SystemPrompts = append(clone.SystemPrompts, planModeOverlay)
-		}
-
-		// Inject MCP tools from all connected servers.
-		clone.Tools = append(clone.Tools, ss.mcpTools...)
+	// Inject MCP tools from all connected servers.
+	clone.Tools = append(clone.Tools, ss.mcpTools...)
 
 		// Create per-turn tools scoped to the session's cwd.
 	// This ensures tools see the correct working directory
@@ -1075,16 +1069,30 @@ func (s *AgentServer) agentForTurn(sid openacp.SessionId) *openagent.Agent {
 	return clone
 }
 
-// planModeOverlay is appended to the system instructions when the session
-// is in plan mode. It nudges the agent to decompose complex goals explicitly.
-const planModeOverlay = `## Plan Mode
-You are in plan mode. For complex multi-step tasks, use the plan_create tool
-to produce a structured execution plan before starting work. The plan will be
-shown to the user so they can review the approach. After creating the plan,
-proceed to execute each step in order.
+// buildDynamicContext assembles per-turn dynamic context from session
+// runtime state — plan entries with status, mode instruction, etc.
+// Called every turn in OnPrompt; injected into the system prompt via
+// Session.DynamicContext → PromptInput → defaultBuildPrompt.
+func (s *AgentServer) buildDynamicContext(ss *agentSession) string {
+	var b strings.Builder
 
-For simple one-step tasks (reading a file, answering a question, a single edit),
-you do not need to create a plan — just do the work directly.`
+	// ── Plan entries with current status ──
+	if len(ss.planEntries) > 0 {
+		b.WriteString("## Current Plan\n")
+		for _, e := range ss.planEntries {
+			fmt.Fprintf(&b, "- [%s] [%s] %s\n", e.Priority, e.Status, e.Content)
+		}
+		b.WriteString("\nUpdate plan status with plan_update when starting or completing each step.\n\n")
+	}
+
+	// ── Mode instruction ──
+	if ss.mode == "plan" {
+		b.WriteString("## Session Mode\n")
+		b.WriteString("You are in plan mode. For complex multi-step tasks, use the plan_create tool to produce a structured execution plan before starting work. After creating the plan, proceed to execute each step. For simple one-step tasks, you do not need to create a plan.\n")
+	}
+
+	return b.String()
+}
 
 // buildSlashContext constructs the slash.Context for command dispatch.
 func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.SessionId, ss *agentSession) slash.Context {

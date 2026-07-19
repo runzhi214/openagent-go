@@ -55,6 +55,12 @@ type Session struct {
 	UserProfile    string `json:"user_profile,omitempty"`
 	ProjectContext string `json:"project_context,omitempty"`
 
+	// DynamicContext is injected into the system prompt every turn.
+	// It carries session-level state that changes between turns:
+	// plan entries with status, active mode instructions, etc.
+	// The ACP layer constructs it; the Runner simply passes it through.
+	DynamicContext string `json:"-"`
+
 	// Lifecycle
 	Status    SessionStatus `json:"status"`
 	Turn      int           `json:"turn"`

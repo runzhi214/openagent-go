@@ -19,8 +19,9 @@ type PromptInput struct {
 	LoadedSkills    map[string]string // name → body, injected when use_skill was called
 
 	// From Session
-	UserProfile    string
-	ProjectContext string
+	UserProfile     string
+	ProjectContext  string
+	DynamicContext  string
 }
 
 // RetrievalHint tells the model how to retrieve the original context.

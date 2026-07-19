@@ -546,6 +546,11 @@ func (r *runner) estimatePromptOverhead(ctx context.Context, session Session, mo
 		n += tokenizer.Count(modelID, session.ProjectContext) + 4
 	}
 
+	// Dynamic context (plan, mode, etc.) — injected by ACP layer.
+	if session.DynamicContext != "" {
+		n += tokenizer.Count(modelID, session.DynamicContext) + 4
+	}
+
 	// Compressed summary + hints.
 	if cc, err := r.agent.Memory.Compressed(ctx, session.ID); err == nil && cc != nil && cc.Summary != "" {
 		content := "## Conversation Summary\n" + cc.Summary
@@ -586,6 +591,7 @@ func (r *runner) buildPrompt(ctx context.Context, session Session, working []Mes
 		Tools:            toolDefinitions(r.agent.Tools),
 		UserProfile:      session.UserProfile,
 		ProjectContext:   session.ProjectContext,
+		DynamicContext:   session.DynamicContext,
 	}
 
 	if r.compressed != nil {
@@ -631,6 +637,10 @@ func defaultBuildPrompt(input PromptInput) []Message {
 			}
 		}
 		msgs = append(msgs, Message{Role: RoleSystem, Content: content})
+	}
+
+	if input.DynamicContext != "" {
+		msgs = append(msgs, Message{Role: RoleSystem, Content: input.DynamicContext})
 	}
 
 	if len(input.AvailableSkills) > 0 {
