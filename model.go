@@ -13,8 +13,9 @@ type ChatCompletionRequest struct {
 	Tools       []FunctionDefinition `json:"tools,omitempty"`
 	Temperature *float64             `json:"temperature,omitempty"`  // nil = model default
 	MaxTokens   int                  `json:"max_tokens,omitempty"`   // 0 = model default
-	TopP        *float64             `json:"top_p,omitempty"`        // nil = model default
-	Stop        []string             `json:"stop,omitempty"`
+	TopP             *float64             `json:"top_p,omitempty"`        // nil = model default
+	Stop             []string             `json:"stop,omitempty"`
+	ReasoningEffort  string               `json:"reasoning_effort,omitempty"` // "none","minimal","low","medium","high","xhigh"
 	Stream      bool                 `json:"stream,omitempty"`
 }
 

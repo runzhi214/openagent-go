@@ -586,11 +586,12 @@ func (r *runner) buildModelRequest(session Session, messages []Message) ChatComp
 		tools = append(tools, r.builtinTools...)
 	}
 	return ChatCompletionRequest{
-		Model:       session.ModelID,
-		Messages:    messages,
-		Tools:       tools,
-		Temperature: session.Temperature,
-		MaxTokens:   session.MaxTokens,
+		Model:           session.ModelID,
+		Messages:        messages,
+		Tools:           tools,
+		Temperature:     session.Temperature,
+		MaxTokens:       session.MaxTokens,
+		ReasoningEffort: r.agent.ReasoningEffort,
 	}
 }
 

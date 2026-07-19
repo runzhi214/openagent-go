@@ -43,6 +43,11 @@ type Agent struct {
 	MaxWorkingTokens    int // max tokens for working set before compaction; 0 = 70% of model context window
 	MaxCompressedTokens int // max tokens for compressed summary, 0 = no limit (default 2048)
 
+	// ReasoningEffort is passed through to the Model's ChatCompletionRequest
+	// for providers that support it (OpenAI o-series, Anthropic extended thinking).
+	// Empty string means use the model default.
+	ReasoningEffort string
+
 	// noSpawn, when true, prevents the built-in spawn tool from being
 	// auto-injected. Sub-agents (created via AsTool or the spawn tool itself)
 	// set this to prevent infinite recursion.

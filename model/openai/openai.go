@@ -10,6 +10,7 @@ import (
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/packages/ssestream"
+	"github.com/openai/openai-go/v3/shared"
 
 	openagent "github.com/yusheng-g/openagent-go"
 )
@@ -63,6 +64,9 @@ func (m *Model) ChatCompletion(ctx context.Context, req openagent.ChatCompletion
 		params.Stop = openaisdk.ChatCompletionNewParamsStopUnion{
 			OfStringArray: req.Stop,
 		}
+	}
+	if req.ReasoningEffort != "" {
+		params.ReasoningEffort = shared.ReasoningEffort(req.ReasoningEffort)
 	}
 
 	completion, err := m.client.Chat.Completions.New(ctx, params)
