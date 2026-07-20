@@ -48,10 +48,11 @@ type Agent struct {
 	// Empty string means use the model default.
 	ReasoningEffort string
 
-	// noSpawn, when true, prevents the built-in spawn tool from being
-	// auto-injected. Sub-agents (created via AsTool or the spawn tool itself)
-	// set this to prevent infinite recursion.
-	noSpawn bool
+	// NoSpawn, when true, prevents the built-in subagent tool from being
+	// auto-injected by the Runner. Sub-agents (created via AsTool), plan-mode
+	// sessions, and the spawn tool itself set this to prevent infinite recursion
+	// or mode-inappropriate delegation.
+	NoSpawn bool
 }
 
 // Clone returns a shallow copy of the Agent that is safe to mutate.
@@ -291,7 +292,7 @@ func (a *Agent) AsTool() Tool {
 	clone.MaxTurns = 3
 	clone.Approver = nil
 	clone.Memory = nil
-	clone.noSpawn = true
+	clone.NoSpawn = true
 	clone.Tools = stripAgentTools(clone.Tools)
 
 	return &subAgentTool{agent: clone}

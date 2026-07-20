@@ -201,3 +201,48 @@ func (t *UpdateTool) Execute(ctx context.Context, args json.RawMessage) (string,
 
 	return formatPlan("", entries), nil
 }
+
+// ── exit_plan_mode Tool ──
+
+// ExitTool is an openagent.Tool named "exit_plan_mode". The agent calls it
+// to leave plan mode and gain execution tools (shell, write, delete, terminal,
+// etc.). The session returns to the mode that was active before entering plan
+// mode (auto or manual).
+//
+// The onExit callback is called by Execute to transition the session. It is
+// wired by the ACP server at OnPrompt time.
+type ExitTool struct {
+	onExit func() error
+}
+
+// NewExitTool creates an exit_plan_mode tool.
+func NewExitTool(onExit func() error) *ExitTool {
+	return &ExitTool{onExit: onExit}
+}
+
+// Definition implements openagent.Tool.
+func (t *ExitTool) Definition() openagent.FunctionDefinition {
+	return openagent.FunctionDefinition{
+		Name: "exit_plan_mode",
+		Description: `Exit plan mode and return to the previous mode (auto or manual) to begin executing the plan. Call this AFTER you have created a complete plan with plan_create and the user has reviewed it. You will gain access to execution tools (shell, write, terminal, etc.).
+
+Only call this once, and only when you are ready to start executing the plan steps.`,
+		Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {},
+  "required": []
+}`),
+	}
+}
+
+// Execute implements openagent.Tool. It calls the onExit callback to
+// transition the session mode, then returns confirmation text.
+func (t *ExitTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	if t.onExit == nil {
+		return "exit_plan_mode: no mode transition callback configured.\n", nil
+	}
+	if err := t.onExit(); err != nil {
+		return "", fmt.Errorf("exit_plan_mode: %w", err)
+	}
+	return "Exited plan mode. You now have access to execution tools (shell, write, terminal, etc.). Use plan_update to track progress as you work through the plan steps.\n", nil
+}

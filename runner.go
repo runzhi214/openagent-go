@@ -77,7 +77,7 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 	if r.agent.Memory != nil {
 		r.builtinTools = append(r.builtinTools, builtinRecallDef)
 	}
-	if !r.agent.noSpawn {
+	if !r.agent.NoSpawn {
 		r.builtinTools = append(r.builtinTools, builtinSubAgentDef)
 	}
 
@@ -1450,7 +1450,7 @@ func (r *runner) executeSubAgent(ctx context.Context, session Session, call Tool
 		Model:        r.runModel,
 		Tools:        stripAgentTools(r.agent.Tools),
 		MaxTurns:     3,
-		noSpawn:      true,
+		NoSpawn:      true,
 		// no Approver, no Memory — safe sub-agent
 	}
 

@@ -57,8 +57,9 @@ type agentSession struct {
 	id        openacp.SessionId
 	cwd       string
 	createdAt time.Time
-	mode      string                          // "chat" or "plan"
-	config    map[openacp.SessionConfigId]any // config option values
+	mode         string                          // "auto", "manual", or "plan"
+	previousMode string                          // mode before entering plan; used by exit_plan_mode
+	config       map[openacp.SessionConfigId]any // config option values
 	cancel    context.CancelFunc
 
 	// Accumulated usage across turns.
@@ -333,7 +334,7 @@ func (s *AgentServer) OnNewSession(ctx context.Context, req openacp.NewSessionRe
 		id:                    id,
 		cwd:                   req.Cwd,
 		createdAt:             time.Now(),
-		mode:                  "chat",
+		mode:                  "auto",
 		config:                map[openacp.SessionConfigId]any{"thought_level": "medium", "model": s.defaultModelID},
 		firstPrompt:           true,
 		additionalDirectories: req.AdditionalDirectories,
@@ -364,7 +365,7 @@ func (s *AgentServer) OnLoadSession(ctx context.Context, req openacp.LoadSession
 	if ss == nil {
 		mode := s.loadMode(ctx, string(req.SessionID))
 		if mode == "" {
-			mode = "chat"
+			mode = "auto"
 		}
 		ss = &agentSession{
 			id:                    req.SessionID,
@@ -480,7 +481,7 @@ func (s *AgentServer) OnResumeSession(ctx context.Context, req openacp.ResumeSes
 	if ss == nil {
 		mode := s.loadMode(ctx, string(req.SessionID))
 		if mode == "" {
-			mode = "chat"
+			mode = "auto"
 		}
 		ss = &agentSession{
 			id:                    req.SessionID,
@@ -565,7 +566,7 @@ func (s *AgentServer) OnListSessions(ctx context.Context, req openacp.ListSessio
 
 func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.SessionConfigOption {
 	ss := s.getSession(sid)
-	mode := "chat"
+	mode := "auto"
 	thoughtLevel := "medium"
 	modelID := s.defaultModelID
 	if ss != nil {
@@ -586,13 +587,14 @@ func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.Sessio
 		{
 			ID:           "mode",
 			Name:         "Session Mode",
-			Description:  "Chat mode for conversation, Plan mode for goal-driven execution",
+			Description:  "Auto: full access with LLM-judged approval. Manual: full access with per-tool user approval. Plan: read-only planning.",
 			Category:     "mode",
 			Type:         "select",
 			CurrentValue: mode,
 			Options: []openacp.SessionConfigOptValue{
-				{Value: "chat", Name: "Chat", Description: "Conversational agent with tools"},
-				{Value: "plan", Name: "Plan", Description: "Goal decomposition and DAG execution"},
+				{Value: "auto", Name: "Auto", Description: "Full tool access with LLM-judged approval for writes"},
+				{Value: "manual", Name: "Manual", Description: "Full tool access with per-tool user approval"},
+				{Value: "plan", Name: "Plan", Description: "Read-only analysis and planning — no execution tools"},
 			},
 		},
 		{
@@ -632,15 +634,16 @@ func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.Sessio
 
 func (s *AgentServer) buildModeState(sid openacp.SessionId) *openacp.SessionModeState {
 	ss := s.getSession(sid)
-	current := "chat"
+	current := "auto"
 	if ss != nil {
 		current = ss.mode
 	}
 	return &openacp.SessionModeState{
 		CurrentModeID: openacp.SessionModeId(current),
 		AvailableModes: []openacp.SessionMode{
-			{ID: "chat", Name: "Chat", Description: "Conversational agent with tools"},
-			{ID: "plan", Name: "Plan", Description: "Goal decomposition and DAG execution"},
+			{ID: "auto", Name: "Auto", Description: "Full tool access with LLM-judged approval for writes"},
+			{ID: "manual", Name: "Manual", Description: "Full tool access with per-tool user approval"},
+			{ID: "plan", Name: "Plan", Description: "Read-only analysis and planning — no execution tools"},
 		},
 	}
 }
@@ -662,20 +665,34 @@ func (s *AgentServer) availableCommands() []openacp.AvailableCommand {
 	return out
 }
 
-func (s *AgentServer) OnSetSessionMode(ctx context.Context, req openacp.SetSessionModeRequest) (*openacp.SetSessionModeResponse, error) {
-	ss := s.getSession(req.SessionID)
+// setSessionMode transitions the session to a new mode. When entering plan,
+// the current mode is saved as previousMode so exit_plan_mode can restore it.
+// Callers: OnSetSessionMode (ACP RPC), slash /mode, and OnSetSessionConfigOption.
+func (s *AgentServer) setSessionMode(ctx context.Context, sid openacp.SessionId, mode string) error {
+	ss := s.getSession(sid)
 	if ss == nil {
-		return nil, fmt.Errorf("session %s not found", req.SessionID)
+		return fmt.Errorf("session %s not found", sid)
 	}
-	ss.mode = string(req.ModeID)
-	s.saveMode(ctx, string(req.SessionID), ss.mode)
 
-	// Notify the client of the mode change.
+	// Save previous mode when entering plan (unless already in plan).
+	if mode == "plan" && ss.mode != "plan" {
+		ss.previousMode = ss.mode
+	}
+	ss.mode = mode
+	s.saveMode(ctx, string(sid), mode)
+
 	if s.updateSender != nil {
-		s.updateSender.SendSessionUpdate(req.SessionID, openacp.SessionUpdate{
+		s.updateSender.SendSessionUpdate(sid, openacp.SessionUpdate{
 			SessionUpdate: "current_mode_update",
-			CurrentModeID: openacp.SessionModeId(ss.mode),
+			CurrentModeID: openacp.SessionModeId(mode),
 		})
+	}
+	return nil
+}
+
+func (s *AgentServer) OnSetSessionMode(ctx context.Context, req openacp.SetSessionModeRequest) (*openacp.SetSessionModeResponse, error) {
+	if err := s.setSessionMode(ctx, req.SessionID, string(req.ModeID)); err != nil {
+		return nil, err
 	}
 	return &openacp.SetSessionModeResponse{}, nil
 }
@@ -703,14 +720,7 @@ func (s *AgentServer) OnSetSessionConfigOption(ctx context.Context, req openacp.
 	// (most clients use set_config_option rather than set_mode).
 	if req.ConfigID == "mode" {
 		if v, ok := ss.config["mode"].(string); ok {
-			ss.mode = v
-			s.saveMode(ctx, string(req.SessionID), v)
-			if s.updateSender != nil {
-				s.updateSender.SendSessionUpdate(req.SessionID, openacp.SessionUpdate{
-					SessionUpdate: "current_mode_update",
-					CurrentModeID: openacp.SessionModeId(v),
-				})
-			}
+			_ = s.setSessionMode(ctx, req.SessionID, v)
 		}
 	}
 
@@ -800,27 +810,62 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 	agent.Tools = append(agent.Tools, pt)
 
 	// ── Register plan_update tool ──
-	// Always present so the agent can update entry statuses as it works
-	// through an existing plan. References entries by stable id.
-	if len(ss.planEntries) > 0 {
-		pu := plan.NewUpdateTool(func(updates []plan.Update) ([]plan.Entry, error) {
-			// Build id → index lookup.
-			idxByID := make(map[string]int, len(ss.planEntries))
-			for i, e := range ss.planEntries {
-				idxByID[e.ID] = i
+	// Always registered so it can track plan progress. At execution time
+	// the tool reads ss.planEntries to resolve IDs — no stale closures.
+	pu := plan.NewUpdateTool(func(updates []plan.Update) ([]plan.Entry, error) {
+		idxByID := make(map[string]int, len(ss.planEntries))
+		for i, e := range ss.planEntries {
+			idxByID[e.ID] = i
+		}
+		for _, u := range updates {
+			idx, ok := idxByID[u.ID]
+			if !ok {
+				return nil, fmt.Errorf("plan_update: unknown step id %q", u.ID)
 			}
-			for _, u := range updates {
-				idx, ok := idxByID[u.ID]
-				if !ok {
-					return nil, fmt.Errorf("plan_update: unknown step id %q", u.ID)
-				}
-				ss.planEntries[idx].Status = plan.Status(u.Status)
+			ss.planEntries[idx].Status = plan.Status(u.Status)
+		}
+		s.savePlan(ctx, string(req.SessionID), ss.planEntries)
+		sender.SendPlanUpdate(s.entriesToACP(ss.planEntries))
+		return copyPlanEntries(ss.planEntries), nil
+	})
+	agent.Tools = append(agent.Tools, pu)
+
+	// ── Register exit_plan_mode tool (plan mode only) ──
+	// In plan mode the agent has no execution tools. exit_plan_mode
+	// restores the mode that was active before entering plan mode and
+	// unlocks the full tool set. If the session started in plan (no
+	// previous mode), defaults to auto.
+	if ss.mode == "plan" {
+		et := plan.NewExitTool(func() error {
+			target := ss.previousMode
+			if target == "" || target == "plan" {
+				target = "auto"
 			}
-			s.savePlan(ctx, string(req.SessionID), ss.planEntries)
-			sender.SendPlanUpdate(s.entriesToACP(ss.planEntries))
-			return copyPlanEntries(ss.planEntries), nil
+			ss.mode = target
+			s.saveMode(ctx, string(req.SessionID), target)
+
+			// Inject execution tools into the running agent clone
+			// so they are available this same turn.
+			s.injectExecutionTools(agent, req.SessionID, ss)
+
+
+			// Set approver based on target mode.
+			if target == "manual" && s.clientRPC != nil {
+				agent.Approver = &acpApprover{client: s.clientRPC, sessionID: req.SessionID}
+			} else {
+				agent.Approver = nil
+			}
+
+			// Notify client of mode change.
+			if s.updateSender != nil {
+				s.updateSender.SendSessionUpdate(req.SessionID, openacp.SessionUpdate{
+					SessionUpdate: "current_mode_update",
+					CurrentModeID: openacp.SessionModeId(target),
+				})
+			}
+			return nil
 		})
-		agent.Tools = append(agent.Tools, pu)
+		agent.Tools = append(agent.Tools, et)
 	}
 
 	// ── Run the agent ──
@@ -1024,11 +1069,6 @@ func (s *AgentServer) updateTitle(ctx context.Context, sessionID openacp.Session
 func (s *AgentServer) agentForTurn(sid openacp.SessionId) *openagent.Agent {
 	clone := s.Agent.Clone()
 
-	// Inject ACP-based permission bridge for tool calls.
-	if s.clientRPC != nil {
-		clone.Approver = &acpApprover{client: s.clientRPC, sessionID: sid}
-	}
-
 	// Apply session-level config to the clone.
 	if ss := s.getSession(sid); ss != nil {
 		// Resolve model from the registry.
@@ -1048,23 +1088,70 @@ func (s *AgentServer) agentForTurn(sid openacp.SessionId) *openagent.Agent {
 			}
 		}
 
-	// Inject MCP tools from all connected servers.
+		// ── Mode-gated tool injection ──
+		switch ss.mode {
+		case "plan":
+			// Plan mode: read-only tools only. No execution tools, no
+			// approver (no side effects to approve).
+			clone.NoSpawn = true
+			clone.Approver = nil
+
+			// ACP read_file is safe (reads from client filesystem).
+			if s.clientRPC != nil {
+				clone.Tools = append(clone.Tools,
+					opentool.NewACPReadFile(s.clientRPC, sid),
+				)
+			}
+
+			// plan_create, plan_update, exit_plan_mode are injected in
+			// OnPrompt — not here — because they need closures over the
+			// session and sender.
+
+		case "auto":
+			// Auto mode: full tool set, no approval prompts.
+			// Safety is handled by Guard.in/Guard.out (if configured).
+			clone.Approver = nil
+			if s.clientRPC != nil {
+				clone.Tools = append(clone.Tools,
+					opentool.NewACPReadFile(s.clientRPC, sid),
+				)
+			}
+			s.injectExecutionTools(clone, sid, ss)
+
+		case "manual":
+			// Manual mode: full tool set, per-tool user approval via ACP.
+			if s.clientRPC != nil {
+				clone.Approver = &acpApprover{client: s.clientRPC, sessionID: sid}
+				clone.Tools = append(clone.Tools,
+					opentool.NewACPReadFile(s.clientRPC, sid),
+				)
+			}
+			s.injectExecutionTools(clone, sid, ss)
+		}
+	}
+
+	return clone
+}
+
+// injectExecutionTools appends all execution-capable tools to the agent
+// clone. Called in manual mode and after exit_plan_mode transitions.
+// Mirrors the original flat injection — MCP tools, ToolFactory tools,
+// and Agent→Client RPC tools all go through here.
+func (s *AgentServer) injectExecutionTools(clone *openagent.Agent, sid openacp.SessionId, ss *agentSession) {
+	// MCP tools from connected servers.
 	clone.Tools = append(clone.Tools, ss.mcpTools...)
 
-		// Create per-turn tools scoped to the session's cwd.
-	// This ensures tools see the correct working directory
-	// even when the process cwd differs (e.g. Docker mounts).
+	// Per-turn tools scoped to the session cwd.
 	if s.ToolFactory != nil && ss.cwd != "" {
 		if tools := s.ToolFactory(ss.cwd); len(tools) > 0 {
 			clone.Tools = append(clone.Tools, tools...)
 		}
 	}
-	}
 
-	// Inject Agent→Client RPC tools when the client supports them.
+	// Agent→Client RPC tools (write/terminal only — read_client_file is
+	// added by agentForTurn to avoid duplicate registration across modes).
 	if s.clientRPC != nil {
 		clone.Tools = append(clone.Tools,
-			opentool.NewACPReadFile(s.clientRPC, sid),
 			opentool.NewACPWriteFile(s.clientRPC, sid),
 			opentool.NewACPTerminalCreate(s.clientRPC, sid),
 			opentool.NewACPTerminalOutput(s.clientRPC, sid),
@@ -1073,8 +1160,6 @@ func (s *AgentServer) agentForTurn(sid openacp.SessionId) *openagent.Agent {
 			opentool.NewACPTerminalRelease(s.clientRPC, sid),
 		)
 	}
-
-	return clone
 }
 
 // buildDynamicContext assembles per-turn dynamic context from session
@@ -1096,7 +1181,13 @@ func (s *AgentServer) buildDynamicContext(ss *agentSession) string {
 	// ── Mode instruction ──
 	if ss.mode == "plan" {
 		b.WriteString("## Session Mode\n")
-		b.WriteString("You are in plan mode. For complex multi-step tasks, use the plan_create tool to produce a structured execution plan before starting work. After creating the plan, proceed to execute each step. For simple one-step tasks, you do not need to create a plan.\n")
+		b.WriteString("You are in **plan mode**. You have NO execution tools — you cannot modify files, run shell commands, or create terminals. Your only tools are read-only inspection (read_client_file) and planning (plan_create, plan_update, exit_plan_mode).\n\n")
+		b.WriteString("**Workflow:**\n")
+		b.WriteString("1. Read and analyze relevant files to understand the task\n")
+		b.WriteString("2. Call plan_create with concrete, actionable steps\n")
+		b.WriteString("3. Wait for the user to review the plan\n")
+		b.WriteString("4. Call exit_plan_mode to leave plan mode and begin execution\n\n")
+		b.WriteString("Do NOT call exit_plan_mode until you have a complete plan that the user has reviewed.\n")
 	}
 
 	return b.String()
@@ -1111,15 +1202,7 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 		TotalTokens: ss.totalTokens,
 		CreatedAt:   ss.createdAt,
 		SetMode: func(mode string) error {
-			ss.mode = mode
-			s.saveMode(ctx, string(sid), mode)
-			if s.updateSender != nil {
-				s.updateSender.SendSessionUpdate(sid, openacp.SessionUpdate{
-					SessionUpdate: "current_mode_update",
-					CurrentModeID: openacp.SessionModeId(mode),
-				})
-			}
-			return nil
+			return s.setSessionMode(ctx, sid, mode)
 		},
 		Rename: func(title string) error {
 			return s.renameSession(ctx, sid, title)

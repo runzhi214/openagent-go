@@ -46,16 +46,16 @@ func (s *AgentServer) buildCommandRegistry() *slash.Registry {
 			return "Switched to model: " + args + "\n", nil
 		})
 
-	r.Register("mode", "Switch session mode", &slash.InputHint{Hint: "chat|plan"},
+	r.Register("mode", "Switch session mode", &slash.InputHint{Hint: "auto|manual|plan"},
 		func(ctx slash.Context, args string) (string, error) {
 			switch args {
-			case "chat", "plan":
+			case "auto", "manual", "plan":
 				if err := ctx.SetMode(args); err != nil {
 					return "", err
 				}
 				return "Switched to " + args + " mode.\n", nil
 			default:
-				return "Usage: /mode chat|plan (current: " + ctx.Mode + ")\n", nil
+				return "Usage: /mode auto|manual|plan (current: " + ctx.Mode + ")\n", nil
 			}
 		})
 
