@@ -263,7 +263,7 @@ func streamReply(reply channel.ReplyFunc, stream <-chan openagent.StreamEvent) {
 			delete(pendingTool, evt.Message.ToolCallID)
 			delete(toolBuf, evt.Message.ToolCallID)
 
-			if t.name == "plan_update" {
+			if t.name == "plan_update" || t.name == "enter_plan_mode" {
 				continue
 			}
 
