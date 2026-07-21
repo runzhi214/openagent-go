@@ -140,7 +140,8 @@ MCP tools are available to the Feishu bot at startup. Each tool call renders as 
 }
 ```
 
-Logs are written to stderr and the log file (auto-rotated at 10 MB, 5 backups kept). Set `level` to `"debug"` to see every API request in detail.
+All fields are optional. Defaults: `~/.openagent/data/openagent.log`, 10 MB rotation, 5 backups, info level.
+Each `max_size` unit is megabytes. Logs go to both stderr *and* the file. Set `level` to `"debug"` to see every API request.
 
 ## Architecture
 

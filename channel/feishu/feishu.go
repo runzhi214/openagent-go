@@ -16,6 +16,7 @@ import (
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
+	larkapplication "github.com/larksuite/oapi-sdk-go/v3/service/application/v6"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
@@ -53,6 +54,13 @@ func (c *Channel) Start(ctx context.Context, handler channel.MessageHandler) err
 				return nil
 			}
 			handler(ctx, *msg, c.buildReply(ctx, event))
+			return nil
+		}).
+		// Silently accept non-message events to avoid error spam.
+		OnP2ChatAccessEventBotP2pChatEnteredV1(func(ctx context.Context, event *larkim.P2ChatAccessEventBotP2pChatEnteredV1) error {
+			return nil
+		}).
+		OnP2BotMenuV6(func(ctx context.Context, event *larkapplication.P2BotMenuV6) error {
 			return nil
 		})
 
