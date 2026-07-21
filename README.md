@@ -317,9 +317,9 @@ Full example: `examples/plugin/`. Rust SDK: `plugin/sdk/rust/`.
 | `plugin/sdk/rust/` | Rust SDK crate for building WASM plugins |
 | `skill/fs/` | Filesystem skill loader |
 | `mcp/` | Model Context Protocol client |
-| `acp/` | ACP server — Agent→Client RPC tools |
 | `guard/llm/` | LLM-based input/output guard |
 | `hooks/otel/` | OpenTelemetry hooks |
 | `hooks/slog/` | Structured logging hooks |
 | `tool/` | Built-in tools (shell, read, write, ls, grep, ACP fs, ACP terminal) |
+| `channel/` | IM platform adapters — Feishu WebSocket, card rendering |
 | `cmd/cli/` | CLI runtime, WASM host, Rust SDK examples |

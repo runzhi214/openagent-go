@@ -321,4 +321,5 @@ pub extern "C" fn openagent_on_stage(event_json: &str) {
 | `hooks/otel/` | OpenTelemetry 钩子 |
 | `hooks/slog/` | 结构化日志钩子 |
 | `tool/` | 内置工具 (shell, read, write, ls, grep, ACP fs, ACP terminal) |
+| `channel/` | IM 平台适配器 — 飞书 WebSocket、卡片渲染 |
 | `cmd/cli/` | CLI 运行时、WASM 宿主、Rust SDK 示例 |
