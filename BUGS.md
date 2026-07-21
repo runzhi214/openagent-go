@@ -444,31 +444,20 @@ Proposed fix (not yet applied):
 
 ---
 
-### [P2] `plan_create` available in all modes, bypassing plan-mode workflow
+### [P2] ~~`plan_create` available in all modes, bypassing plan-mode workflow~~ ✅ FIXED
 
-[acp/server.go:855-864](acp/server.go#L855), [acp/server.go:866-885](acp/server.go#L866), [plan/tool.go:16-116](plan/tool.go):
+[plan/tool.go:205-260](plan/tool.go), [acp/server.go:740-750](acp/server.go), [acp/server.go:867-919](acp/server.go), [acp/server.go:1263-1285](acp/server.go): **Fixed in this commit** — Added `EnterTool` (`enter_plan_mode`) to `plan/tool.go` as a symmetrical counterpart to `ExitTool` (`exit_plan_mode`). `plan_create` registration moved inside the `if ss.mode == "plan"` block in `OnPrompt`; `enter_plan_mode` registered in the `else` branch (auto/manual modes). `enterPlanMode` helper added to `AgentServer` to persist the mode transition via `setSessionMode`. `buildDynamicContext` updated to hint auto/manual agents about `enter_plan_mode` when no plan exists. The `enter_plan_mode` tool result card is suppressed in the CLI channel UI (same as `plan_update`). Cross-turn approach avoids removing execution tools from the agent clone mid-turn. `enter_plan_mode` inherits the current mode's approver automatically — auto runs without approval, manual triggers user confirmation via `acpApprover`.
 
-`plan_create` is registered unconditionally in `OnPrompt` — available in auto, manual, and plan modes. The agent in auto/manual mode can call `plan_create` to produce a structured plan AND immediately begin executing it within the same turn, bypassing the "enter plan mode → create plan → user review → exit plan mode → execute" workflow that plan mode was designed for.
+Original issue: `plan_create` was registered unconditionally in `OnPrompt` — available in auto, manual, and plan modes. The agent in auto/manual mode could call `plan_create` and immediately begin executing, bypassing the "enter plan mode → create plan → user review → exit plan mode → execute" workflow. The symmetry was also broken: `exit_plan_mode` had no `enter_plan_mode` counterpart.
 
-This conflates planning and execution: the plan is created while execution tools remain active, so the agent can skip user review entirely. The symmetry is also broken — `exit_plan_mode` has no `enter_plan_mode` counterpart, so agents in auto/manual mode cannot proactively switch to plan mode when they detect a complex task.
+Final tool availability:
 
-Current vs intended tool availability:
-
-| Tool | auto (current→target) | manual (current→target) | plan |
-|------|:---:|:---:|:----:|
-| `enter_plan_mode` | ✗→✓ | ✗→✓ | ✗ |
-| `plan_create` | ✓→✗ | ✓→✗ | ✓ |
-| `plan_update` | ✓→✓ | ✓→✓ | ✓ |
-| `exit_plan_mode` | ✗→✗ | ✗→✗ | ✓ |
-
-**Proposed fix:**
-1. Add `enter_plan_mode` tool to `plan/tool.go` (symmetrical to existing `exit_plan_mode`).
-2. Move `plan_create` registration inside the `if ss.mode == "plan"` block in `OnPrompt`.
-3. Register `enter_plan_mode` in the else branch (auto/manual modes).
-4. Update `buildDynamicContext` to hint auto/manual agents about `enter_plan_mode` for complex tasks.
-5. Cross-turn approach: `enter_plan_mode` calls `setSessionMode("plan")` to persist the mode change; the next `OnPrompt` turn picks up plan mode and registers `plan_create` + `exit_plan_mode`. This avoids the complexity of removing execution tools from the agent clone mid-turn.
-
-**Approval behavior:** `enter_plan_mode` inherits the current mode's approver automatically — in auto mode it runs without approval; in manual mode it triggers `acpApprover.requestPermission` for user confirmation. No extra wiring needed.
+| Tool | auto | manual | plan |
+|------|:----:|:------:|:----:|
+| `enter_plan_mode` | ✓ (no approval) | ✓ (needs approval) | ✗ |
+| `plan_create` | ✗ | ✗ | ✓ |
+| `plan_update` | ✓ | ✓ | ✓ |
+| `exit_plan_mode` | ✗ | ✗ | ✓ |
 
 ---
 

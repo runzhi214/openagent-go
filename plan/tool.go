@@ -31,7 +31,7 @@ func (t *CreateTool) Definition() openagent.FunctionDefinition {
 		Name: "plan_create",
 		Description: `Create a structured execution plan for a complex task. Use this when a task involves multiple steps, spans multiple files, or requires careful sequencing.
 
-After creating the plan, proceed to execute each step. Call plan_update to mark each step in_progress when you start working on it and completed when you finish.`,
+After creating the plan and having it reviewed by the user, call exit_plan_mode to return to your previous mode and begin executing each step. Use plan_update to track progress during execution.`,
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -200,6 +200,52 @@ func (t *UpdateTool) Execute(ctx context.Context, args json.RawMessage) (string,
 	}
 
 	return formatPlan("", entries), nil
+}
+
+// ── enter_plan_mode Tool ──
+
+// EnterTool is an openagent.Tool named "enter_plan_mode". The agent calls it
+// to enter plan mode when a task requires structured planning. In plan mode,
+// execution tools are removed and plan_create / exit_plan_mode become available.
+//
+// The onEnter callback is called by Execute to transition the session. It is
+// wired by the ACP server at OnPrompt time.
+type EnterTool struct {
+	onEnter func() error
+}
+
+// NewEnterTool creates an enter_plan_mode tool.
+func NewEnterTool(onEnter func() error) *EnterTool {
+	return &EnterTool{onEnter: onEnter}
+}
+
+// Definition implements openagent.Tool.
+func (t *EnterTool) Definition() openagent.FunctionDefinition {
+	return openagent.FunctionDefinition{
+		Name: "enter_plan_mode",
+		Description: `Enter plan mode to create a structured execution plan. Use this when the task is complex, involves multiple steps, spans multiple files, or requires careful sequencing.
+
+After entering plan mode, you will have access to plan_create, plan_update, and exit_plan_mode. Your execution tools (shell, file writes, terminal) will be temporarily unavailable — they will be restored when you call exit_plan_mode.
+
+Workflow: enter_plan_mode → plan_create → (user reviews plan) → exit_plan_mode → execute`,
+		Parameters: json.RawMessage(`{
+  "type": "object",
+  "properties": {},
+  "required": []
+}`),
+	}
+}
+
+// Execute implements openagent.Tool. It calls the onEnter callback to
+// transition the session mode, then returns confirmation text.
+func (t *EnterTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	if t.onEnter == nil {
+		return "enter_plan_mode: no mode transition callback configured.\n", nil
+	}
+	if err := t.onEnter(); err != nil {
+		return "", fmt.Errorf("enter_plan_mode: %w", err)
+	}
+	return "Entered plan mode. You now have access to plan_create and exit_plan_mode. Execution tools are disabled until you call exit_plan_mode. Create a plan with plan_create, then call exit_plan_mode when ready to execute.\n", nil
 }
 
 // ── exit_plan_mode Tool ──
