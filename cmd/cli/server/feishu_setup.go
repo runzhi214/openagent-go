@@ -37,7 +37,7 @@ func ResolveFeishuCredentials(ctx context.Context) (FeishuCredentials, error) {
 
 // ── Persisted credential file ──
 
-func feishuAppPath() string {
+var feishuAppPath = func() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".openagent", "data", "feishu_app.json")
 }

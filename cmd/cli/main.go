@@ -224,8 +224,11 @@ func buildServeCmd(cfg config.Config) *cobra.Command {
 
 			ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
-		// Resolve Feishu credentials when --channel feishu is set.
-		if channelFlag == "feishu" {
+		// Channels are only enabled when --channel is explicitly set.
+		// settings.json credentials alone do NOT auto-start a channel.
+		if channelFlag != "feishu" {
+			cfg.Channels = config.ChannelsConfig{}
+		} else {
 			creds, err := server.ResolveFeishuCredentials(ctx)
 			if err != nil {
 				cancel()
