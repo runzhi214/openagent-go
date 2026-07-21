@@ -465,16 +465,21 @@ func (s *AgentServer) replayHistory(ctx context.Context, sid openacp.SessionId, 
 			sender.SendHistoryMessage("user_message_chunk", msg.Content, mid)
 
 		case openagent.RoleAssistant:
+			// Replay reasoning content before the message body.
+			if msg.ReasoningContent != "" {
+				sender.SendHistoryMessage("agent_thought_chunk", msg.ReasoningContent, mid)
+			}
 			if msg.Content != "" {
 				sender.SendHistoryMessage("agent_message_chunk", msg.Content, mid)
 			}
 			// Replay tool calls made by this assistant message.
+			// Status "pending" → sessionUpdate "tool_call" variant.
 			for _, tc := range msg.ToolCalls {
 				sender.SendToolCall(openacp.ToolCallUpdate{
 					ToolCallID: tc.ID,
 					Title:      tc.Function.Name,
 					Kind:       "execute",
-					Status:     "in_progress",
+					Status:     "pending",
 					RawInput:   json.RawMessage(tc.Function.Arguments),
 				})
 			}

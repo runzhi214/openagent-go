@@ -51,8 +51,9 @@ type SessionEventSender interface {
 	SendSessionInfo(title string, metadata map[string]any) error
 
 	// SendHistoryMessage replays a historical message during session/load.
-	// sessionUpdate must be "user_message_chunk" or "agent_message_chunk".
-	// messageID identifies the message for chunk grouping.
+	// sessionUpdate must be "user_message_chunk", "agent_message_chunk",
+	// or "agent_thought_chunk". messageID identifies the message for
+	// chunk grouping.
 	SendHistoryMessage(sessionUpdate, text, messageID string) error
 }
 
