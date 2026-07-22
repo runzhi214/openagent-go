@@ -665,6 +665,8 @@ func (r *runner) buildPrompt(ctx context.Context, session Session, working []Mes
 	// Compressed conversation summary — Layer 2 of the memory model.
 	if r.compressed != nil && r.compressed.Summary != "" {
 		dynamicParts = append(dynamicParts, buildCompressedSection(r.compressed))
+	} else {
+		dynamicParts = append(dynamicParts, "## Conversation Summary\n\n(no prior conversation history)")
 	}
 
 	input := PromptInput{
