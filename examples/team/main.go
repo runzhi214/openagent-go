@@ -100,14 +100,38 @@ Do NOT hand off — you are the final gate.`),
 	fmt.Println("=== Team: analyst → designer → coder → tester → reviewer ===")
 	fmt.Printf("User: Write a function that validates email addresses\n\n")
 
-	result, err := team.Run(ctx, session, openagent.UserMessage("Write a function that validates email addresses"))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+	var result *openagent.TeamResult
+	for evt := range team.RunStream(ctx, session, openagent.UserMessage("Write a function that validates email addresses")) {
+		switch evt.Type {
+		case openagent.TeamAgentStart:
+			fmt.Printf("\n── %s ──\n", evt.Agent)
+		case openagent.TeamAgentEnd:
+			// done.
+		case openagent.TeamHandoff:
+			fmt.Printf("\n  → %s: %s\n", evt.Target, truncate(evt.Message, 120))
+		case openagent.TeamTextDelta:
+			fmt.Print(evt.Text)
+		case openagent.TeamToolCall:
+			if evt.ToolCall != nil {
+				fmt.Printf("\n  🔧 %s(%s)\n", evt.ToolCall.Function.Name, truncate(evt.ToolCall.Function.Arguments, 120))
+			}
+		case openagent.TeamToolResult:
+			fmt.Printf("  → %s\n", truncate(evt.Text, 200))
+		case openagent.TeamDone:
+			result = evt.Result
+		case openagent.TeamError:
+			fmt.Fprintf(os.Stderr, "\nERROR: %v\n", evt.Error)
+			os.Exit(1)
+		}
+	}
+	fmt.Println()
+
+	if result == nil {
+		fmt.Fprintln(os.Stderr, "Team returned no result")
 		os.Exit(1)
 	}
 
-	fmt.Printf("Final output: %s\n", result.FinalOutput)
-	fmt.Printf("Handoffs: %d\n", len(result.HandoffChain))
+	fmt.Printf("\nHandoffs: %d\n", len(result.HandoffChain))
 	for i, h := range result.HandoffChain {
 		fmt.Printf("  %d. %s → %s: %s\n", i+1, h.From, h.To, truncate(h.Message, 120))
 	}
