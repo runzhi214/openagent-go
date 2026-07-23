@@ -336,6 +336,9 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 		r.observe(ctx, StageModelCall, "leave", map[string]any{
 			"tokens_prompt":     resp.Usage.PromptTokens,
 			"tokens_completion": resp.Usage.CompletionTokens,
+			"finish_reason":     string(resp.Choices[0].FinishReason),
+			"content_preview":   truncateStr(resp.Choices[0].Message.Content, 200),
+			"tool_calls":        toolCallNames(resp.Choices[0].Message.ToolCalls),
 		}, mcStart, nil)
 		lastResp = resp
 
@@ -1041,6 +1044,17 @@ func (r *runner) appendMemory(ctx context.Context, session Session, msg Message)
 	r.observe(ctx, StageMemoryAppend, "enter", nil, time.Time{}, nil)
 	err := r.agent.Memory.Append(ctx, session.ID, msg)
 	r.observe(ctx, StageMemoryAppend, "leave", nil, maStart, err)
+}
+
+func toolCallNames(calls []ToolCall) []string {
+	if len(calls) == 0 {
+		return nil
+	}
+	names := make([]string, len(calls))
+	for i, tc := range calls {
+		names[i] = tc.Function.Name
+	}
+	return names
 }
 
 func toolDefinitions(tools []Tool) []FunctionDefinition {

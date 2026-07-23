@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -14,7 +15,12 @@ import (
 
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/eventbus"
+	"github.com/yusheng-g/openagent-go/memory/sqlite"
+	"github.com/yusheng-g/openagent-go/model/openai"
+	wasm "github.com/yusheng-g/openagent-go/plugin/agent/wasm"
+	"github.com/yusheng-g/openagent-go/plugin/wasmhost"
 	"github.com/yusheng-g/openagent-go/session"
+	"github.com/yusheng-g/openagent-go/skill/fs"
 )
 
 // ── Handler ──
@@ -36,7 +42,8 @@ type ModelInfo struct {
 
 type Handler struct {
 	defaultModel openagent.Model
-	models       map[string]openagent.Model // modelID → model instance
+	models       map[string]openagent.Model // "provider/modelID" → model instance
+	modelConfigs map[string]ModelConfig     // "provider/modelID" → original apiKey/baseURL, for SetModel fallback
 	modelList    []ModelInfo                // ordered list for /models endpoint
 	modelsMu     sync.RWMutex
 
@@ -44,6 +51,7 @@ type Handler struct {
 	systemPrompts []string
 	name          string
 	maxTurns      int
+	pluginMgr     *wasm.Manager // nil = plugins disabled, set by WithPluginManager
 
 	// Optional capabilities from the template Agent.
 	hooks       openagent.RunHooks
@@ -64,6 +72,7 @@ func NewHandler(agent *openagent.Agent) *Handler {
 	h := &Handler{
 		defaultModel:    agent.Model,
 		models:          make(map[string]openagent.Model),
+		modelConfigs:    make(map[string]ModelConfig),
 		modelList:       nil,
 		tools:           agent.Tools,
 		systemPrompts:   agent.SystemPrompts,
@@ -98,12 +107,45 @@ func (h *Handler) fillDetail(e *sessionState, detail *SessionDetail) {
 // RegisterModel adds a model to the handler's registry.
 // id is the string the frontend sends as modelID (e.g. "deepseek-v3").
 // provider identifies which API serves this model (e.g. "deepseek", "openai").
-// The internal key is "provider:id" so different providers can serve the same model name.
-func (h *Handler) RegisterModel(id string, model openagent.Model, provider string) {
+// apiKey and baseURL are stored as the original config, used by SetModel
+// (via runtime_set_model_config) to preserve values when only model_id changes.
+// The internal key is "provider/id" so different providers can serve the same model name.
+func (h *Handler) RegisterModel(id string, model openagent.Model, provider, apiKey, baseURL string) {
 	h.modelsMu.Lock()
 	defer h.modelsMu.Unlock()
-	h.models[provider+":"+id] = model
+	key := provider + "/" + id
+	h.models[key] = model
+	h.modelConfigs[key] = ModelConfig{Provider: provider, ModelID: id, APIKey: apiKey, BaseURL: baseURL}
 	h.modelList = append(h.modelList, ModelInfo{ID: id, Provider: provider})
+}
+
+// SetModel replaces a model in the registry. apiKey and baseURL override the
+// originals only when non-empty. Used by runtime_set_model_config host export.
+func (h *Handler) SetModel(provider, modelID, apiKey, baseURL string) {
+	h.modelsMu.Lock()
+	defer h.modelsMu.Unlock()
+	key := provider + "/" + modelID
+	old, ok := h.modelConfigs[key]
+	if !ok {
+		return
+	}
+	if apiKey == "" {
+		apiKey = old.APIKey
+	}
+	if baseURL == "" {
+		baseURL = old.BaseURL
+	}
+	h.models[key] = openai.New(apiKey, modelID, baseURL)
+	h.modelConfigs[key] = ModelConfig{Provider: provider, ModelID: modelID, APIKey: apiKey, BaseURL: baseURL}
+}
+
+// ModelConfig stores the original apiKey/baseURL for a registered model,
+// used by SetModel to preserve values when only model_id changes.
+type ModelConfig struct {
+	Provider string
+	ModelID  string
+	APIKey   string
+	BaseURL  string
 }
 
 // lookupModel finds a registered model. When provider is non-empty, it uses
@@ -114,17 +156,33 @@ func (h *Handler) lookupModel(provider, modelID string) openagent.Model {
 	h.modelsMu.RLock()
 	defer h.modelsMu.RUnlock()
 	if provider != "" {
-		return h.models[provider+":"+modelID]
+		return h.models[provider+"/"+modelID]
 	}
 	for key, m := range h.models {
 		if key == "default" {
 			continue
 		}
-		if strings.HasSuffix(key, ":"+modelID) {
+		if strings.HasSuffix(key, "/"+modelID) {
 			return m
 		}
 	}
 	return nil
+}
+
+// WithPluginManager attaches a WASM plugin manager for session lifecycle
+// hooks (agent:sessions) and runtime APIs (agent:observers).
+// Must be called before any session is created.
+func (h *Handler) WithPluginManager(mgr *wasm.Manager) *Handler {
+	h.pluginMgr = mgr
+	h.sm.hooks.onDelete = func(e *sessionState) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		mgr.OnSessionDestroy(ctx, wasm.SessionCtx{SessionID: e.info.ID})
+		if e.ownedCloser != nil {
+			e.ownedCloser.Close()
+		}
+	}
+	return h
 }
 
 // Register adds the handler's routes to mux using Go 1.22+ patterns.
@@ -177,6 +235,10 @@ func (h *Handler) WithApproverEnabled(v bool) *Handler {
 type sessionState struct {
 	info  session.SessionInfo // ModelID is the session's model preference; empty → handler default
 	agent *openagent.Agent
+
+	// ownedCloser is a per-session resource (e.g. memory db created by
+	// an agent:sessions plugin) that is closed on session deletion.
+	ownedCloser io.Closer
 
 	mu              sync.Mutex
 	running         bool // true while agent goroutine is active
@@ -309,6 +371,13 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 			CreatedAt: s.info.CreatedAt,
 		}
 
+		// Inject AgentRuntime into context so runtime_* host exports work
+		// in agent:observers / agent:tools plugins during this run.
+		if h.pluginMgr != nil {
+			rt := wasm.BuildAgentRuntime(s.agent, &oaSession, h.SetModel)
+			ctx = wasmhost.WithAgentRuntime(ctx, rt)
+		}
+
 		ch := s.agent.RunStream(ctx, oaSession, openagent.UserMessage(body.Message))
 		for evt := range ch {
 			se := streamToSSE(evt)
@@ -395,6 +464,36 @@ func (h *Handler) newEntry(info session.SessionInfo) *sessionState {
 		openagent.WithTools(h.tools...),
 		openagent.WithSystemPrompts(h.systemPrompts...),
 		openagent.WithMaxTurns(h.maxTurns),
+	}
+
+	// agent:sessions plugins — let them override agent config before NewAgent.
+	if h.pluginMgr != nil {
+		cfg := h.pluginMgr.OnSessionInit(context.Background(), wasm.SessionCtx{
+			SessionID: info.ID,
+		})
+		if cfg != nil {
+			if len(cfg.SystemPrompts) > 0 {
+				opts = append(opts, openagent.WithSystemPrompts(cfg.SystemPrompts...))
+			}
+			if cfg.Description != "" {
+				opts = append(opts, openagent.WithDescription(cfg.Description))
+			}
+			if cfg.MaxTurns > 0 {
+				opts = append(opts, openagent.WithMaxTurns(cfg.MaxTurns))
+			}
+			if cfg.SkillDir != "" {
+				if sl := fs.New(cfg.SkillDir); sl != nil {
+					opts = append(opts, openagent.WithSkillLoader(sl))
+				}
+			}
+			if cfg.MemoryPath != "" {
+				mem, err := sqlite.New(cfg.MemoryPath)
+				if err == nil {
+					opts = append(opts, openagent.WithMemory(mem))
+					s.ownedCloser = mem
+				}
+			}
+		}
 	}
 	if h.approverEnabled {
 		opts = append(opts, openagent.WithApprover(&restApprover{

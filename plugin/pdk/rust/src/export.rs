@@ -75,6 +75,17 @@ pub trait Plugin: Sized {
         StageOutput { action: alloc::string::String::from("continue"), reason: alloc::string::String::new() }
     }
 
+    // ── agent:sessions ──
+
+    /// Called on session creation. Return Some(SessionConfig) to override
+    /// Agent opts for this session, or None to leave defaults.
+    fn on_session_init(_ctx: &SessionCtx) -> Result<Option<SessionConfig>, String> {
+        Ok(None)
+    }
+
+    /// Called on session deletion. Fire-and-forget — return value is ignored.
+    fn on_session_destroy(_ctx: &SessionCtx) {}
+
     // ── Internal: assemble metadata JSON ──
 
     fn build_metadata() -> PluginMeta {
@@ -88,86 +99,51 @@ pub trait Plugin: Sized {
 
 // ── export! macro ──
 
-/// Generate all `extern "C"` entry-points for a plugin type.
-///
-/// Place this at crate root:
-/// ```
-/// struct MyPlugin;
-/// impl export::Plugin for MyPlugin { ... }
-/// openagent_pdk::export!(MyPlugin);
-/// ```
 #[macro_export]
 macro_rules! export {
     ($t:ty) => {
-        // ── alloc ──
         #[no_mangle]
-        pub extern "C" fn alloc(size: u32) -> u32 {
-            $crate::sdk_alloc(size)
-        }
+        pub extern "C" fn alloc(size: u32) -> u32 { $crate::sdk_alloc(size) }
 
-        // ── metadata ──
         #[no_mangle]
         pub extern "C" fn metadata() -> u64 {
             let meta = <$t as $crate::export::Plugin>::build_metadata();
-            // Build JSON by hand to avoid pulling serde_json into every build.
-            // PluginMeta has a custom Serialize that outputs the right fields.
             $crate::sdk_return_json(&meta)
         }
 
-        // ── cli:settings: init ──
+        // ── cli:settings ──
         #[no_mangle]
         pub extern "C" fn init(ptr: u32, len: u32) -> u64 {
             let input = unsafe { $crate::wasm_str(ptr, len) };
             match <$t as $crate::export::Plugin>::init(input) {
                 Ok(s) => $crate::sdk_return(s.as_bytes()),
-                Err(e) => {
-                    $crate::host::log_error(&e);
-                    // Return original settings unchanged on error.
-                    $crate::sdk_return(input.as_bytes())
-                }
+                Err(e) => { $crate::host::log_error(&e); $crate::sdk_return(input.as_bytes()) }
             }
         }
 
-        // ── cli:commands: commands ──
+        // ── cli:commands ──
         #[no_mangle]
         pub extern "C" fn commands() -> u64 {
             let cmds = <$t as $crate::export::Plugin>::commands();
             $crate::sdk_return_json(&cmds)
         }
 
-        // ── cli:commands: run_<name> — macro can't generate dynamic exports
-        // so author must manually write #[no_mangle] pub extern "C" fn run_<name>.
-        // See run_command! helper below.
-
         // ── cli:observers ──
-        #[no_mangle]
-        pub extern "C" fn on_startup() {
-            <$t as $crate::export::Plugin>::on_startup();
-        }
-
-        #[no_mangle]
-        pub extern "C" fn on_shutdown() {
-            <$t as $crate::export::Plugin>::on_shutdown();
-        }
-
-        #[no_mangle]
-        pub extern "C" fn on_command_start(ptr: u32, len: u32) {
+        #[no_mangle] pub extern "C" fn on_startup() { <$t as $crate::export::Plugin>::on_startup(); }
+        #[no_mangle] pub extern "C" fn on_shutdown() { <$t as $crate::export::Plugin>::on_shutdown(); }
+        #[no_mangle] pub extern "C" fn on_command_start(ptr: u32, len: u32) {
             let cmd = unsafe { $crate::wasm_str(ptr, len) };
             <$t as $crate::export::Plugin>::on_command_start(cmd);
         }
-
-        #[no_mangle]
-        pub extern "C" fn on_command_end(ptr: u32, len: u32) {
+        #[no_mangle] pub extern "C" fn on_command_end(ptr: u32, len: u32) {
             let payload = unsafe { $crate::wasm_str(ptr, len) };
             <$t as $crate::export::Plugin>::on_command_end(payload);
         }
 
-        // ── agent:tools: execute ──
+        // ── agent:tools ──
         #[no_mangle]
         pub extern "C" fn execute(ptr: u32, len: u32) -> u64 {
-            let input: $crate::types::ToolInput = $crate::read_input_json(
-                $crate::pk(ptr, len)
-            );
+            let input: $crate::types::ToolInput = $crate::read_input_json($crate::pk(ptr, len));
             let result = <$t as $crate::export::Plugin>::execute(&input.args);
             let out = match result {
                 Ok(r) => $crate::types::ToolOutput { result: r, error: alloc::string::String::new() },
@@ -176,35 +152,39 @@ macro_rules! export {
             $crate::sdk_return_json(&out)
         }
 
-        // ── agent:observers: run ──
+        // ── agent:observers ──
         #[no_mangle]
         pub extern "C" fn run(ptr: u32, len: u32) -> u64 {
-            let input: $crate::types::StageInput = $crate::read_input_json(
-                $crate::pk(ptr, len)
-            );
+            let input: $crate::types::StageInput = $crate::read_input_json($crate::pk(ptr, len));
             let out = <$t as $crate::export::Plugin>::observe_stage(&input);
             $crate::sdk_return_json(&out)
+        }
+
+        // ── agent:sessions ──
+        #[no_mangle]
+        pub extern "C" fn session_init(ptr: u32, len: u32) -> u64 {
+            let ctx: $crate::types::SessionCtx = $crate::read_input_json($crate::pk(ptr, len));
+            match <$t as $crate::export::Plugin>::on_session_init(&ctx) {
+                Ok(Some(cfg)) => $crate::sdk_return_json(&cfg),
+                Ok(None) => $crate::sdk_return(b"null"),
+                Err(e) => $crate::sdk_return_json(&$crate::types::HostResult { error: e }),
+            }
+        }
+
+        #[no_mangle]
+        pub extern "C" fn session_destroy(ptr: u32, len: u32) {
+            let ctx: $crate::types::SessionCtx = $crate::read_input_json($crate::pk(ptr, len));
+            <$t as $crate::export::Plugin>::on_session_destroy(&ctx);
         }
     };
 }
 
 /// Helper for cli:commands plugins: generates a single run_<name> export.
-///
-/// Usage:
-/// ```
-/// run_command!(stats, MyPlugin);
-/// ```
-/// Expands to:
-/// ```
-/// #[no_mangle] pub extern "C" fn run_stats(ptr: u32, len: u32) -> u64 { ... }
-/// ```
 #[macro_export]
 macro_rules! run_command {
     ($name:ident, $t:ty) => {
         #[no_mangle]
         pub extern "C" fn $name(ptr: u32, len: u32) -> u64 {
-            // concat_idents is unstable, so we use a fixed pattern:
-            // the command name is the function name with "run_" prefix stripped.
             let cmd_name = stringify!($name);
             let args = unsafe { $crate::wasm_str(ptr, len) };
             match <$t as $crate::export::Plugin>::run_command(cmd_name, args) {

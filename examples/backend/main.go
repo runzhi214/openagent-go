@@ -108,7 +108,7 @@ func main() {
 			{"deepseek-v4-pro", "deepseek"},
 		}
 		for _, o := range opts {
-			handler.RegisterModel(o.id, openai.New(apiKey, o.id, baseURL).WithContextWindow(128_000), o.label)
+			handler.RegisterModel(o.id, openai.New(apiKey, o.id, baseURL).WithContextWindow(128_000), o.label, apiKey, baseURL)
 		}
 	}
 

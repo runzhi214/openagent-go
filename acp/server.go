@@ -17,6 +17,9 @@ import (
 	openacp "github.com/yusheng-g/openagent-go/acp/sdk"
 	"github.com/yusheng-g/openagent-go/mcp"
 	"github.com/yusheng-g/openagent-go/plan"
+	"github.com/yusheng-g/openagent-go/model/openai"
+	wasm "github.com/yusheng-g/openagent-go/plugin/agent/wasm"
+	"github.com/yusheng-g/openagent-go/plugin/wasmhost"
 	"github.com/yusheng-g/openagent-go/session"
 	"github.com/yusheng-g/openagent-go/slash"
 	opentool "github.com/yusheng-g/openagent-go/tool"
@@ -61,6 +64,20 @@ type AgentServer struct {
 	// connected on session create/load/resume. Default true (enabled in
 	// NewAgentServer); set false to disable MCP tool integration.
 	MCPEnabled bool
+
+	// Plugin manager and model config backup for runtime_set_model_config.
+	PluginMgr    *wasm.Manager
+	modelConfigs map[string]ModelConfig // "provider/modelID" → original config
+	modelsMu     sync.Mutex
+}
+
+// ModelConfig stores the original apiKey/baseURL for a registered model,
+// so SetModel can preserve values when only model_id changes.
+type ModelConfig struct {
+	Provider string
+	ModelID  string
+	APIKey   string
+	BaseURL  string
 }
 
 // agentSession holds per-session runtime state.
@@ -121,6 +138,7 @@ func NewAgentServer(agent *openagent.Agent, mem openagent.Memory, store session.
 		Mem:          mem,
 		SessionStore: store,
 		Models:       models,
+		modelConfigs: make(map[string]ModelConfig),
 		sessions:     make(map[openacp.SessionId]*agentSession),
 		MCPEnabled:   true,
 	}
@@ -146,6 +164,32 @@ func (s *AgentServer) SetClientRequester(r openacp.ClientRequester) {
 
 var _ openacp.ClientRPCUser = (*AgentServer)(nil)
 var _ openacp.AgentHandler = (*AgentServer)(nil)
+
+// SetModel replaces a registered model. Used by runtime_set_model_config.
+func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string) {
+	s.modelsMu.Lock()
+	defer s.modelsMu.Unlock()
+	key := provider + "/" + modelID
+	old, ok := s.modelConfigs[key]
+	if !ok {
+		return
+	}
+	if apiKey == "" {
+		apiKey = old.APIKey
+	}
+	if baseURL == "" {
+		baseURL = old.BaseURL
+	}
+	s.Models[key] = openai.New(apiKey, modelID, baseURL)
+	s.modelConfigs[key] = ModelConfig{Provider: provider, ModelID: modelID, APIKey: apiKey, BaseURL: baseURL}
+}
+
+// RegisterModel stores a model's original config for SetModel fallback.
+func (s *AgentServer) RegisterModel(key, provider, modelID, apiKey, baseURL string) {
+	s.modelsMu.Lock()
+	defer s.modelsMu.Unlock()
+	s.modelConfigs[key] = ModelConfig{Provider: provider, ModelID: modelID, APIKey: apiKey, BaseURL: baseURL}
+}
 
 // ── Client capability helpers ──
 //
@@ -410,6 +454,9 @@ func (s *AgentServer) OnNewSession(ctx context.Context, req openacp.NewSessionRe
 	}
 	s.putSession(id, ss)
 	s.saveMeta(string(id), req.Cwd, "acp", req.Meta)
+	if s.PluginMgr != nil {
+		s.PluginMgr.OnSessionInit(ctx, wasm.SessionCtx{SessionID: string(id)})
+	}
 
 	// Send available commands so the client can show them immediately.
 	if s.updateSender != nil {
@@ -603,6 +650,9 @@ func (s *AgentServer) OnCloseSession(ctx context.Context, req openacp.CloseSessi
 }
 
 func (s *AgentServer) OnDeleteSession(ctx context.Context, req openacp.DeleteSessionRequest) (*openacp.DeleteSessionResponse, error) {
+	if s.PluginMgr != nil {
+		s.PluginMgr.OnSessionDestroy(ctx, wasm.SessionCtx{SessionID: string(req.SessionID)})
+	}
 	ss := s.getSession(req.SessionID)
 	if ss != nil {
 		s.disconnectMCP(ss.mcpSessions)
@@ -908,6 +958,12 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 			"mcpServers":            ss.mcpServers,
 		},
 		DynamicContext: s.buildDynamicContext(ss),
+	}
+
+	// Inject AgentRuntime for runtime_* host exports.
+	if s.PluginMgr != nil {
+		rt := wasm.BuildAgentRuntime(agent, &oaSession, s.SetModel)
+		ctx = wasmhost.WithAgentRuntime(ctx, rt)
 	}
 
 	// ── Register mode-specific planning tools ──

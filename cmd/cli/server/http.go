@@ -15,6 +15,9 @@ import (
 	"github.com/yusheng-g/openagent-go/summarizer"
 	opentool "github.com/yusheng-g/openagent-go/tool"
 
+	wasm "github.com/yusheng-g/openagent-go/plugin/agent/wasm"
+	"github.com/yusheng-g/openagent-go/plugin/wasmhost"
+
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
 )
 
@@ -75,7 +78,16 @@ func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 		WithApproverEnabled(caps.OnApprover())
 	handler.StartJanitor(ctx, 1*time.Hour, 24*time.Hour)
 	for _, mi := range modelInfos {
-		handler.RegisterModel(mi.ID, mi.Model, mi.Provider)
+		handler.RegisterModel(mi.ID, mi.Model, mi.Provider, mi.APIKey, mi.BaseURL)
+	}
+
+	// Plugin manager — loads agent:tools, agent:observers, agent:sessions.
+	pluginDir := filepath.Join(profilesDir, "plugins")
+	mgr := wasm.NewManager(pluginDir).WithHostAPI(&wasmhost.HostAPI{Logger: &logAdapter{}})
+	if err := mgr.Discover(ctx); err != nil {
+		log.Printf("WARNING: plugin discover: %v", err)
+	} else {
+		handler.WithPluginManager(mgr)
 	}
 
 	// Start IM channels in the background.
@@ -133,3 +145,10 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// logAdapter implements wasmhost.Logger by forwarding to the standard log package.
+type logAdapter struct{}
+
+func (l *logAdapter) Info(msg string)  { log.Printf("[plugin:info] %s", msg) }
+func (l *logAdapter) Warn(msg string)  { log.Printf("[plugin:warn] %s", msg) }
+func (l *logAdapter) Error(msg string) { log.Printf("[plugin:error] %s", msg) }

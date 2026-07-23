@@ -5,12 +5,16 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"path/filepath"
 
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/acp"
 	openacpsdk "github.com/yusheng-g/openagent-go/acp/sdk"
 	"github.com/yusheng-g/openagent-go/sandbox/native"
 	"github.com/yusheng-g/openagent-go/summarizer"
+
+	wasm "github.com/yusheng-g/openagent-go/plugin/agent/wasm"
+	"github.com/yusheng-g/openagent-go/plugin/wasmhost"
 
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
 )
@@ -78,6 +82,25 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	}
 	srv := acp.NewAgentServer(agent, serverMem, sessionStore, modelMap)
 	srv.MCPEnabled = caps.OnMCP()
+
+	// Register model configs for runtime_set_model_config.
+	for _, mi := range modelInfos {
+		key := mi.ID
+		if mi.Provider != "" {
+			key = mi.Provider + "/" + mi.ID
+		}
+		srv.RegisterModel(key, mi.Provider, mi.ID, mi.APIKey, mi.BaseURL)
+	}
+
+	// Plugin manager — loads agent:tools, agent:observers, agent:sessions.
+	pluginDir := filepath.Join(profilesDir, "plugins")
+	mgr := wasm.NewManager(pluginDir).WithHostAPI(&wasmhost.HostAPI{Logger: &logAdapter{}})
+	if err := mgr.Discover(ctx); err != nil {
+		log.Printf("WARNING: plugin discover: %v", err)
+	} else {
+		srv.PluginMgr = mgr
+	}
+
 	policy := sandboxPolicy(cfg.Sandbox)
 	if caps.OnTools() {
 		srv.ToolFactory = func(cwd string) []openagent.Tool {

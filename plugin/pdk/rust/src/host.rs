@@ -25,6 +25,16 @@ mod ffi {
         pub fn log_warn(msg_p: u32, msg_l: u32);
         pub fn log_error(msg_p: u32, msg_l: u32);
         pub fn utc_now() -> u64;
+
+        pub fn runtime_session_id() -> u64;
+        pub fn runtime_user_id() -> u64;
+        pub fn runtime_turn_count() -> u64;
+        pub fn runtime_model_id() -> u64;
+        pub fn runtime_get_metadata(key_p: u32, key_l: u32) -> u64;
+        pub fn runtime_set_metadata(key_p: u32, key_l: u32, val_p: u32, val_l: u32) -> u64;
+        pub fn runtime_set_model_config(val_p: u32, val_l: u32) -> u64;
+        pub fn runtime_set_system_prompts(val_p: u32, val_l: u32) -> u64;
+        pub fn runtime_set_max_turns(val_p: u32, val_l: u32) -> u64;
     }
 }
 
@@ -121,6 +131,55 @@ pub fn log_error(msg: &str) {
 
 pub fn utc_now() -> u64 {
     unsafe { ffi::utc_now() }
+}
+
+// ── Runtime (agent:observers, agent:tools) ──
+
+macro_rules! runtime_get_fn {
+    ($name:ident, $ffi:ident) => {
+        pub fn $name() -> Result<String, String> {
+            let packed = unsafe { ffi::$ffi() };
+            let r: KeyringResult = serde_json::from_slice(wasm_str_packed(packed)).unwrap_or_default();
+            if !r.error.is_empty() { Err(r.error) } else { Ok(r.value) }
+        }
+    };
+}
+
+runtime_get_fn!(runtime_session_id, runtime_session_id);
+runtime_get_fn!(runtime_user_id, runtime_user_id);
+runtime_get_fn!(runtime_turn_count, runtime_turn_count);
+runtime_get_fn!(runtime_model_id, runtime_model_id);
+
+pub fn runtime_get_metadata(key: &str) -> Result<String, String> {
+    let packed = unsafe { ffi::runtime_get_metadata(key.as_ptr() as u32, key.len() as u32) };
+    let r: KeyringResult = serde_json::from_slice(wasm_str_packed(packed)).unwrap_or_default();
+    if !r.error.is_empty() { Err(r.error) } else { Ok(r.value) }
+}
+
+
+pub fn runtime_set_metadata(key: &str, val: &str) -> Result<(), String> {
+    let packed = unsafe { ffi::runtime_set_metadata(key.as_ptr() as u32, key.len() as u32, val.as_ptr() as u32, val.len() as u32) };
+    let r: HostResult = serde_json::from_slice(wasm_str_packed(packed)).unwrap_or_default();
+    if !r.error.is_empty() { Err(r.error) } else { Ok(()) }
+}
+
+pub fn runtime_set_model_config(json: &str) -> Result<(), String> {
+    let packed = unsafe { ffi::runtime_set_model_config(json.as_ptr() as u32, json.len() as u32) };
+    let r: HostResult = serde_json::from_slice(wasm_str_packed(packed)).unwrap_or_default();
+    if !r.error.is_empty() { Err(r.error) } else { Ok(()) }
+}
+
+pub fn runtime_set_system_prompts(json: &str) -> Result<(), String> {
+    let packed = unsafe { ffi::runtime_set_system_prompts(json.as_ptr() as u32, json.len() as u32) };
+    let r: HostResult = serde_json::from_slice(wasm_str_packed(packed)).unwrap_or_default();
+    if !r.error.is_empty() { Err(r.error) } else { Ok(()) }
+}
+
+pub fn runtime_set_max_turns(n: u32) -> Result<(), String> {
+    let s = alloc::format!("{}", n);
+    let packed = unsafe { ffi::runtime_set_max_turns(s.as_ptr() as u32, s.len() as u32) };
+    let r: HostResult = serde_json::from_slice(wasm_str_packed(packed)).unwrap_or_default();
+    if !r.error.is_empty() { Err(r.error) } else { Ok(()) }
 }
 
 // ── Internal ──

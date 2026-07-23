@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/tetratelabs/wazero"
@@ -210,6 +211,128 @@ func (h *HostAPI) RegisterHostModule(ctx context.Context, rt wazero.Runtime) err
 		}).
 		Export("utc_now").
 
+		// ── runtime_* → {"value":"...","error":""} ──
+		NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, mod api.Module) uint64 {
+			return h.runtimeGet(ctx, mod, RuntimeKeySessionID)
+		}).
+		Export("runtime_session_id").
+
+		NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, mod api.Module) uint64 {
+			return h.runtimeGet(ctx, mod, RuntimeKeyUserID)
+		}).
+		Export("runtime_user_id").
+
+		NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, mod api.Module) uint64 {
+			return h.runtimeGet(ctx, mod, RuntimeKeyTurnCount)
+		}).
+		Export("runtime_turn_count").
+
+		NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, mod api.Module) uint64 {
+			return h.runtimeGet(ctx, mod, RuntimeKeyModelID)
+		}).
+		Export("runtime_model_id").
+
+		NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, mod api.Module, keyPtr, keyLen uint32) uint64 {
+			key := read(mod, keyPtr, keyLen)
+			return h.runtimeGet(ctx, mod, RuntimeKeyMetadataPrefix+key)
+		}).
+		Export("runtime_get_metadata").
+
+		// ── runtime_set_* → {"error":""} ──
+		NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, mod api.Module, keyPtr, keyLen, valPtr, valLen uint32) uint64 {
+			key := read(mod, keyPtr, keyLen)
+			val := read(mod, valPtr, valLen)
+			return h.runtimeSet(ctx, mod, RuntimeKeyMetadataPrefix+key, val)
+		}).
+		Export("runtime_set_metadata").
+
+		NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, mod api.Module, valPtr, valLen uint32) uint64 {
+			return h.runtimeSetModelConfig(ctx, mod, read(mod, valPtr, valLen))
+		}).
+		Export("runtime_set_model_config").
+
+		NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, mod api.Module, valPtr, valLen uint32) uint64 {
+			return h.runtimeSet(ctx, mod, "system_prompts", read(mod, valPtr, valLen))
+		}).
+		Export("runtime_set_system_prompts").
+
+		NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, mod api.Module, valPtr, valLen uint32) uint64 {
+			return h.runtimeSet(ctx, mod, "max_turns", read(mod, valPtr, valLen))
+		}).
+		Export("runtime_set_max_turns").
+
 		Instantiate(ctx)
 	return err
+}
+
+// runtimeGet reads a value from the runtime. Returns {"value":"...","error":""}.
+func (h *HostAPI) runtimeGet(ctx context.Context, mod api.Module, key string) uint64 {
+	rt := AgentRuntimeFromContext(ctx)
+	if rt == nil {
+		b, _ := json.Marshal(map[string]string{"error": "runtime not available"})
+		return WriteString(ctx, mod, b)
+	}
+	v, ok := rt.Get(key)
+	if !ok {
+		b, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("key %q not found", key)})
+		return WriteString(ctx, mod, b)
+	}
+	b, _ := json.Marshal(map[string]string{"value": v})
+	return WriteString(ctx, mod, b)
+}
+
+// runtimeSet writes a value to the runtime. Returns {"error":""}.
+func (h *HostAPI) runtimeSet(ctx context.Context, mod api.Module, key, value string) uint64 {
+	rt := AgentRuntimeFromContext(ctx)
+	if rt == nil {
+		b, _ := json.Marshal(map[string]string{"error": "runtime not available"})
+		return WriteString(ctx, mod, b)
+	}
+	if err := rt.Set(key, value); err != nil {
+		b, _ := json.Marshal(map[string]string{"error": err.Error()})
+		return WriteString(ctx, mod, b)
+	}
+	b, _ := json.Marshal(map[string]string{})
+	return WriteString(ctx, mod, b)
+}
+
+// runtimeSetModelConfig parses a JSON model_config and calls rt.SetModel.
+// Input: {"provider":"deepseek","model_id":"v4","api_key":"sk-...","base_url":"https://..."}
+// api_key and base_url are optional — empty values leave the existing ones unchanged.
+func (h *HostAPI) runtimeSetModelConfig(ctx context.Context, mod api.Module, raw string) uint64 {
+	rt := AgentRuntimeFromContext(ctx)
+	if rt == nil {
+		b, _ := json.Marshal(map[string]string{"error": "runtime not available"})
+		return WriteString(ctx, mod, b)
+	}
+	if rt.SetModel == nil {
+		b, _ := json.Marshal(map[string]string{"error": "SetModel not configured"})
+		return WriteString(ctx, mod, b)
+	}
+	var mc struct {
+		Provider string `json:"provider"`
+		ModelID  string `json:"model_id"`
+		APIKey   string `json:"api_key"`
+		BaseURL  string `json:"base_url"`
+	}
+	if err := json.Unmarshal([]byte(raw), &mc); err != nil {
+		b, _ := json.Marshal(map[string]string{"error": err.Error()})
+		return WriteString(ctx, mod, b)
+	}
+	if mc.Provider == "" || mc.ModelID == "" {
+		b, _ := json.Marshal(map[string]string{"error": "provider and model_id are required"})
+		return WriteString(ctx, mod, b)
+	}
+	rt.SetModel(mc.Provider, mc.ModelID, mc.APIKey, mc.BaseURL)
+	b, _ := json.Marshal(map[string]string{})
+	return WriteString(ctx, mod, b)
 }

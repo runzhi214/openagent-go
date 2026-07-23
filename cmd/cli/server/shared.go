@@ -53,7 +53,7 @@ func buildModels(providers map[string]config.ProviderConfig) ([]openagent.Model,
 			}
 			m := openai.New(apiKey, mid, p.BaseURL)
 			models = append(models, m)
-			infos = append(infos, modelReg{ID: mid, Provider: pid, Model: m})
+			infos = append(infos, modelReg{ID: mid, Provider: pid, Model: m, APIKey: apiKey, BaseURL: p.BaseURL})
 		}
 	}
 	return models, infos
@@ -63,6 +63,8 @@ type modelReg struct {
 	ID       string
 	Provider string
 	Model    openagent.Model
+	APIKey   string
+	BaseURL  string
 }
 
 func firstModel(models []openagent.Model) openagent.Model {

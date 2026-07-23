@@ -61,9 +61,9 @@ func newSessionManager[E sessionEntry](
 
 func (sm *sessionManager[E]) SetStore(s session.Store)      { sm.store = s }
 func (sm *sessionManager[E]) SetCleanupDir(fn func(string)) { sm.hooks.cleanupDir = fn }
-func (sm *sessionManager[E]) Bus() *eventbus.Bus[SSEEvent]   { return sm.bus }
-func (sm *sessionManager[E]) Memory() openagent.Memory       { return sm.memory }
-func (sm *sessionManager[E]) Store() session.Store            { return sm.store }
+func (sm *sessionManager[E]) Bus() *eventbus.Bus[SSEEvent]  { return sm.bus }
+func (sm *sessionManager[E]) Memory() openagent.Memory      { return sm.memory }
+func (sm *sessionManager[E]) Store() session.Store          { return sm.store }
 
 func (sm *sessionManager[E]) Exists(id string) bool {
 	sm.mu.RLock()
@@ -363,6 +363,9 @@ func (sm *sessionManager[E]) evictIdle(maxIdle time.Duration) {
 					log.Printf("rest: failed to persist session %s before eviction: %v", id, err)
 				}
 			}(info)
+		}
+		if sm.hooks.onDelete != nil {
+			sm.hooks.onDelete(e)
 		}
 
 		delete(sm.entries, id)

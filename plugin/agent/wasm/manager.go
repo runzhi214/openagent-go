@@ -2,6 +2,7 @@ package wasm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -20,6 +21,7 @@ type Manager struct {
 	ldr       loader
 	tools     []openagent.Tool
 	observers []*wasmObserver
+	sessions  []*wasmSession
 
 	hostAPI *wasmhost.HostAPI
 
@@ -37,6 +39,105 @@ func NewManager(dir string) *Manager {
 func (m *Manager) WithHostAPI(h *wasmhost.HostAPI) *Manager {
 	m.hostAPI = h
 	return m
+}
+
+// wasmSession wraps an agent:sessions WASM plugin. It exports session_init(...)
+// and session_destroy(...) instead of run().
+type wasmSession struct {
+	mod  *module
+	meta PluginMeta
+}
+
+// invokeSessionInit calls the guest's session_init() and returns the parsed
+// SessionConfig, or nil if the export is missing / returns null.
+func (ws *wasmSession) invokeSessionInit(ctx context.Context, sc SessionCtx) (*SessionConfig, error) {
+	fn := ws.mod.mod.ExportedFunction("session_init")
+	if fn == nil {
+		return nil, nil
+	}
+	bs, _ := json.Marshal(sc)
+	out, err := ws.mod.invoke(ctx, "session_init", bs)
+	if err != nil {
+		return nil, err
+	}
+	if out == nil || string(out) == "null" {
+		return nil, nil
+	}
+	var cfg SessionConfig
+	if err := json.Unmarshal(out, &cfg); err != nil {
+		return nil, fmt.Errorf("parse session config: %w", err)
+	}
+	return &cfg, nil
+}
+
+func (ws *wasmSession) invokeSessionDestroy(ctx context.Context, sc SessionCtx) error {
+	fn := ws.mod.mod.ExportedFunction("session_destroy")
+	if fn == nil {
+		return nil
+	}
+	bs, _ := json.Marshal(sc)
+	_, err := ws.mod.invoke(ctx, "session_destroy", bs)
+	return err
+}
+
+// OnSessionInit calls every agent:sessions plugin's session_init export.
+// Returns a merged SessionConfig (last non-nil wins for each field).
+func (m *Manager) OnSessionInit(ctx context.Context, sc SessionCtx) *SessionConfig {
+	m.mu.Lock()
+	sessions := make([]*wasmSession, len(m.sessions))
+	copy(sessions, m.sessions)
+	m.mu.Unlock()
+
+	var merged SessionConfig
+	for _, ws := range sessions {
+		cfg, err := ws.invokeSessionInit(ctx, sc)
+		if err != nil {
+			log.Printf("[wasm:%s] session_init error: %v", ws.meta.Name, err)
+			continue
+		}
+		if cfg != nil {
+			mergeConfig(&merged, cfg)
+		}
+	}
+	return &merged
+}
+
+// OnSessionDestroy calls every agent:sessions plugin's session_destroy export.
+func (m *Manager) OnSessionDestroy(ctx context.Context, sc SessionCtx) {
+	m.mu.Lock()
+	sessions := make([]*wasmSession, len(m.sessions))
+	copy(sessions, m.sessions)
+	m.mu.Unlock()
+
+	for _, ws := range sessions {
+		if err := ws.invokeSessionDestroy(ctx, sc); err != nil {
+			log.Printf("[wasm:%s] session_destroy error: %v", ws.meta.Name, err)
+		}
+	}
+}
+
+func mergeConfig(dst, src *SessionConfig) {
+	if len(src.SystemPrompts) > 0 {
+		dst.SystemPrompts = src.SystemPrompts
+	}
+	if src.Description != "" {
+		dst.Description = src.Description
+	}
+	if len(src.Tools) > 0 {
+		dst.Tools = src.Tools
+	}
+	if src.MaxTurns > 0 {
+		dst.MaxTurns = src.MaxTurns
+	}
+	if src.MaxWorkingTokens > 0 {
+		dst.MaxWorkingTokens = src.MaxWorkingTokens
+	}
+	if src.SkillDir != "" {
+		dst.SkillDir = src.SkillDir
+	}
+	if src.MemoryPath != "" {
+		dst.MemoryPath = src.MemoryPath
+	}
 }
 
 // OnAbort registers a callback invoked when a stage plugin returns action=abort.
@@ -114,8 +215,11 @@ func (m *Manager) loadOne(ctx context.Context, path string) error {
 		m.tools = append(m.tools, &wasmTool{mod: mod, meta: meta})
 	case PluginTypeObservers:
 		m.observers = append(m.observers, &wasmObserver{mod: mod, meta: meta, name: meta.Name})
+	case PluginTypeSessions:
+		m.sessions = append(m.sessions, &wasmSession{mod: mod, meta: meta})
 	default:
-		return fmt.Errorf("unknown plugin type %q", meta.Type)
+		log.Printf("[wasm] skipping %s: unknown plugin type %q (not an agent plugin)", filepath.Base(path), meta.Type)
+		return nil
 	}
 
 	return nil
