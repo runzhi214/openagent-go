@@ -102,12 +102,25 @@ func (s *Sandbox) confineAndRunStream(ctx context.Context, cmd *openagent.Comman
 		}
 		cmd.PID = c.Process.Pid
 
+		// Two goroutines race to close pipe writers: one when process
+		// exits (c.Wait returns), one when ctx expires. readLines get
+		// EOF from whichever wins, done channels fire, goroutine exits.
+		go func() {
+			_ = c.Wait()
+			soutW.Close()
+			serrW.Close()
+		}()
+		go func() {
+			<-ctx.Done()
+			soutW.Close()
+			serrW.Close()
+		}()
+
 		done := make(chan struct{}, 2)
 		go readLines(soutR, ch, done)
 		go readLines(serrR, ch, done)
 		<-done
 		<-done
-		_ = c.Wait()
 	}()
 	return ch
 }

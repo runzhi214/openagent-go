@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"time"
 
 	openaisdk "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -28,6 +30,9 @@ func New(apiKey, modelID, baseURL string) *Model {
 		client: openaisdk.NewClient(
 			option.WithAPIKey(apiKey),
 			option.WithBaseURL(baseURL),
+			option.WithHTTPClient(&http.Client{
+				Timeout: 5 * time.Minute,
+			}),
 		),
 		modelID: modelID,
 	}

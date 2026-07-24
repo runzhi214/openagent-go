@@ -127,19 +127,39 @@ func (s *Sandbox) confineAndRunStream(ctx context.Context, cmd *openagent.Comman
 		}
 		cmd.PID = c.Process.Pid
 
+		// Two goroutines race to close pipe writers: one on process
+		// exit, one on ctx timeout. The bwrap check only applies
+		// when the process exits (ctx timeout → already streaming).
+		waitErrCh := make(chan error, 1)
+		go func() {
+			waitErrCh <- c.Wait()
+			soutW.Close()
+			serrW.Close()
+		}()
+		go func() {
+			<-ctx.Done()
+			soutW.Close()
+			serrW.Close()
+		}()
+
 		// Read stderr first line early so we can detect bwrap setup
-		// failures (which happen before the inner command produces any
-		// stdout). If bwrap fails, stderr starts with "bwrap:" and the
+		// failures (happen before inner command produces any stdout).
+		// If bwrap fails, stderr starts with "bwrap:" and the
 		// process exits immediately with no stdout.
 		done := make(chan struct{}, 2)
 		var firstStderr string
 		firstStderrCh := make(chan string, 1)
 		go readLinesWithFirst(serrR, ch, done, firstStderrCh)
 		go readLines(soutR, ch, done)
+		<-done
+		<-done
 
-		waitErr := c.Wait()
-		<-done
-		<-done
+		// Get exit status: available when process exited before timeout.
+		var waitErr error
+		select {
+		case waitErr = <-waitErrCh:
+		default:
+		}
 		select {
 		case firstStderr = <-firstStderrCh:
 		default:

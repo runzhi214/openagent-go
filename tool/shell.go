@@ -202,24 +202,53 @@ func (t *Shell) ExecuteStream(ctx context.Context, args json.RawMessage) <-chan 
 	}
 
 	src := sr.RunStream(streamCtx, &cmd)
-	wrapped := make(chan openagent.ToolStreamChunk, cap(src))
+	wrapped := make(chan openagent.ToolStreamChunk, 16)
 	go func() {
 		defer cancel()
 		defer close(wrapped)
-		for chunk := range src {
-			wrapped <- chunk
-		}
-		// Stream ended. Two cases:
-		// 1. ctx timed out → process still running, return info.
-		// 2. process exited normally → clean up proc.
-		if streamCtx.Err() != nil && proc != nil {
-			proc.SetPID(cmd.PID)
-			wrapped <- openagent.ToolStreamChunk{
-				Content: formatProcessRunning(proc),
+		for {
+			select {
+			case chunk, ok := <-src:
+				if !ok {
+					// Process exited on its own.
+					if proc != nil {
+						proc.Close()
+						pm.Remove(proc.ID)
+					}
+					return
+				}
+				// Non-blocking send — if the runner isn't reading,
+				// drop back through select to check the timeout.
+				select {
+				case wrapped <- chunk:
+				case <-streamCtx.Done():
+					if proc != nil && cmd.PID > 0 {
+						proc.SetPID(cmd.PID)
+						// One last send — runner should be draining.
+						select {
+						case wrapped <- openagent.ToolStreamChunk{Content: formatProcessRunning(proc)}:
+						default:
+						}
+					}
+					go func() { for range src {} }()
+					return
+				}
+			case <-streamCtx.Done():
+				// Timeout — don't wait for sandbox, return process info.
+				if proc != nil && cmd.PID > 0 {
+					proc.SetPID(cmd.PID)
+				}
+				if proc != nil {
+					select {
+					case wrapped <- openagent.ToolStreamChunk{Content: formatProcessRunning(proc)}:
+					default:
+					}
+				}
+				// Drain src in background so sandbox goroutine
+				// doesn't block on a full channel.
+				go func() { for range src {} }()
+				return
 			}
-		} else if proc != nil {
-			proc.Close()
-			pm.Remove(proc.ID)
 		}
 	}()
 	return wrapped
