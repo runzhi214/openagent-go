@@ -212,21 +212,17 @@ func (t *Shell) ExecuteStream(ctx context.Context, args json.RawMessage) <-chan 
 			select {
 			case chunk, ok := <-src:
 				if !ok {
-					// Process exited on its own.
 					if proc != nil {
 						proc.Close()
 						pm.Remove(proc.ID)
 					}
 					return
 				}
-				// Non-blocking send — if the runner isn't reading,
-				// drop back through select to check the timeout.
 				select {
 				case wrapped <- chunk:
 				case <-streamCtx.Done():
 					if proc != nil && cmd.PID > 0 {
 						proc.SetPID(cmd.PID)
-						// One last send — runner should be draining.
 						select {
 						case wrapped <- openagent.ToolStreamChunk{Content: formatProcessRunning(proc)}:
 						default:
@@ -236,7 +232,6 @@ func (t *Shell) ExecuteStream(ctx context.Context, args json.RawMessage) <-chan 
 					return
 				}
 			case <-streamCtx.Done():
-				// Timeout — don't wait for sandbox, return process info.
 				if proc != nil && cmd.PID > 0 {
 					proc.SetPID(cmd.PID)
 				}
@@ -246,8 +241,6 @@ func (t *Shell) ExecuteStream(ctx context.Context, args json.RawMessage) <-chan 
 					default:
 					}
 				}
-				// Drain src in background so sandbox goroutine
-				// doesn't block on a full channel.
 				go func() { for range src {} }()
 				return
 			}

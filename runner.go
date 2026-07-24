@@ -921,22 +921,41 @@ func (r *runner) executeOneToolInternal(ctx context.Context, session Session, ca
 	if se, ok := tool.(StreamExecutor); ok {
 		toolCh := se.ExecuteStream(toolCtx, args)
 		var buf strings.Builder
-		for chunk := range toolCh {
-			if chunk.Error != nil {
-				execErr = chunk.Error
-				break
-			}
-			buf.WriteString(chunk.Content)
-			// Emit progress for real-time display. ToolCallID disambiguates
-			// concurrent streaming tools in the same turn.
-			if ch != nil {
+		// Rate-limit: some tools (shell) produce hundreds of chunks/sec.
+		// Emitting every chunk as a StreamToolProgress event floods the
+		// runner's event channel and deadlocks when downstream (ACP
+		// stdout pipe) reads slower than the tool produces.
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		var pending string
+		flush := func() {
+			if pending != "" && ch != nil {
 				ch <- StreamEvent{
 					Type:       StreamToolProgress,
-					Text:       chunk.Content,
+					Text:       pending,
 					ToolCallID: call.ID,
 				}
+				pending = ""
 			}
 		}
+		done := false
+		for !done {
+			select {
+			case chunk, ok := <-toolCh:
+				if !ok {
+					done = true
+				} else if chunk.Error != nil {
+					execErr = chunk.Error
+					done = true
+				} else {
+					buf.WriteString(chunk.Content)
+					pending += chunk.Content
+				}
+			case <-ticker.C:
+				flush()
+			}
+		}
+		flush()
 		output = buf.String()
 	} else {
 		// ── Blocking path (default) ──
