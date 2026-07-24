@@ -25,6 +25,11 @@ type Command struct {
 	// StderrW is like StdoutW but for stderr.
 	StderrW io.Writer
 
+	// ExitCodeW, if set, receives the exit code as a decimal string
+	// (e.g. "0", "1") after the process exits. Used by ProcessManager
+	// to persist the exit code so the model can read it across turns.
+	ExitCodeW io.Writer
+
 	// PID is set by the sandbox after the process starts. The caller can
 	// read it after Run/RunStream returns (or after the first stream chunk
 	// arrives) to get the OS process ID.

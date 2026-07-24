@@ -132,7 +132,18 @@ func (s *Sandbox) confineAndRunStream(ctx context.Context, cmd *openagent.Comman
 		// when the process exits (ctx timeout → already streaming).
 		waitErrCh := make(chan error, 1)
 		go func() {
-			waitErrCh <- c.Wait()
+			err := c.Wait()
+			// Write exit code so the model can check it via read.
+			if cmd.ExitCodeW != nil {
+				code := 0
+				if ee, ok := err.(*exec.ExitError); ok {
+					code = ee.ExitCode()
+				} else if err != nil {
+					code = -1
+				}
+				fmt.Fprintf(cmd.ExitCodeW, "%d", code)
+			}
+			waitErrCh <- err
 			soutW.Close()
 			serrW.Close()
 		}()

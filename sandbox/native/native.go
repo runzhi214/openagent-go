@@ -212,7 +212,17 @@ func (s *Sandbox) unconfinedRunStream(ctx context.Context, cmd *openagent.Comman
 		// exits (c.Wait returns), one when ctx expires. readLines get
 		// EOF from whichever wins, done channels fire, goroutine exits.
 		go func() {
-			_ = c.Wait()
+			err := c.Wait()
+			// Write exit code so the model can check it via read.
+			if cmd.ExitCodeW != nil {
+				code := 0
+				if ee, ok := err.(*exec.ExitError); ok {
+					code = ee.ExitCode()
+				} else if err != nil {
+					code = -1
+				}
+				fmt.Fprintf(cmd.ExitCodeW, "%d", code)
+			}
 			soutW.Close()
 			serrW.Close()
 		}()

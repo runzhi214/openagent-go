@@ -50,16 +50,18 @@ type Manager struct {
 
 // Proc represents a single running (or recently exited) process.
 type Proc struct {
-	ID         string    // short hex ID, e.g. "a1b2c3d4"
-	PID        int       // host OS PID of the sandbox wrapper (bwrap / bash)
-	Command    string    // original shell command
-	StdoutPath string    // absolute path to stdout.log
-	StderrPath string    // absolute path to stderr.log
-	StartedAt  time.Time
+	ID          string    // short hex ID, e.g. "a1b2c3d4"
+	PID         int       // host OS PID of the sandbox wrapper (bwrap / bash)
+	Command     string    // original shell command
+	StdoutPath  string    // absolute path to stdout.log
+	StderrPath  string    // absolute path to stderr.log
+	ExitCodePath string   // absolute path to exit.code
+	StartedAt   time.Time
 
-	dir     string         // proc subdirectory
-	stdoutF *os.File       // open file handle for stdout
-	stderrF *os.File       // open file handle for stderr
+	dir      string    // proc subdirectory
+	stdoutF  *os.File  // open file handle for stdout
+	stderrF  *os.File  // open file handle for stderr
+	exitCodeF *os.File // open file handle for exit code
 }
 
 // StdoutW returns the writer for sandbox stdout output.
@@ -68,13 +70,19 @@ func (p *Proc) StdoutW() io.Writer { return p.stdoutF }
 // StderrW returns the writer for sandbox stderr output.
 func (p *Proc) StderrW() io.Writer { return p.stderrF }
 
-// Close closes the stdout and stderr file handles.
+// ExitCodeW returns the writer for the process exit code.
+func (p *Proc) ExitCodeW() io.Writer { return p.exitCodeF }
+
+// Close closes the stdout, stderr, and exit code file handles.
 func (p *Proc) Close() {
 	if p.stdoutF != nil {
 		p.stdoutF.Close()
 	}
 	if p.stderrF != nil {
 		p.stderrF.Close()
+	}
+	if p.exitCodeF != nil {
+		p.exitCodeF.Close()
 	}
 }
 
@@ -90,6 +98,7 @@ func (p *Proc) SetPID(pid int) {
 	p.dir = newDir
 	p.StdoutPath = filepath.Join(newDir, "stdout.log")
 	p.StderrPath = filepath.Join(newDir, "stderr.log")
+	p.ExitCodePath = filepath.Join(newDir, "exit.code")
 }
 
 // NewManager creates a Manager rooted at baseDir. The directory is created
@@ -124,6 +133,7 @@ func (m *Manager) Create(command string) (*Proc, error) {
 
 	stdoutPath := filepath.Join(dir, "stdout.log")
 	stderrPath := filepath.Join(dir, "stderr.log")
+	exitCodePath := filepath.Join(dir, "exit.code")
 
 	stdoutF, err := os.Create(stdoutPath)
 	if err != nil {
@@ -136,16 +146,25 @@ func (m *Manager) Create(command string) (*Proc, error) {
 		os.RemoveAll(dir)
 		return nil, fmt.Errorf("process %s stderr: %w", id, err)
 	}
+	exitCodeF, err := os.Create(exitCodePath)
+	if err != nil {
+		stdoutF.Close()
+		stderrF.Close()
+		os.RemoveAll(dir)
+		return nil, fmt.Errorf("process %s exit code: %w", id, err)
+	}
 
 	p := &Proc{
-		ID:         id,
-		Command:    command,
-		StdoutPath: stdoutPath,
-		StderrPath: stderrPath,
-		StartedAt:  time.Now(),
-		dir:        dir,
-		stdoutF:    stdoutF,
-		stderrF:    stderrF,
+		ID:           id,
+		Command:      command,
+		StdoutPath:   stdoutPath,
+		StderrPath:   stderrPath,
+		ExitCodePath: exitCodePath,
+		StartedAt:    time.Now(),
+		dir:          dir,
+		stdoutF:      stdoutF,
+		stderrF:      stderrF,
+		exitCodeF:    exitCodeF,
 	}
 
 	m.mu.Lock()

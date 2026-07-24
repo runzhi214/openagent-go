@@ -48,7 +48,7 @@ func (t *Shell) WithLanguage(lang string) *Shell {
 }
 
 func (t *Shell) Definition() openagent.FunctionDefinition {
-	desc := "Execute a shell command. Returns stdout, stderr, and exit code."
+	desc := "Execute a shell command in the background. If the command finishes quickly, stdout/stderr/exit code are returned directly. If it runs longer, you'll get file paths to monitor progress — use `read` to check stdout.log, stderr.log, and exit.code."
 	if t.language != "" {
 		desc = fmt.Sprintf("Execute a shell command in a %s sandbox. CWD is the workspace root.", t.language)
 	}
@@ -110,6 +110,7 @@ func (t *Shell) Execute(ctx context.Context, args json.RawMessage) (string, erro
 		}
 		cmd.StdoutW = proc.StdoutW()
 		cmd.StderrW = proc.StderrW()
+		cmd.ExitCodeW = proc.ExitCodeW()
 
 		result, runErr := t.sandbox.Run(shellCtx, cmd)
 		if errors.Is(runErr, openagent.ErrProcessRunning) {
@@ -179,6 +180,7 @@ func (t *Shell) ExecuteStream(ctx context.Context, args json.RawMessage) <-chan 
 		}
 		cmd.StdoutW = proc.StdoutW()
 		cmd.StderrW = proc.StderrW()
+		cmd.ExitCodeW = proc.ExitCodeW()
 	}
 
 	type streamRunner interface {
@@ -281,21 +283,28 @@ func formatProcessRunning(proc *process.Proc) string {
 	var b strings.Builder
 	elapsed := time.Since(proc.StartedAt).Truncate(time.Second)
 
-	b.WriteString(fmt.Sprintf("[process: %s] PID: %d — running for %v\n\n", proc.ID, proc.PID, elapsed))
+	// Check if exit code is available (process completed after timeout).
+	var status string
+	if code, err := os.ReadFile(proc.ExitCodePath); err == nil {
+		status = fmt.Sprintf("exited (code: %s)", strings.TrimSpace(string(code)))
+	} else {
+		status = fmt.Sprintf("running for %v", elapsed)
+	}
+	b.WriteString(fmt.Sprintf("[process: %s] PID: %d — %s\n\n", proc.ID, proc.PID, status))
 
 	if stdout, err := os.ReadFile(proc.StdoutPath); err == nil && len(stdout) > 0 {
-		b.WriteString("── stdout (partial) ──\n")
+		b.WriteString("── stdout ──\n")
 		b.WriteString(truncateStr(string(stdout), 2000))
 		b.WriteString("\n")
 	}
 	if stderr, err := os.ReadFile(proc.StderrPath); err == nil && len(stderr) > 0 {
-		b.WriteString("── stderr (partial) ──\n")
+		b.WriteString("── stderr ──\n")
 		b.WriteString(truncateStr(string(stderr), 500))
 		b.WriteString("\n")
 	}
 
-	b.WriteString(fmt.Sprintf("── output files ──\n%s\n%s\n",
-		proc.StdoutPath, proc.StderrPath))
+	b.WriteString(fmt.Sprintf("── output files ──\n%s\n%s\n%s\n",
+		proc.StdoutPath, proc.StderrPath, proc.ExitCodePath))
 	return b.String()
 }
 
