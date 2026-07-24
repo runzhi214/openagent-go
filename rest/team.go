@@ -1,9 +1,9 @@
 package rest
 
 import (
+	"log/slog"
 	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -48,11 +48,11 @@ func NewTeamHandler(mem openagent.Memory, agents ...TeamAgentTemplate) *TeamHand
 	}
 	for _, t := range agents {
 		if t.Agent.Model == nil {
-			log.Printf("team: agent %q has nil Model — chat will fail until a model is set", t.Name)
+			slog.Warn("team agent has nil model", "agent", t.Name)
 		}
 	}
 	if len(agents) > 0 && model == nil {
-		log.Printf("team: primary agent has nil Model — dynamically added agents will have no model")
+		slog.Warn("team primary agent has nil model")
 	}
 
 	h := &TeamHandler{agents: agents, model: model, models: make(map[string]openagent.Model)}
@@ -628,7 +628,7 @@ func teamEventToSSE(evt openagent.TeamEvent) SSEEvent {
 		return se
 
 	default:
-		log.Printf("rest: unknown team event type %q", evt.Type)
+		slog.Warn("unknown team event type", "type", evt.Type)
 		return SSEEvent{Type: "unknown"}
 	}
 }

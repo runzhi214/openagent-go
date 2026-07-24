@@ -15,13 +15,16 @@ import (
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
 )
 
-// SetupLog configures slog + log package output. Writes to stderr and
-// optionally to a rotated log file. Returns a cleanup function.
+// SetupLog configures slog + log package output. Writes to a rotated log
+// file when cfg.File is set; otherwise discards log output silently.
+//
+// IMPORTANT: does NOT write to os.Stderr. The ACP protocol uses stderr as
+// a control pipe — any log output there fills the pipe buffer and blocks
+// the process. Use fmt.Fprintf(os.Stderr, ...) for intentional console output.
 func SetupLog(cfg config.LogConfig) (func(), error) {
 	level := parseLevel(cfg.Level)
 
 	mw := &multiCloser{}
-	mw.AddWriter(os.Stderr)
 
 	if cfg.File != "" {
 		if err := os.MkdirAll(filepath.Dir(cfg.File), 0755); err != nil {
@@ -34,8 +37,14 @@ func SetupLog(cfg config.LogConfig) (func(), error) {
 		mw.AddCloser(rw)
 	}
 
+	// When no log file is configured, fall back to discarding.
+	// log.Printf and slog output go only to the file, never to stderr.
+	if len(mw.writers) == 0 {
+		mw.AddWriter(io.Discard)
+	}
+
 	// slog.
-	h := slog.NewTextHandler(mw, &slog.HandlerOptions{Level: level})
+	h := slog.NewJSONHandler(mw, &slog.HandlerOptions{Level: level})
 	slog.SetDefault(slog.New(h))
 
 	// Redirect log.Printf etc. to the same writer so existing

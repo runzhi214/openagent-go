@@ -1,9 +1,9 @@
 package rest
 
 import (
+	"log/slog"
 	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -100,7 +100,7 @@ func (sm *sessionManager[E]) syncMeta(inf *session.SessionInfo) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := sm.store.Save(ctx, *inf); err != nil {
-			log.Printf("rest: failed to persist meta for session %s: %v", inf.ID, err)
+			slog.Error("failed to persist session meta", "session", inf.ID, "error", err)
 		}
 	}()
 }
@@ -294,7 +294,7 @@ func (sm *sessionManager[E]) del(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		if err := sm.store.Delete(ctx, id); err != nil {
-			log.Printf("rest: failed to delete session %s from store: %v", id, err)
+			slog.Error("failed to delete session from store", "session", id, "error", err)
 		}
 	}
 
@@ -360,7 +360,7 @@ func (sm *sessionManager[E]) evictIdle(maxIdle time.Duration) {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 				if err := sm.store.Save(ctx, inf); err != nil {
-					log.Printf("rest: failed to persist session %s before eviction: %v", id, err)
+					slog.Error("failed to persist session before eviction", "session", id, "error", err)
 				}
 			}(info)
 		}

@@ -1,10 +1,10 @@
 package server
 
 import (
+	"log/slog"
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +29,7 @@ func RunChannels(ctx context.Context, agent *openagent.Agent, cfg config.Channel
 	}
 
 	for _, ch := range channels {
-		log.Printf("channel: starting %s", ch.Name())
+		slog.Info("channel starting", "name", ch.Name())
 		go func(ch channel.Channel) {
 			handler := channel.MessageHandler(func(msgCtx context.Context, msg channel.IncomingMessage, reply channel.ReplyFunc) {
 				sessionID := ch.Name() + "_" + msg.ChatID
@@ -45,7 +45,7 @@ func RunChannels(ctx context.Context, agent *openagent.Agent, cfg config.Channel
 			})
 
 			if err := ch.Start(ctx, handler); err != nil {
-				log.Printf("channel: %s stopped: %v", ch.Name(), err)
+				slog.Warn("channel stopped", "name", ch.Name(), "error", err)
 			}
 		}(ch)
 	}

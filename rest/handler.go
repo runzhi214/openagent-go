@@ -1,13 +1,13 @@
 package rest
 
 import (
+	"log/slog"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -194,7 +194,7 @@ func (h *Handler) WithPluginManager(mgr *wasm.Manager) *Handler {
 		} else {
 			h.observer = obs
 		}
-		log.Printf("[wasm] plugin observer wired into handler")
+		slog.Info("plugin observer wired", "source", "wasm")
 	}
 	h.sm.hooks.onDelete = func(e *sessionState) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -685,7 +685,7 @@ func streamToSSE(evt openagent.StreamEvent) SSEEvent {
 		return SSEEvent{Type: "error", Text: msg}
 
 	default:
-		log.Printf("rest: unknown stream event type %q", evt.Type)
+		slog.Warn("unknown stream event type", "type", evt.Type)
 		return SSEEvent{Type: "unknown"}
 	}
 }

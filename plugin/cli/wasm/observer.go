@@ -1,8 +1,8 @@
 package wasm
 
 import (
+	"log/slog"
 	"context"
-	"log"
 	"sync"
 )
 
@@ -50,7 +50,7 @@ func (h *ObserverHub) broadcast(ctx context.Context, name string) {
 		fn := m.Mod.ExportedFunction(name)
 		if fn == nil { continue }
 		if _, err := fn.Call(ctx); err != nil {
-			log.Printf("observer %s: %v", name, err)
+			slog.Error("cli observer error", "name", name, "error", err)
 		}
 	}
 }
@@ -71,7 +71,7 @@ func (h *ObserverHub) broadcastStr(ctx context.Context, name string, arg string)
 		ptr := uint32(res[0])
 		m.Mod.Memory().Write(ptr, b)
 		if _, err := fn.Call(ctx, uint64(ptr), uint64(len(b))); err != nil {
-			log.Printf("observer %s: %v", name, err)
+			slog.Error("cli observer error", "name", name, "error", err)
 		}
 	}
 }

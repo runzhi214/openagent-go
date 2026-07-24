@@ -1,10 +1,10 @@
 package wasm
 
 import (
+	"log/slog"
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -92,7 +92,7 @@ func (m *Manager) OnSessionInit(ctx context.Context, sc SessionCtx) *SessionConf
 	for _, ws := range sessions {
 		cfg, err := ws.invokeSessionInit(ctx, sc)
 		if err != nil {
-			log.Printf("[wasm:%s] session_init error: %v", ws.meta.Name, err)
+			slog.Error("wasm session_init failed", "plugin", ws.meta.Name, "error", err)
 			continue
 		}
 		if cfg != nil {
@@ -111,7 +111,7 @@ func (m *Manager) OnSessionDestroy(ctx context.Context, sc SessionCtx) {
 
 	for _, ws := range sessions {
 		if err := ws.invokeSessionDestroy(ctx, sc); err != nil {
-			log.Printf("[wasm:%s] session_destroy error: %v", ws.meta.Name, err)
+			slog.Error("wasm session_destroy failed", "plugin", ws.meta.Name, "error", err)
 		}
 	}
 }
@@ -218,7 +218,7 @@ func (m *Manager) loadOne(ctx context.Context, path string) error {
 	case PluginTypeSessions:
 		m.sessions = append(m.sessions, &wasmSession{mod: mod, meta: meta})
 	default:
-		log.Printf("[wasm] skipping %s: unknown plugin type %q (not an agent plugin)", filepath.Base(path), meta.Type)
+		slog.Info("wasm skipping unknown plugin type", "file", filepath.Base(path), "type", meta.Type)
 		return nil
 	}
 
@@ -273,9 +273,9 @@ func (o *observerRouter) ObserveStage(ctx context.Context, event openagent.Stage
 				onAbort(out.Reason)
 				return
 			}
-			log.Printf("[wasm:%s] %s:%s ERROR: %v", s.meta.Name, event.Name, event.Phase, err)
+			slog.Error("wasm observer error", "plugin", s.meta.Name, "stage", event.Name, "phase", event.Phase, "error", err)
 			continue
 		}
-		log.Printf("[wasm:%s] %s:%s action=%s", s.meta.Name, event.Name, event.Phase, out.Action)
+		slog.Info("wasm observer", "plugin", s.meta.Name, "stage", event.Name, "phase", event.Phase, "action", out.Action)
 	}
 }

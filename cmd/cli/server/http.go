@@ -1,9 +1,9 @@
 package server
 
 import (
+	"log/slog"
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -34,7 +34,7 @@ func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	if err == nil {
 		tools = buildTools(sb, workDir, []string{"shell", "read", "write", "edit", "ls", "grep"})
 	} else {
-		log.Printf("WARNING: sandbox unavailable, tools disabled: %v", err)
+		slog.Warn("sandbox unavailable, tools disabled", "error", err)
 	}
 
 	// MCP tools from config. Gated by --mcp (default on, --mcp=off disables).
@@ -86,14 +86,14 @@ func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	pluginDir := filepath.Join(profilesDir, "plugins")
 	mgr := wasm.NewManager(pluginDir).WithHostAPI(&wasmhost.HostAPI{Logger: &logAdapter{}})
 	if err := mgr.Discover(ctx); err != nil {
-		log.Printf("WARNING: plugin discover: %v", err)
+		slog.Warn("plugin discover failed", "error", err)
 	} else {
 		handler.WithPluginManager(mgr)
 	}
 
 	// Start IM channels in the background.
 	if err := RunChannels(ctx, agent, cfg.Channels); err != nil {
-		log.Printf("channel: %v", err)
+		slog.Warn("channel error", "error", err)
 	}
 
 	mux := http.NewServeMux()
@@ -106,9 +106,9 @@ func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
 	srv := &http.Server{Addr: addr, Handler: withMiddleware(mux)}
 
-	go func() { <-ctx.Done(); log.Println("shutting down..."); srv.Shutdown(context.Background()) }()
+	go func() { <-ctx.Done(); slog.Info("shutting down"); srv.Shutdown(context.Background()) }()
 
-	log.Printf("REST server listening on http://localhost%s", addr)
+	slog.Info("REST server listening", "addr", addr)
 	err = srv.ListenAndServe()
 	if err == http.ErrServerClosed {
 		return nil
@@ -139,7 +139,7 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
-				log.Printf("PANIC %s %s: %v", r.Method, r.URL.Path, rec)
+				slog.Error("panic recovered", "method", r.Method, "path", r.URL.Path, "error", rec)
 				http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
 			}
 		}()
@@ -150,6 +150,6 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 // logAdapter implements wasmhost.Logger by forwarding to the standard log package.
 type logAdapter struct{}
 
-func (l *logAdapter) Info(msg string)  { log.Printf("[plugin:info] %s", msg) }
-func (l *logAdapter) Warn(msg string)  { log.Printf("[plugin:warn] %s", msg) }
-func (l *logAdapter) Error(msg string) { log.Printf("[plugin:error] %s", msg) }
+func (l *logAdapter) Info(msg string)  { slog.Info(msg, "source", "plugin") }
+func (l *logAdapter) Warn(msg string)  { slog.Warn(msg, "source", "plugin") }
+func (l *logAdapter) Error(msg string) { slog.Error(msg, "source", "plugin") }

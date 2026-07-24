@@ -1,10 +1,10 @@
 package wasm
 
 import (
+	"log/slog"
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 
@@ -82,7 +82,7 @@ func (m *Module) ReadCommands(ctx context.Context) ([]CommandDef, error) {
 	}
 	for _, cd := range cmds {
 		if _, loaded := commandModules.LoadOrStore(cd.Name, m.Mod); loaded {
-			log.Printf("plugin %q: command %q already registered, overwritten", m.Meta.Name, cd.Name)
+			slog.Warn("plugin command already registered, overwriting", "plugin", m.Meta.Name, "command", cd.Name)
 		}
 	}
 	return cmds, nil

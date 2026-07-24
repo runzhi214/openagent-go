@@ -5,10 +5,10 @@
 package acp
 
 import (
+	"log/slog"
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -187,9 +187,9 @@ func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string) {
 		if baseURL == "" {
 			baseURL = old.BaseURL
 		}
-		log.Printf("[acp] updating model: %s", key)
+		slog.Info("acp updating model", "key", key)
 	} else {
-		log.Printf("[acp] inserting model: %s", key)
+		slog.Info("acp inserting model", "key", key)
 	}
 	s.Models[key] = openai.New(apiKey, modelID, baseURL)
 	s.modelConfigs[key] = ModelConfig{Provider: provider, ModelID: modelID, APIKey: apiKey, BaseURL: baseURL}

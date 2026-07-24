@@ -1,9 +1,9 @@
 package plugin
 
 import (
+	"log/slog"
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -30,7 +30,7 @@ func (m *Manager) Pipe(ctx context.Context, initialSettings []byte, loadFn func(
 	for _, path := range m.plugins {
 		files, err := m.ResolveWasmFiles(path)
 		if err != nil {
-			log.Printf("plugin: resolve %s: %v", path, err)
+			slog.Warn("plugin resolve error", "path", path, "error", err)
 			continue
 		}
 		sort.Strings(files)
@@ -38,7 +38,7 @@ func (m *Manager) Pipe(ctx context.Context, initialSettings []byte, loadFn func(
 			name := filepath.Base(f)
 			wasmBytes, err := os.ReadFile(f)
 			if err != nil {
-				log.Printf("plugin: read %s: %v", f, err)
+				slog.Warn("plugin read error", "file", f, "error", err)
 				continue
 			}
 			merged, pluginName, pluginDesc, err := loadFn(wasmBytes, name, settings)
@@ -46,7 +46,7 @@ func (m *Manager) Pipe(ctx context.Context, initialSettings []byte, loadFn func(
 				return nil, fmt.Errorf("plugin %s: %w", name, err)
 			}
 			settings = merged
-			log.Printf("plugin: loaded %s (%s)", pluginName, pluginDesc)
+			slog.Info("plugin loaded", "name", pluginName, "desc", pluginDesc)
 		}
 	}
 	return settings, nil

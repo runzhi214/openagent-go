@@ -244,10 +244,9 @@ func buildGuard(model openagent.Model) *llm.Guard {
 	return llm.New(model)
 }
 
-// buildSlogHooks creates slog-based RunHooks logging to stderr.
+// buildSlogHooks creates slog-based RunHooks.
 func buildSlogHooks() openagent.RunHooks {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	return sloghooks.New(logger)
+	return sloghooks.New(slog.Default())
 }
 
 // slogObserver logs stage events to a dedicated stderr logger.
@@ -262,7 +261,7 @@ func (o slogObserver) ObserveStage(_ context.Context, event openagent.StageEvent
 // buildSlogObserver creates a minimal stderr stage observer.
 func buildSlogObserver() openagent.RunObserver {
 	return slogObserver{
-		logger: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		logger: slog.Default(),
 	}
 }
 

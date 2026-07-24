@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"log"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -38,7 +37,7 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 
 	_, modelInfos := buildModels(cfg.Provider)
 	if len(modelInfos) == 0 {
-		log.Println("WARNING: no models configured — ACP server will start but prompt turns will fail")
+		slog.Warn("no models configured, ACP server will start but prompt turns will fail")
 	}
 
 	modelMap := make(map[string]openagent.Model, len(modelInfos))
@@ -96,7 +95,7 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	pluginDir := filepath.Join(profilesDir, "plugins")
 	mgr := wasm.NewManager(pluginDir).WithHostAPI(&wasmhost.HostAPI{Logger: &logAdapter{}})
 	if err := mgr.Discover(ctx); err != nil {
-		log.Printf("WARNING: plugin discover: %v", err)
+		slog.Warn("plugin discover failed", "error", err)
 	} else {
 		srv.PluginMgr = mgr
 		if obs := mgr.Observer(); obs != nil {
@@ -105,7 +104,7 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 			} else {
 				agent.Observer = obs
 			}
-			log.Printf("[wasm] plugin observer wired into agent")
+			slog.Info("plugin observer wired", "source", "wasm")
 		}
 	}
 
@@ -139,9 +138,9 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	}
 
 	if err := RunChannels(ctx, channelAgent, cfg.Channels); err != nil {
-		log.Printf("channel: %v", err)
+		slog.Warn("channel error", "error", err)
 	}
 
-	log.Println("ACP server starting on stdio")
+	slog.Info("ACP server starting on stdio")
 	return server.Run(ctx)
 }

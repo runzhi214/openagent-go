@@ -1,10 +1,10 @@
 package rest
 
 import (
+	"log/slog"
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -705,7 +705,7 @@ func planEventToSSE(evt orchestrate.PlanEvent) SSEEvent {
 		return SSEEvent{Type: "plan_error", Error: evt.ErrText}
 
 	default:
-		log.Printf("rest: unknown plan event type %q", evt.Type)
+		slog.Warn("unknown plan event type", "type", evt.Type)
 		return SSEEvent{Type: "unknown"}
 	}
 }
