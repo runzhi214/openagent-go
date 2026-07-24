@@ -124,7 +124,7 @@ Output ONLY the JSON object. No markdown, no explanation.
 		openagent.WithSystemPrompts(`You are a Cloud Architect. Design infrastructure for the given ApplicationProfile.
 
 ## Process
-1. Load skills: use_skill("deployment-patterns") for pricing and patterns.
+1. Load skills: load_skill("deployment-patterns") for pricing and patterns.
 2. Based on the ApplicationProfile, design 3 options:
 
 - 方案A (最低成本): Minimum viable. Smallest flavors, no HA.
@@ -164,7 +164,7 @@ Return ONLY a JSON array. No markdown fences.
 
 ## Process
 1. Use read_file to read templates/templates/*.tf.tmpl to see what variables each module needs.
-2. Load skills: use_skill("terraform-modules") for module documentation.
+2. Load skills: load_skill("terraform-modules") for module documentation.
 3. Use read_file to read each needed template, replace {{ .Name }}, {{ .Flavor }}, etc. with real values.
 4. Use write_file to write the result to terraform/<name>.tf
 5. Run terraform_init to verify the configuration.

@@ -201,7 +201,7 @@ Output ONLY the JSON object. No markdown, no explanation.`),
 - 方案B (推荐): Balanced cost/reliability. Standard production.
 - 方案C (高可用): Multi-AZ HA for high traffic.
 
-Load use_skill("deployment-patterns") for pricing and patterns. Output ONLY a JSON array.`),
+Load load_skill("deployment-patterns") for pricing and patterns. Output ONLY a JSON array.`),
 		openagent.WithMaxTurns(3),
 	)
 

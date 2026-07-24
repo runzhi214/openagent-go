@@ -114,7 +114,7 @@ func TestSandboxStreaming(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ch := sb.RunStream(context.Background(), openagent.Command{
+	ch := sb.RunStream(context.Background(), &openagent.Command{
 		Program: "/bin/bash",
 		Args:    []string{"-c", "echo line1; sleep 0.1; echo line2"},
 		WorkDir: dir,

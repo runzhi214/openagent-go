@@ -428,7 +428,7 @@ func toolEmoji(name string) string {
 		return "🧠"
 	case "subagent":
 		return "🤖"
-	case "use_skill":
+	case "load_skill":
 		return "📦"
 	default:
 		return "🔧"

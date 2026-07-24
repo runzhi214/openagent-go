@@ -22,8 +22,8 @@ type runner struct {
 
 	// Cached state
 	skills       []SkillInfo          // Discover result, refreshed by reload_skills
-	loadedSkills map[string]string    // name → body, populated by use_skill
-	builtinTools []FunctionDefinition // auto-injected tools (use_skill, reload_skills)
+	loadedSkills map[string]string    // name → body, populated by load_skill
+	builtinTools []FunctionDefinition // auto-injected tools (load_skill, reload_skills)
 	compressed   *CompressedContext   // Memory.Compressed result, set once per Run()
 
 	// Per-run state
@@ -729,6 +729,7 @@ func buildSemanticSection(path string) string {
 func buildSkillsSection(skills []SkillInfo) string {
 	var b strings.Builder
 	b.WriteString("## Available Skills\n")
+	b.WriteString("To load a skill, call the `load_skill` tool with the skill name.\n")
 	for _, s := range skills {
 		b.WriteString("\n### " + s.Name + "\n")
 		for k, v := range s.Frontmatter {
@@ -882,9 +883,9 @@ func (r *runner) executeOneToolInternal(ctx context.Context, session Session, ca
 
 	// Built-in tools: execute directly, share hooks/observer pipeline.
 	switch call.Function.Name {
-	case "use_skill":
+	case "load_skill":
 		toolStart := r.fireToolHooks(toolCtx, *def, args)
-		msg := r.executeUseSkill(toolCtx, call)
+		msg := r.executeLoadSkill(toolCtx, call)
 		r.fireToolHooksEnd(toolCtx, *def, args, msg.Content, toolStart, nil)
 		return msg
 	case "reload_skills":
@@ -987,8 +988,8 @@ func (r *runner) fireToolHooksEnd(ctx context.Context, def FunctionDefinition, a
 // built-in skill tool definitions — single source of truth used by both
 // toolDef (name→definition lookup) and builtinSkillToolDefs (model tool list).
 var (
-	builtinUseSkillDef = FunctionDefinition{
-		Name:        "use_skill",
+	builtinLoadSkillDef = FunctionDefinition{
+		Name:        "load_skill",
 		Description: "Load a skill's full instructions from its SKILL.md. Use when you need detailed guidance on a specific topic.",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"name":{"type":"string","description":"Name of the skill to load"}},"required":["name"]}`),
 	}
@@ -1017,8 +1018,8 @@ func (r *runner) findTool(name string) Tool {
 // Returns nil if the tool is not found (neither built-in nor registered).
 func (r *runner) toolDef(name string) *FunctionDefinition {
 	switch name {
-	case "use_skill":
-		return &builtinUseSkillDef
+	case "load_skill":
+		return &builtinLoadSkillDef
 	case "reload_skills":
 		return &builtinReloadSkillsDef
 	case "recall":
@@ -1309,10 +1310,10 @@ func accumulateStream(reader StreamReader, ch chan<- StreamEvent) (*ChatCompleti
 // ── Built-in skill tools ──
 
 func builtinSkillToolDefs() []FunctionDefinition {
-	return []FunctionDefinition{builtinUseSkillDef, builtinReloadSkillsDef}
+	return []FunctionDefinition{builtinLoadSkillDef, builtinReloadSkillsDef}
 }
 
-func (r *runner) executeUseSkill(ctx context.Context, call ToolCall) Message {
+func (r *runner) executeLoadSkill(ctx context.Context, call ToolCall) Message {
 	var args struct {
 		Name string `json:"name"`
 	}
@@ -1320,14 +1321,14 @@ func (r *runner) executeUseSkill(ctx context.Context, call ToolCall) Message {
 		return Message{
 			Role:       RoleTool,
 			ToolCallID: call.ID,
-			Content:    fmt.Sprintf("use_skill: invalid arguments: %v", err),
+			Content:    fmt.Sprintf("load_skill: invalid arguments: %v", err),
 		}
 	}
 	if args.Name == "" {
 		return Message{
 			Role:       RoleTool,
 			ToolCallID: call.ID,
-			Content:    "use_skill: name is required",
+			Content:    "load_skill: name is required",
 		}
 	}
 
