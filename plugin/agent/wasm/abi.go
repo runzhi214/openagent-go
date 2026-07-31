@@ -141,7 +141,7 @@ type SessionConfig struct {
 // openagent Agent and Session. The Get/Set closures directly read/write
 // Agent and Session fields. setModel is called by runtime_set_model_config
 // to replace a model in the global registry; it may be nil.
-func BuildAgentRuntime(agent *openagent.Agent, session *openagent.Session, setModel func(provider, modelID, apiKey, baseURL string)) *wasmhost.AgentRuntime {
+func BuildAgentRuntime(agent *openagent.Agent, session *openagent.Session, setModel func(provider, modelID, apiKey, baseURL string, contextWindow, maxTokens int)) *wasmhost.AgentRuntime {
 	return &wasmhost.AgentRuntime{
 		SetModel: setModel,
 		Get: func(key string) (string, bool) {

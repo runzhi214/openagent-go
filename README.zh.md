@@ -57,6 +57,24 @@ go build -o openagent-cli ./cmd/cli/
 }
 ```
 
+每个模型条目可以是纯字符串（`"gpt-4o"`），也可以是带 `context_window` 和
+`max_tokens` 覆盖值的对象——当托管平台实际输入限制小于模型原生上下文窗口时使用：
+
+```json
+{
+  "provider": {
+    "huawei": {
+      "api_key": "...",
+      "base_url": "https://...",
+      "models": [
+        {"model_id": "glm-5.2", "context_window": 131072, "max_tokens": 128000},
+        {"model_id": "deepseek-r1-250528", "context_window": 131072, "max_tokens": 262144}
+      ]
+    }
+  }
+}
+```
+
 将 `AGENTS.md` 和 `SOUL.md` 放在 `~/.openagent/profile/` 或 `$(pwd)/.openagent/profile/` 来自定义 agent 的行为。
 
 连接 ACP 客户端（VSCode/Zed 插件）。

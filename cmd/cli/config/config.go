@@ -43,9 +43,39 @@ type SensitiveConfig struct {
 }
 
 type ProviderConfig struct {
-	APIKey  string   `json:"api_key"`
-	BaseURL string   `json:"base_url"`
-	Models  []string `json:"models,omitempty"`
+	APIKey  string    `json:"api_key"`
+	BaseURL string    `json:"base_url"`
+	Models  ModelList `json:"models,omitempty"`
+}
+
+// ModelConfig describes a single model entry. ContextWindow and MaxTokens
+// are optional overrides for the model's context window and max output tokens.
+// When zero, the model's built-in lookup table values are used.
+type ModelConfig struct {
+	ID            string `json:"model_id"`
+	ContextWindow int    `json:"context_window,omitempty"`
+	MaxTokens     int    `json:"max_tokens,omitempty"`
+}
+
+// ModelList is a list of ModelConfig that accepts both the legacy []string
+// format (["model-id"]) and the new []object format ([{"model_id":...}])
+// during JSON unmarshalling, preserving backward compatibility.
+type ModelList []ModelConfig
+
+func (ml *ModelList) UnmarshalJSON(data []byte) error {
+	var legacy []string
+	if err := json.Unmarshal(data, &legacy); err == nil {
+		for _, s := range legacy {
+			*ml = append(*ml, ModelConfig{ID: s})
+		}
+		return nil
+	}
+	var configs []ModelConfig
+	if err := json.Unmarshal(data, &configs); err != nil {
+		return fmt.Errorf("models: expected []string or []object: %w", err)
+	}
+	*ml = configs
+	return nil
 }
 
 type ServerConfig struct {

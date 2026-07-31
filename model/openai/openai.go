@@ -24,6 +24,7 @@ type Model struct {
 	client        openaisdk.Client
 	modelID       string
 	contextWindow int
+	maxTokens     int
 }
 
 // New creates a Model with the given API key, model ID, and base URL.
@@ -45,7 +46,9 @@ func New(apiKey, modelID, baseURL string) *Model {
 
 func (m *Model) WithContextWindow(tokens int) *Model { m.contextWindow = tokens; return m }
 func (m *Model) ContextWindow() int                  { return m.contextWindow }
-func (m *Model) TokenizerModel() string               { return m.modelID }
+func (m *Model) WithMaxTokens(tokens int) *Model     { m.maxTokens = tokens; return m }
+func (m *Model) MaxTokens() int                      { return m.maxTokens }
+func (m *Model) TokenizerModel() string              { return m.modelID }
 
 // modelContextWindow resolves the context window for a model ID. Falls
 // back to the shared model.ContextWindow lookup table.
@@ -58,6 +61,9 @@ func modelContextWindow(modelID string) int {
 
 // Ensure *Model implements the optional TokenizerModeler interface.
 var _ openagent.TokenizerModeler = (*Model)(nil)
+
+// Ensure *Model implements the optional MaxTokensModeler interface.
+var _ openagent.MaxTokensModeler = (*Model)(nil)
 
 func (m *Model) ChatCompletion(ctx context.Context, req openagent.ChatCompletionRequest) (*openagent.ChatCompletionResponse, error) {
 	modelID := req.Model

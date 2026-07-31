@@ -54,7 +54,7 @@ ACP（Agent 通信协议）模式：
 | `fast_model` | 否 | 轻量快速模型 |
 | `provider.<id>.api_key` | 否 | API 密钥；可从 `env` 或系统 keyring 读取 |
 | `provider.<id>.base_url` | 是 | API 端点 |
-| `provider.<id>.models` | 否 | 模型列表；不填则通过 `GET /models` 自动发现 |
+| `provider.<id>.models` | 否 | 模型列表；每项为字符串（`"gpt-4o"`）或对象（`{"model_id":"...","context_window":N,"max_tokens":N}`）；不填则通过 `GET /models` 自动发现 |
 | `server.port` | 否 | 端口（默认 8080） |
 | `plugins` | 否 | 插件目录或 `.wasm` 文件列表（默认 `~/.openagent/plugins`） |
 | `env` | 否 | 进程静态环境变量 |

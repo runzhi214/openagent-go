@@ -48,12 +48,19 @@ func buildModels(providers map[string]config.ProviderConfig) ([]openagent.Model,
 	var models []openagent.Model
 	var infos []modelReg
 	for pid, p := range providers {
-		for _, mid := range p.Models {
+		for _, mc := range p.Models {
+			mid := mc.ID
 			apiKey := p.APIKey
 			if apiKey == "" {
 				apiKey = os.Getenv(strings.ToUpper(pid) + "_API_KEY")
 			}
 			m := openai.New(apiKey, mid, p.BaseURL)
+			if mc.ContextWindow > 0 {
+				m = m.WithContextWindow(mc.ContextWindow)
+			}
+			if mc.MaxTokens > 0 {
+				m = m.WithMaxTokens(mc.MaxTokens)
+			}
 			models = append(models, m)
 			infos = append(infos, modelReg{ID: mid, Provider: pid, Model: m, APIKey: apiKey, BaseURL: p.BaseURL})
 		}

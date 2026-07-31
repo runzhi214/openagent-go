@@ -621,11 +621,23 @@ func (r *runner) prepareMemory(ctx context.Context, session Session) ([]Message,
 }
 
 // estimatePromptOverhead returns the estimated token count of everything
-// BuildPrompt adds BEFORE the working messages. This is subtracted from the
-// working token budget so that the total prompt (overhead + working) fits
+// BuildPrompt adds BEFORE the working messages, plus tool definitions that
+// buildModelRequest attaches. This is subtracted from the working token
+// budget so that the total prompt (overhead + working + tools) fits
 // within the model's context window.
 func (r *runner) estimatePromptOverhead(ctx context.Context, session Session, modelID string) int {
 	var n int
+
+	// Tool definitions — same assembly as buildModelRequest.
+	tools := toolDefinitions(r.agent.SnapshotTools())
+	if len(r.builtinTools) > 0 {
+		tools = append(tools, r.builtinTools...)
+	}
+	for _, def := range tools {
+		n += tokenizer.Count(modelID, def.Name) +
+			tokenizer.Count(modelID, def.Description) +
+			tokenizer.Count(modelID, string(def.Parameters)) + 8
+	}
 
 	// Static context.
 	static := strings.Join(r.agent.SystemPrompts, "\n\n")
@@ -636,9 +648,17 @@ func (r *runner) estimatePromptOverhead(ctx context.Context, session Session, mo
 		n += tokenizer.Count(modelID, static) + 4
 	}
 
-	// Dynamic context — same assembly order as buildPrompt.
+	// Dynamic context preamble (always present in buildPrompt).
+	n += tokenizer.Count(modelID,
+		"\nIMPORTANT: The context below is generated fresh for this turn. "+
+			"If it conflicts with static instructions or earlier conversation, the latest context here is authoritative. "+
+			"Earlier summaries, skill lists, semantic memory, or plan state may be outdated.\n") + 4
+
+	// Skills catalog or "No available skills" fallback.
 	if len(r.skills) > 0 {
 		n += tokenizer.Count(modelID, buildSkillsSection(r.skills)) + 4
+	} else {
+		n += tokenizer.Count(modelID, "\nIMPORTANT: No available skills.") + 4
 	}
 	for name, body := range r.loadedSkills {
 		n += tokenizer.Count(modelID, "## Loaded Skill: "+name+"\n\n"+body) + 4
@@ -656,9 +676,11 @@ func (r *runner) estimatePromptOverhead(ctx context.Context, session Session, mo
 		}
 	}
 
-	// Compressed summary + hints.
+	// Compressed summary + hints, or "no prior conversation history" fallback.
 	if cc, err := r.agent.Memory.Compressed(ctx, session.ID); err == nil && cc != nil && cc.Summary != "" {
 		n += tokenizer.Count(modelID, buildCompressedSection(cc)) + 4
+	} else {
+		n += tokenizer.Count(modelID, "## Conversation Summary\n\n(no prior conversation history)") + 4
 	}
 
 	return n
@@ -799,12 +821,18 @@ func (r *runner) buildModelRequest(session Session, messages []Message) ChatComp
 	if len(r.builtinTools) > 0 {
 		tools = append(tools, r.builtinTools...)
 	}
+	maxTokens := session.MaxTokens
+	if maxTokens == 0 {
+		if mtm, ok := r.runModel.(MaxTokensModeler); ok {
+			maxTokens = mtm.MaxTokens()
+		}
+	}
 	return ChatCompletionRequest{
 		Model:           session.ModelID,
 		Messages:        messages,
 		Tools:           tools,
 		Temperature:     session.Temperature,
-		MaxTokens:       session.MaxTokens,
+		MaxTokens:       maxTokens,
 		ReasoningEffort: r.agent.ReasoningEffort,
 	}
 }

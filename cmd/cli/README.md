@@ -54,7 +54,7 @@ All configuration lives in `~/.openagent/settings.json`. The path can be overrid
 | `fast_model` | No | Lightweight model for quick tasks |
 | `provider.<id>.api_key` | No | API key. Falls back to env `<ID>_API_KEY` or system keyring |
 | `provider.<id>.base_url` | Yes | API endpoint |
-| `provider.<id>.models` | No | Model list. Omit to auto-discover via `GET /models` |
+| `provider.<id>.models` | No | Model list. Each entry is a string (`"gpt-4o"`) or object (`{"model_id":"...","context_window":N,"max_tokens":N}`). Omit to auto-discover via `GET /models` |
 | `server.port` | No | Server port (default: 8080) |
 | `plugins` | No | Plugin directories or `.wasm` files (default: `~/.openagent/plugins`) |
 | `env` | No | Static environment variables for the process |

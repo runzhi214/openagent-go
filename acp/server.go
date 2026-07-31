@@ -314,7 +314,7 @@ var _ openacp.AgentHandler = (*AgentServer)(nil)
 // runtime_set_model_config. When the model already exists, empty apiKey
 // or baseURL preserve the originals; when inserting a new model, values
 // are used as-is.
-func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string) {
+func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string, contextWindow, maxTokens int) {
 	s.modelsMu.Lock()
 	defer s.modelsMu.Unlock()
 	key := provider + "/" + modelID
@@ -329,7 +329,14 @@ func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string) {
 	} else {
 		slog.Info("acp inserting model", "key", key)
 	}
-	s.Models[key] = openai.New(apiKey, modelID, baseURL)
+	m := openai.New(apiKey, modelID, baseURL)
+	if contextWindow > 0 {
+		m = m.WithContextWindow(contextWindow)
+	}
+	if maxTokens > 0 {
+		m = m.WithMaxTokens(maxTokens)
+	}
+	s.Models[key] = m
 	s.modelConfigs[key] = ModelConfig{Provider: provider, ModelID: modelID, APIKey: apiKey, BaseURL: baseURL}
 }
 

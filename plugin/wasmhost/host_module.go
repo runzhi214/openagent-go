@@ -305,8 +305,9 @@ func (h *HostAPI) runtimeSet(ctx context.Context, mod api.Module, key, value str
 }
 
 // runtimeSetModelConfig parses a JSON model_config and calls rt.SetModel.
-// Input: {"provider":"deepseek","model_id":"v4","api_key":"sk-...","base_url":"https://..."}
+// Input: {"provider":"deepseek","model_id":"v4","api_key":"sk-...","base_url":"https://...","context_window":131072,"max_tokens":262144}
 // api_key and base_url are optional — empty values leave the existing ones unchanged.
+// context_window and max_tokens are optional — zero values leave the model defaults unchanged.
 func (h *HostAPI) runtimeSetModelConfig(ctx context.Context, mod api.Module, raw string) uint64 {
 	rt := AgentRuntimeFromContext(ctx)
 	if rt == nil {
@@ -318,10 +319,12 @@ func (h *HostAPI) runtimeSetModelConfig(ctx context.Context, mod api.Module, raw
 		return WriteString(ctx, mod, b)
 	}
 	var mc struct {
-		Provider string `json:"provider"`
-		ModelID  string `json:"model_id"`
-		APIKey   string `json:"api_key"`
-		BaseURL  string `json:"base_url"`
+		Provider      string `json:"provider"`
+		ModelID       string `json:"model_id"`
+		APIKey        string `json:"api_key"`
+		BaseURL       string `json:"base_url"`
+		ContextWindow int    `json:"context_window"`
+		MaxTokens     int    `json:"max_tokens"`
 	}
 	if err := json.Unmarshal([]byte(raw), &mc); err != nil {
 		b, _ := json.Marshal(map[string]string{"error": err.Error()})
@@ -331,7 +334,7 @@ func (h *HostAPI) runtimeSetModelConfig(ctx context.Context, mod api.Module, raw
 		b, _ := json.Marshal(map[string]string{"error": "provider and model_id are required"})
 		return WriteString(ctx, mod, b)
 	}
-	rt.SetModel(mc.Provider, mc.ModelID, mc.APIKey, mc.BaseURL)
+	rt.SetModel(mc.Provider, mc.ModelID, mc.APIKey, mc.BaseURL, mc.ContextWindow, mc.MaxTokens)
 	b, _ := json.Marshal(map[string]string{})
 	return WriteString(ctx, mod, b)
 }

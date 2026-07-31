@@ -62,6 +62,13 @@ type TokenizerModeler interface {
 	TokenizerModel() string
 }
 
+// MaxTokensModeler is an optional interface for Models that have a
+// configured max output tokens. The Runner uses this as a default when
+// session.MaxTokens is not explicitly set.
+type MaxTokensModeler interface {
+	MaxTokens() int
+}
+
 // ── Streaming types ──
 
 // StreamReader is an iterator over response deltas.

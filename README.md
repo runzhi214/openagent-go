@@ -57,6 +57,25 @@ Create `~/.openagent/settings.json`:
 }
 ```
 
+Each model entry can be a plain string (`"gpt-4o"`) or an object with
+`context_window` and `max_tokens` overrides — useful when a hosting platform
+enforces a smaller input limit than the model's native context window:
+
+```json
+{
+  "provider": {
+    "huawei": {
+      "api_key": "...",
+      "base_url": "https://...",
+      "models": [
+        {"model_id": "glm-5.2", "context_window": 131072, "max_tokens": 128000},
+        {"model_id": "deepseek-r1-250528", "context_window": 131072, "max_tokens": 262144}
+      ]
+    }
+  }
+}
+```
+
 Put `AGENTS.md` and `SOUL.md` in `~/.openagent/profile/` or `$(pwd)/.openagent/profile/` to customise the agent's behaviour.
 
 Connect an ACP client (VSCode/Zed plugin).
