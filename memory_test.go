@@ -4,69 +4,75 @@ import "testing"
 
 func TestSafeCompressionBoundary_AssistantToolPair(t *testing.T) {
 	// Boundary lands on an assistant-with-tool_calls: extend to include
-	// the trailing tool results, then forward-scan finds user at [3].
+	// the trailing tool results.
 	msgs := []Message{
 		{Role: RoleUser, Content: "u1"},
 		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "t1"}}},
 		{Role: RoleTool, ToolCallID: "t1"},
 		{Role: RoleUser, Content: "u2"},
 	}
-	// overflow=2 → extend past tool result → 3 → forward-scan: all[3] is user → 3
+	// overflow=2 → extend past tool result → 3 (no user forward-scan)
 	got := SafeCompressionBoundary(msgs, 2)
 	if got != 3 {
 		t.Fatalf("expected 3, got %d", got)
 	}
 }
 
-func TestSafeCompressionBoundary_ExtendsToNextUser(t *testing.T) {
-	// overflow lands between two users, on an assistant. Forward-scan
-	// moves overflow to the next user.
+func TestSafeCompressionBoundary_NoForwardScanToNextUser(t *testing.T) {
+	// overflow lands between two users, on an assistant. Previously the
+	// forward-scan moved overflow to the next user (4); now it stays put
+	// — the user-first invariant is handled by ensureValidWorkingSet.
 	msgs := []Message{
 		{Role: RoleUser, Content: "u1"},
 		{Role: RoleAssistant, Content: "a1"},
 		{Role: RoleAssistant, Content: "a2"},
 		{Role: RoleAssistant, Content: "a3"}, // overflow points here
-		{Role: RoleUser, Content: "u2"},      // next user — boundary lands here
+		{Role: RoleUser, Content: "u2"},      // no longer scanned to
 		{Role: RoleAssistant, Content: "a4"},
 	}
 	got := SafeCompressionBoundary(msgs, 3)
-	if got != 4 {
-		t.Fatalf("expected 4 (next user), got %d", got)
+	if got != 3 {
+		t.Fatalf("expected 3 (no user forward-scan), got %d", got)
 	}
 }
 
-func TestSafeCompressionBoundary_NoUserCompressesAll(t *testing.T) {
-	// No user message after overflow — invariant says compress everything
-	// (working set is empty; caller injects a placeholder).
+func TestSafeCompressionBoundary_NoUserKeepsOverflow(t *testing.T) {
+	// No user message after overflow — previously compressed everything
+	// (len(all)); now keeps overflow as-is. The working set may start with
+	// assistant/tool; ensureValidWorkingSet handles the user-first invariant.
 	msgs := []Message{
 		{Role: RoleUser, Content: "u1"},
 		{Role: RoleAssistant, Content: "a1"},
 		{Role: RoleAssistant, Content: "a2"},
 	}
-	// overflow=2 → forward-scan from 2 → no user → len(all)=3
+	// overflow=2 → stays 2 (previously pushed to 3)
 	got := SafeCompressionBoundary(msgs, 2)
-	if got != 3 {
-		t.Fatalf("expected 3 (compress all, no user after), got %d", got)
+	if got != 2 {
+		t.Fatalf("expected 2 (no full compression), got %d", got)
 	}
 }
 
-func TestSafeCompressionBoundary_SingleUserCompressesAll(t *testing.T) {
-	// The production regression: one user + long assistant→tool chain.
-	// 80% scan sets overflow past the only user. Forward-scan finds no
-	// more users → compress all → working set empty → placeholder injected.
+func TestSafeCompressionBoundary_SingleUserKeepsRetention(t *testing.T) {
+	// The autonomous-task regression: one user + long assistant→tool chain.
+	// Previously the forward-scan found no more users → compress all →
+	// working set empty. Now overflow stays at the tool-pair boundary,
+	// retaining the recent messages. ensureValidWorkingSet handles the
+	// user-first invariant in the prompt assembly stage.
 	msgs := []Message{
-		{Role: RoleUser, Content: "the only user"},
-		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "t1"}}},
-		{Role: RoleTool, ToolCallID: "t1"},
-		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "t2"}}},
-		{Role: RoleTool, ToolCallID: "t2"},
-		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "t3"}}},
-		{Role: RoleTool, ToolCallID: "t3"},
+		{Role: RoleUser, Content: "the only user"},               // 0
+		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "t1"}}}, // 1
+		{Role: RoleTool, ToolCallID: "t1"},                       // 2
+		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "t2"}}}, // 3
+		{Role: RoleTool, ToolCallID: "t2"},                       // 4
+		{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "t3"}}}, // 5
+		{Role: RoleTool, ToolCallID: "t3"},                       // 6
 	}
-	// overflow=6 → forward-scan from 6 → no user → len(all)=7
-	got := SafeCompressionBoundary(msgs, 6)
-	if got != 7 {
-		t.Fatalf("expected 7 (compress all), got %d — working set must be empty", got)
+	// overflow=4: lastCompressed=all[3] (assistant+tool_calls) → extend
+	// past tool result at [4] → overflow=5. No user forward-scan —
+	// previously this would have pushed to len(all)=7.
+	got := SafeCompressionBoundary(msgs, 4)
+	if got != 5 {
+		t.Fatalf("expected 5 (tool-pair extension only, no user scan), got %d", got)
 	}
 }
 

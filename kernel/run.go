@@ -146,7 +146,10 @@ func (rt *Runtime) run(ctx context.Context, session openagent.Session, prefix []
 			workingMessages = append(workingMessages, messages...)
 			// Strip the just-appended input so history is history.
 			workingMessages = ctxpkg.ExcludeInput(workingMessages, input)
-			// Orphan cleanup: leading assistant tool_calls without results.
+			// Ensure user-first before orphan trim (same rationale as the
+			// turn > 0 path above — see comment there).
+			workingMessages = ensureValidWorkingSet(workingMessages)
+			// Orphan cleanup: incomplete assistant tool_calls groups.
 			workingMessages = ctxpkg.TrimOrphanToolCalls(workingMessages)
 			rt.compressed = ci.compressed
 			rt.emitCompactionResult(ctx, ch, ci, "compaction failed")
@@ -182,18 +185,19 @@ func (rt *Runtime) run(ctx context.Context, session openagent.Session, prefix []
 				// Best-effort: keep the existing working set. The hard
 				// window check below surfaces any overflow (fail-loud).
 			} else {
-				workingMessages = ctxpkg.TrimOrphanToolCalls(messages)
+				// ensureValidWorkingSet must run BEFORE TrimOrphanToolCalls:
+				// SafeCompressionBoundary no longer forces the working set to
+				// start with a user, so the retained 20% may begin with
+				// assistant/tool. TrimOrphanToolCalls' head-stripping would
+				// delete those complete assistant→tool pairs (it strips
+				// leading assistant tool_calls "regardless of completeness"),
+				// losing the recently retained context — the exact problem
+				// that 100% compression caused. Prepending a transient user
+				// prevents the head-stripping loop from entering.
+				workingMessages = ensureValidWorkingSet(messages)
+				workingMessages = ctxpkg.TrimOrphanToolCalls(workingMessages)
 				rt.compressed = ci.compressed
 				rt.emitCompactionResult(ctx, ch, ci, "tool-turn compaction failed")
-				// After compaction + orphan trim the working set can be empty
-				// (the summary absorbed every user message, and the remaining
-				// assistant→tool pairs were orphan-trimmed). A prompt with
-				// only system/assistant messages is rejected by most providers
-				// ("must contain at least one 'user' or 'tool' role"). Inject
-				// a synthetic <system-reminder> user pointing the model at the
-				// summary. Turn 0 is exempt — it appends the live user input
-				// below (L154).
-				workingMessages = ensureValidWorkingSet(workingMessages)
 			}
 		}
 
@@ -550,15 +554,27 @@ func (rt *Runtime) observe(ctx context.Context, stage string, phase string, deta
 	})
 }
 
-// ensureValidWorkingSet injects a <system-reminder> user placeholder when
-// the working set is empty after compaction + TrimOrphanToolCalls.
+// ensureValidWorkingSet guarantees the working set starts with a user or
+// system message, injecting a <system-reminder> user placeholder when needed.
 //
-// SafeCompressionBoundary guarantees the working set EITHER starts with a
-// user message OR is empty (it pushes overflow past the last message when no
-// user follows). TrimOrphanToolCalls may then delete an all-assistant/tool
-// working set down to empty. An empty working set means the prompt has only
-// system messages (static + dynamic + summary), which providers reject
-// ("must contain at least one 'user' or 'tool' role").
+// SafeCompressionBoundary no longer enforces a user-first invariant (it only
+// protects tool_call/tool_result pairs). After compaction the retained working
+// set may start with assistant or tool messages — e.g. in an autonomous task
+// (one user + long assistant→tool chain), the 80% retain point leaves recent
+// assistant/tool messages at the head. Most providers reject a message array
+// that starts with assistant ("must contain at least one 'user' or 'tool'
+// role"), and TrimOrphanToolCalls would delete an all-assistant/tool head down
+// to empty.
+//
+// This function is the SINGLE owner of the user-first invariant. It must run
+// BEFORE TrimOrphanToolCalls so the head-stripping loop (which deletes leading
+// assistant tool_calls groups regardless of completeness) does not fire — a
+// user at position 0 prevents the loop from entering.
+//
+// Three cases:
+//   - working set already starts with user/system → unchanged
+//   - working set is empty → inject a single transient user
+//   - working set starts with assistant/tool → prepend a transient user
 //
 // The <system-reminder> tag is the project's existing pattern for injected
 // environment events (sub-agent completions use it — subagent_notify.go).
@@ -567,17 +583,21 @@ func (rt *Runtime) observe(ctx context.Context, stage string, phase string, deta
 // (commit skips it); the next turn re-fetches from the store, and the
 // summary carries the real history.
 func ensureValidWorkingSet(msgs []openagent.Message) []openagent.Message {
-	if len(msgs) > 0 {
+	if len(msgs) > 0 && (msgs[0].Role == openagent.RoleUser || msgs[0].Role == openagent.RoleSystem) {
 		return msgs
 	}
-	return []openagent.Message{{
+	placeholder := openagent.Message{
 		Role: openagent.RoleUser,
 		Content: "<system-reminder>\n" +
 			"Earlier conversation history has been compacted into the summary above. " +
 			"Continue the task based on the summary and any remaining working messages.\n" +
 			"</system-reminder>",
 		Transient: true,
-	}}
+	}
+	if len(msgs) == 0 {
+		return []openagent.Message{placeholder}
+	}
+	return append([]openagent.Message{placeholder}, msgs...)
 }
 
 // commit appends a message to memory (Transient messages and nil memory skip).
