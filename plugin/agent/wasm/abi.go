@@ -160,6 +160,13 @@ func BuildAgentRuntime(rt *kernel.Runtime, session *openagent.Session, setModel 
 				return session.ModelID, true
 			case wasmhost.RuntimeKeyProvider:
 				return session.Provider, true
+			case wasmhost.RuntimeKeyContextUsage:
+				pb := rt.PromptBreakdown()
+				if pb == nil {
+					return "", false
+				}
+				b, _ := json.Marshal(pb)
+				return string(b), true
 			default:
 				if strings.HasPrefix(key, wasmhost.RuntimeKeyMetadataPrefix) {
 					k := strings.TrimPrefix(key, wasmhost.RuntimeKeyMetadataPrefix)

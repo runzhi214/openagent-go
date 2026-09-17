@@ -145,6 +145,11 @@ type Runtime struct {
 	execution      execution.Runtime
 	context        ctxpkg.Runtime
 	state          *ctxpkg.RuntimeState
+
+	// promptBreakdown is the per-layer token breakdown of the last-built
+	// prompt. Set by buildPrompt + run(), read by PromptBreakdown() and
+	// the StagePromptBuild observer event. Guarded by mu.
+	promptBreakdown *PromptBreakdown
 }
 
 // SubAgentRegistry returns the session's child registry, or nil when no
@@ -152,6 +157,22 @@ type Runtime struct {
 // completion callback for async sub-agent notifications.
 func (rt *Runtime) SubAgentRegistry() *childRegistry {
 	return rt.deps.SubAgentRegistry
+}
+
+// PromptBreakdown is the per-layer token breakdown of a built prompt.
+// It mirrors the prompt assembly structure: static context (system prompts
+// + project context), dynamic context (skills, memories, resources, plan
+// state — excluding the summary), compressed summary, working messages,
+// and tool definitions. The total is the sum of all layers; the context
+// window is the model's limit.
+type PromptBreakdown struct {
+	SystemTokens  int `json:"system_tokens"`
+	DynamicTokens int `json:"dynamic_tokens"`
+	SummaryTokens int `json:"summary_tokens"`
+	WorkingTokens int `json:"working_tokens"`
+	ToolTokens    int `json:"tool_tokens"`
+	TotalTokens   int `json:"total_tokens"`
+	ContextWindow int `json:"context_window"`
 }
 
 // New creates a Runtime from an agent config and dependencies.
@@ -246,6 +267,24 @@ func (rt *Runtime) Model() openagent.Model {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 	return rt.runModel
+}
+
+// PromptBreakdown returns the per-layer token breakdown of the last-built
+// prompt, or nil if no prompt has been built yet. The JSON form is used by
+// the WASM host export runtime_context_usage.
+func (rt *Runtime) PromptBreakdown() *PromptBreakdown {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.promptBreakdown
+}
+
+// SetPromptBreakdown stores the per-layer token breakdown. Called by
+// buildPrompt (system/dynamic/summary layers) and run() (working/tool/
+// total/window layers). Guarded by mu.
+func (rt *Runtime) SetPromptBreakdown(pb *PromptBreakdown) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.promptBreakdown = pb
 }
 
 // SetSystemPrompts overrides the agent's system prompts for this runtime

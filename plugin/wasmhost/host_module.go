@@ -433,6 +433,11 @@ func (h *HostAPI) RegisterHostModule(ctx context.Context, rt wazero.Runtime) err
 		}).
 		Export("runtime_provider").
 		NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, mod api.Module) uint64 {
+			return h.runtimeGet(ctx, mod, RuntimeKeyContextUsage)
+		}).
+		Export("runtime_context_usage").
+		NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, mod api.Module, keyPtr, keyLen uint32) uint64 {
 			key := read(mod, keyPtr, keyLen)
 			return h.runtimeGet(ctx, mod, RuntimeKeyMetadataPrefix+key)

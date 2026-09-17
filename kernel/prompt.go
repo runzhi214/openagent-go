@@ -18,6 +18,8 @@ import (
 // via the agent's PromptBuilder. The builder's error is surfaced (not
 // silently dropped) — an empty prompt must not silently reach the model.
 func (rt *Runtime) buildPrompt(ctx context.Context, session openagent.Session, ac *ctxpkg.AgentContext) ([]openagent.Message, error) {
+	modelID := openagent.TokenizerModelID(rt.Model())
+
 	// ── Static context (assembled once per run, never changes) ──
 	// Snapshot under the lock: SetSystemPrompts (wasm runtime_set export)
 	// can run concurrently from a tool callback.
@@ -67,19 +69,31 @@ Date today: %s
 	// MaxCompressedTokens is enforced HERE (the only place the summary
 	// enters the prompt); the summarizer backend uses it as a target, but
 	// the prompt must never carry an oversized summary.
+	var summarySection string
 	if rt.compressed != nil && rt.compressed.Summary != "" {
-		section := buildCompressedSection(rt.compressed)
+		summarySection = buildCompressedSection(rt.compressed)
 		// MaxCompressedTokens is immutable after New, but the summary
 		// section uses rt.runModel which the run snapshots under the lock.
 		if rt.cfg.MaxCompressedTokens > 0 {
-			if n := tokenizer.Count(openagent.TokenizerModelID(rt.Model()), section); n > rt.cfg.MaxCompressedTokens {
-				section = truncateTokens(section, rt.cfg.MaxCompressedTokens) + "\n\n[summary truncated: exceeds MaxCompressedTokens]"
+			if n := tokenizer.Count(modelID, summarySection); n > rt.cfg.MaxCompressedTokens {
+				summarySection = truncateTokens(summarySection, rt.cfg.MaxCompressedTokens) + "\n\n[summary truncated: exceeds MaxCompressedTokens]"
 			}
 		}
-		dynamicParts = append(dynamicParts, section)
+		dynamicParts = append(dynamicParts, summarySection)
 	} else {
-		dynamicParts = append(dynamicParts, "## Conversation Summary\n\n(no prior conversation history)")
+		summarySection = "## Conversation Summary\n\n(no prior conversation history)"
+		dynamicParts = append(dynamicParts, summarySection)
 	}
+
+	// ── Per-layer token breakdown (system/dynamic/summary layers) ──
+	// run() completes the remaining layers (working/tool/total/window).
+	dynamicText := strings.Join(dynamicParts[:len(dynamicParts)-1], "\n\n")
+	pb := &PromptBreakdown{
+		SystemTokens: tokenizer.Count(modelID, static) + 4,
+		DynamicTokens: tokenizer.Count(modelID, dynamicText) + 4,
+		SummaryTokens: tokenizer.Count(modelID, summarySection) + 4,
+	}
+	rt.SetPromptBreakdown(pb)
 
 	input := openagent.PromptInput{
 		StaticContext:   static,

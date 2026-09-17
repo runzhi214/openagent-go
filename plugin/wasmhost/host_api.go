@@ -110,12 +110,13 @@ type AgentRuntime struct {
 
 // Runtime key constants used by AgentRuntime.Get/Set.
 const (
-	RuntimeKeySessionID      = "session_id"
-	RuntimeKeyUserID         = "user_id"
-	RuntimeKeyTurnCount      = "turn_count"
-	RuntimeKeyModelID        = "model_id"
-	RuntimeKeyProvider       = "provider"
-	RuntimeKeyMetadataPrefix = "metadata." // Get("metadata.foo") / Set("metadata.foo", "bar")
+	RuntimeKeySessionID       = "session_id"
+	RuntimeKeyUserID          = "user_id"
+	RuntimeKeyTurnCount       = "turn_count"
+	RuntimeKeyModelID         = "model_id"
+	RuntimeKeyProvider        = "provider"
+	RuntimeKeyContextUsage    = "context_usage" // JSON PromptBreakdown from the last-built prompt
+	RuntimeKeyMetadataPrefix  = "metadata."     // Get("metadata.foo") / Set("metadata.foo", "bar")
 )
 
 // HostAPI bundles host-provided capabilities available to WASM plugins

@@ -2,6 +2,7 @@ package kernel
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
@@ -12,6 +13,7 @@ import (
 	ctxpkg "github.com/yusheng-g/openagent-go/context"
 	"github.com/yusheng-g/openagent-go/eventbus"
 	"github.com/yusheng-g/openagent-go/governance"
+	"github.com/yusheng-g/openagent-go/tokenizer"
 )
 
 // run is the 8-node mainline loop. It orchestrates; each node is a method
@@ -207,13 +209,39 @@ func (rt *Runtime) run(ctx context.Context, session openagent.Session, prefix []
 		prompt, err := rt.buildPrompt(ctx, session, ac)
 		// Composition counts (skills/memories/resources) let observers
 		// attribute prompt growth to a context source without inspecting
-		// the content.
+		// the content. Per-layer token breakdown lets observers track
+		// context usage without a separate query.
+		modelID := openagent.TokenizerModelID(rt.runModel)
+		promptTokens := openagent.CountMessages(modelID, prompt)
+		var toolTokens, workingTokens, contextWindow int
+		if tools := append(toolDefinitions(rt.SnapshotTools()), rt.builtinTools...); len(tools) > 0 {
+			if b, e := json.Marshal(tools); e == nil {
+				toolTokens = tokenizer.Count(modelID, string(b))
+			}
+		}
+		workingTokens = openagent.CountMessages(modelID, ac.Messages)
+		if rt.runModel != nil {
+			contextWindow = rt.runModel.ContextWindow()
+		}
+		if pb := rt.PromptBreakdown(); pb != nil {
+			pb.WorkingTokens = workingTokens
+			pb.ToolTokens = toolTokens
+			pb.TotalTokens = promptTokens + toolTokens
+			pb.ContextWindow = contextWindow
+			rt.SetPromptBreakdown(pb)
+		}
 		rt.observe(ctx, openagent.StagePromptBuild, "leave", map[string]any{
-			"messages":  len(prompt),
-			"tokens":    openagent.CountMessages(openagent.TokenizerModelID(rt.runModel), prompt),
-			"skills":    len(ac.Skills),
-			"memories":  len(ac.Memories),
-			"resources": len(ac.Resources),
+			"messages":        len(prompt),
+			"tokens":          promptTokens,
+			"system_tokens":   rt.promptBreakdown.SystemTokens,
+			"dynamic_tokens":  rt.promptBreakdown.DynamicTokens,
+			"summary_tokens":  rt.promptBreakdown.SummaryTokens,
+			"working_tokens":  workingTokens,
+			"tool_tokens":     toolTokens,
+			"context_window":  contextWindow,
+			"skills":          len(ac.Skills),
+			"memories":        len(ac.Memories),
+			"resources":       len(ac.Resources),
 		}, pStart, err)
 		if err != nil {
 			slog.Error("prompt build failed", "error", err)
