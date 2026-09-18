@@ -22,21 +22,16 @@ type CompressedContext struct {
 // include all consecutive tool results so the summary captures the complete
 // tool exchange. all is in chronological order.
 //
-// It also guarantees an invariant: after compaction the retained working set
-// (all[overflow:]) EITHER starts with a user message OR is empty. This is
-// enforced by scanning forward from overflow to the next user message:
-//   - found → overflow lands on that user (it stays in the working set)
-//   - not found → overflow is pushed to len(all) (everything compressed,
-//     working set is empty; the caller injects a <system-reminder> user
-//     placeholder via ensureValidWorkingSet)
+// The user-first invariant (working set must start with a user message for
+// provider compatibility) is NOT enforced here — that responsibility belongs
+// to ensureValidWorkingSet in the prompt assembly stage. Mixing the two
+// concerns here caused 100% compression in autonomous tasks (one user + long
+// assistant→tool chain): the forward scan found no user after overflow and
+// pushed to len(all), compressing everything and leaving the working set
+// empty every turn.
 //
-// Without this, an 80% compaction on a session with one user + a long
-// assistant→tool chain compresses the only user into the summary, leaving a
-// working set of pure assistant/tool messages that providers reject ("must
-// contain at least one 'user' or 'tool' role") and that TrimOrphanToolCalls
-// may delete to empty anyway.
-//
-// Returns the adjusted overflow index (may be larger than input).
+// Returns the adjusted overflow index (may be larger than input, but only
+// due to tool-pair extension — never pushed to len(all) for user-scanning).
 func SafeCompressionBoundary(all []Message, overflow int) int {
 	if overflow <= 0 || overflow >= len(all) {
 		return overflow
@@ -58,12 +53,5 @@ func SafeCompressionBoundary(all []Message, overflow int) int {
 		}
 	}
 
-	// Invariant: working set starts with a user message or is empty.
-	// Scan forward for the next user; if none exists, compress everything.
-	for i := overflow; i < len(all); i++ {
-		if all[i].Role == RoleUser {
-			return i // user found — keep it as the first working message
-		}
-	}
-	return len(all) // no user after overflow — compress all, working set is empty
+	return overflow
 }
