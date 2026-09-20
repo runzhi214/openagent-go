@@ -138,6 +138,30 @@ func RunREST(ctx context.Context, cfg *config.Config) error {
 		handler.RegisterModel(mi.ID, mi.Model, mi.Provider, mi.APIKey, mi.BaseURL)
 	}
 
+	// Wire lazy model reload: when the server starts with zero models
+	// (both settings.json and cli:settings plugins returned nothing at
+	// startup), tryReloadModels re-runs the cli:settings plugins' init
+	// export at request time to recover models from external state
+	// (keyring, env, files) that may have changed since process start.
+	// No-op when no cli:settings plugins are configured.
+	if mods := loadSettingsPluginModules(); len(mods) > 0 {
+		handler.SetModelReloadFn(buildModelReloadFn(mods,
+			func(mi modelReg) {
+				handler.RegisterModel(mi.ID, mi.Model, mi.Provider, mi.APIKey, mi.BaseURL)
+				handler.SetModel(mi.Provider, mi.ID, mi.APIKey, mi.BaseURL,
+					mi.MaxInputTokens, mi.MaxOutputTokens)
+			},
+			func(first modelReg) {
+				if handler.DefaultModel() == nil {
+					handler.SetDefaultModel(first.Model)
+					slog.Info("model reload: set default model", "key", first.Key())
+				}
+			},
+		))
+		slog.Info("model reload: lazy reload wired for REST",
+			"settings_plugin_count", len(mods))
+	}
+
 	// Plugin manager — loads agent:tools and agent:observers plugins.
 	// Scheduled jobs declared by plugins fire on a process-local scheduler
 	// that lives for the server's lifetime.

@@ -24,6 +24,7 @@ import (
 	sloghooks "github.com/yusheng-g/openagent-go/hooks/slog"
 	"github.com/yusheng-g/openagent-go/kernel"
 	"github.com/yusheng-g/openagent-go/model/openai"
+	cliwasm "github.com/yusheng-g/openagent-go/plugin/cli/wasm"
 	memorysqlite "github.com/yusheng-g/openagent-go/provider/memory/sqlite"
 	openviking "github.com/yusheng-g/openagent-go/provider/openviking"
 	"github.com/yusheng-g/openagent-go/provider/skill"
@@ -174,6 +175,98 @@ func resolveModel(cfgModel string, infos []modelReg) openagent.Model {
 		}
 	}
 	return nil
+}
+
+// buildModelReloadFn constructs a lazy model reload callback that:
+//  1. Re-reads settings.json from disk (the file may have been edited
+//     since startup).
+//  2. Pipes the raw bytes through each cli:settings plugin's init export
+//     (same as loadPlugins does at startup, but with live external state).
+//  3. Expands ${ENV} references and parses the merged result.
+//  4. Calls buildModels + register for each model found.
+//
+// The register callback is caller-specific: ACP calls srv.SetModel +
+// srv.RegisterModel; REST calls handler.RegisterModel + handler.SetModel.
+// The postReload callback receives the first modelReg (not just the key
+// string) so callers have direct access to the Model instance and
+// provider/ID fields without re-parsing the composite key.
+//
+// Returns an unnamed func(ctx context.Context) bool so it can be passed
+// to both acp.AgentServer.SetModelReloadFn (which accepts the named type
+// acp.ModelReloadFunc, same underlying type) and rest.Handler.SetModelReloadFn
+// (which accepts the unnamed type directly) without explicit conversion.
+func buildModelReloadFn(
+	mods []*cliwasm.Module,
+	register func(mi modelReg),
+	postReload func(firstModel modelReg),
+) func(ctx context.Context) bool {
+	return func(ctx context.Context) bool {
+		if len(mods) == 0 {
+			slog.Debug("model reload: no settings plugins, skipping")
+			return false
+		}
+
+		// Step 1: re-read settings.json from disk.
+		cfgPath := config.Path()
+		raw, err := os.ReadFile(cfgPath)
+		if err != nil {
+			slog.Warn("model reload: failed to read settings.json",
+				"path", cfgPath, "error", err)
+			return false
+		}
+		if len(raw) == 0 {
+			raw = []byte("{}")
+		}
+		slog.Info("model reload: read settings.json",
+			"path", cfgPath, "bytes", len(raw), "plugin_count", len(mods))
+
+		// Step 2: pipe through each cli:settings plugin's init export.
+		// This mirrors loadPlugins: each plugin receives the current
+		// merged bytes and returns updated bytes with its provider
+		// entries injected. The plugins are called in the same order
+		// as at startup (slice order is preserved from loadPlugins).
+		for i, mod := range mods {
+			slog.Info("model reload: running settings plugin",
+				"plugin_index", i, "total_plugins", len(mods))
+			merged, err := mod.CallInit(ctx, raw)
+			if err != nil {
+				slog.Warn("model reload: plugin init error, skipping plugin",
+					"plugin_index", i, "error", err)
+				continue
+			}
+			raw = merged
+		}
+
+		// Step 3: expand ${ENV} references and parse the merged result.
+		raw, warns := config.ExpandBytes(raw)
+		for _, w := range warns {
+			slog.Warn("model reload: env var referenced but not set", "var", w)
+		}
+		var newCfg config.Config
+		if err := json.Unmarshal(raw, &newCfg); err != nil {
+			slog.Warn("model reload: failed to parse merged settings", "error", err)
+			return false
+		}
+		slog.Info("model reload: parsed merged config",
+			"provider_count", len(newCfg.Provider))
+
+		// Step 4: build models and register each one.
+		_, infos := buildModels(newCfg.Provider)
+		if len(infos) == 0 {
+			slog.Warn("model reload: no models found after plugin re-init",
+				"provider_count", len(newCfg.Provider))
+			return false
+		}
+		for _, mi := range infos {
+			slog.Info("model reload: registering model",
+				"key", mi.Key(), "provider", mi.Provider, "model_id", mi.ID)
+			register(mi)
+		}
+
+		// Notify the caller that models are now registered.
+		postReload(infos[0])
+		return true
+	}
 }
 
 // applyContextProviders selects the provider backend per capability.
@@ -743,6 +836,34 @@ var activeWatcher atomic.Pointer[settingsWatcher]
 // server startup (ACP and REST). atomic.Pointer for thread safety —
 // written once at startup, read from session goroutines.
 var settingsReloadFn atomic.Pointer[func(ctx context.Context) acp.ReloadResult]
+
+// settingsPluginModules holds the cli:settings WASM modules loaded at
+// startup, so they can be re-invoked at request time for lazy model
+// recovery. Set by SetSettingsPluginModules (called from main() after
+// loadPlugins returns). nil/empty when no cli:settings plugins are
+// configured — tryReloadModels becomes a no-op in that case.
+//
+// The modules remain callable for the process lifetime because the WASM
+// runtime is only closed at process exit (defer cleanup() in main).
+// Module.CallInit is stateless — each call allocates/frees its own guest
+// buffers via the shared ABI helper, so concurrent calls are safe.
+var settingsPluginModules atomic.Pointer[[]*cliwasm.Module]
+
+// SetSettingsPluginModules stores the cli:settings plugin modules for
+// lazy model reload. Called once from main() after loadPlugins returns.
+func SetSettingsPluginModules(mods []*cliwasm.Module) {
+	settingsPluginModules.Store(&mods)
+}
+
+// loadSettingsPluginModules returns the stored settings plugin modules
+// or nil when none are configured.
+func loadSettingsPluginModules() []*cliwasm.Module {
+	mods := settingsPluginModules.Load()
+	if mods == nil {
+		return nil
+	}
+	return *mods
+}
 
 // loadSettingsReloadFn returns the current reload function or nil.
 func loadSettingsReloadFn() func(ctx context.Context) acp.ReloadResult {

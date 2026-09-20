@@ -153,6 +153,18 @@ type AgentServer struct {
 	// (auto-allow safe calls, prompt for destructive). Configured via
 	// settings "default_mode": "auto" | "semi-auto" | "manual" | "plan".
 	DefaultMode string
+
+	// modelReloadFn re-runs cli:settings plugins to recover models that
+	// were unavailable at startup. Returns true if at least one model was
+	// registered. nil when no cli:settings plugins are configured.
+	// Triggered once per prompt that finds no model (see tryReloadModels).
+	modelReloadFn ModelReloadFunc
+
+	// modelReloadMu serializes concurrent reload attempts so that N
+	// prompts arriving simultaneously don't each independently fire the
+	// plugin init pipeline — the first one runs, the rest wait and then
+	// see the registry already has models.
+	modelReloadMu sync.Mutex
 }
 
 // defaultMode resolves the configured default mode.
@@ -790,6 +802,91 @@ func (s *AgentServer) switchSessionModel(ss *agentSession, m openagent.Model) {
 	// ACP mode, so they pick up registry updates automatically — no need
 	// to call SetModel here. rt.SetModel above updates the session runtime,
 	// which is the per-session model switch.
+}
+
+// ── Lazy model reload ──
+
+// ModelReloadFunc re-runs cli:settings plugins against the current
+// settings.json and registers any models they inject into the AgentServer's
+// model registry. Returns true if at least one model was registered.
+type ModelReloadFunc func(ctx context.Context) bool
+
+// SetModelReloadFn injects the lazy model reload callback. Called by
+// BuildACPServer when cli:settings plugin modules are available. When not
+// set (nil), tryReloadModels is a no-op.
+func (s *AgentServer) SetModelReloadFn(fn ModelReloadFunc) {
+	s.modelReloadFn = fn
+}
+
+// tryReloadModels attempts to re-run cli:settings plugins to recover models
+// that were unavailable at startup. Called once per prompt that finds no
+// model — no retry loop, no permanent state. If the reload fails, the prompt
+// proceeds with no model (errNoModel) and the next prompt will try again.
+//
+// Concurrency: modelReloadMu serializes concurrent calls so only one
+// goroutine runs the plugin pipeline; others wait, then check the registry
+// and return without re-running.
+func (s *AgentServer) tryReloadModels(ctx context.Context) bool {
+	if s.modelReloadFn == nil {
+		return false
+	}
+
+	// Fast path: registry already has models (previous reload succeeded).
+	if s.hasModels() {
+		return true
+	}
+
+	s.modelReloadMu.Lock()
+	defer s.modelReloadMu.Unlock()
+
+	// Re-check after lock — another goroutine may have succeeded while
+	// we were waiting.
+	if s.hasModels() {
+		return true
+	}
+
+	start := time.Now()
+	slog.Info("model reload: attempting plugin re-init")
+
+	loaded := false
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				slog.Error("model reload: panic recovered",
+					"error", panicToMsg(rec),
+					"elapsed_ms", time.Since(start).Milliseconds())
+			}
+		}()
+		loaded = s.modelReloadFn(ctx)
+	}()
+
+	if loaded {
+		slog.Info("model reload: succeeded, models registered",
+			"elapsed_ms", time.Since(start).Milliseconds())
+	} else {
+		slog.Warn("model reload: failed, will retry on next prompt",
+			"elapsed_ms", time.Since(start).Milliseconds())
+	}
+	return loaded
+}
+
+// hasModels reports whether the model registry has at least one entry.
+func (s *AgentServer) hasModels() bool {
+	s.modelsMu.Lock()
+	defer s.modelsMu.Unlock()
+	return len(s.Models) > 0
+}
+
+// panicToMsg converts a recovered panic value to a string for logging.
+func panicToMsg(rec any) string {
+	switch v := rec.(type) {
+	case error:
+		return v.Error()
+	case string:
+		return v
+	default:
+		return fmt.Sprintf("%v", rec)
+	}
 }
 
 // ── Client capability helpers ──
@@ -2046,6 +2143,37 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 			"mode":                  ss.Mode(),
 		},
 		DynamicContext: s.buildDynamicContext(ss),
+	}
+
+	// Lazy model recovery: re-run cli:settings plugins when no model is
+	// resolved (registry empty at startup). tryReloadModels is idempotent.
+	if oaSession.Model == nil {
+		if s.tryReloadModels(ctx) {
+			// Sync session model config to the new server default.
+			// OnNewSession set it to defaultModelID ("") when no models
+			// existed at creation; without this, resolveSessionModel
+			// and the UI selector both see an empty current model.
+			if v, ok := ss.ConfigString("model"); ok && v == "" {
+				if id := s.GetDefaultModelID(); id != "" {
+					ss.SetConfigValue("model", id)
+					slog.Info("model reload: synced session model to server default",
+						"session", req.SessionID, "model", id)
+					if s.updateSender != nil {
+						s.updateSender.SendSessionUpdate(req.SessionID, openacp.SessionUpdate{
+							SessionUpdate: "config_option_update",
+							ConfigOptions: s.buildConfigOptions(req.SessionID),
+						})
+					}
+				}
+			}
+			// Re-resolve the model after a successful reload — the registry
+			// now has entries, so resolveSessionModel should return non-nil.
+			oaSession.Model = s.resolveSessionModel(ss)
+			slog.Info("model reload: model resolved after lazy reload",
+				"session", req.SessionID,
+				"model_id", oaSession.ModelID,
+				"provider", oaSession.Provider)
+		}
 	}
 
 	// Inject AgentRuntime for runtime_* host exports.
