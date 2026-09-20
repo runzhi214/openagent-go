@@ -210,6 +210,38 @@ func BuildACPServer(ctx context.Context, cfg *config.Config) (*openacpsdk.Server
 		}
 	}
 
+	// Wire lazy model reload: when the server starts with zero models
+	// (both settings.json and cli:settings plugins returned nothing at
+	// startup), tryReloadModels re-runs the cli:settings plugins' init
+	// export at request time to recover models from external state
+	// (keyring, env, files) that may have changed since process start.
+	// No-op when no cli:settings plugins are configured.
+	if mods := loadSettingsPluginModules(); len(mods) > 0 {
+		srv.SetModelReloadFn(buildModelReloadFn(mods,
+			func(mi modelReg) {
+				srv.SetModel(mi.Provider, mi.ID, mi.APIKey, mi.BaseURL,
+					mi.MaxInputTokens, mi.MaxOutputTokens)
+				srv.RegisterModel(mi.Key(), mi.Provider, mi.ID,
+					mi.APIKey, mi.BaseURL, acp.ModelPricing{
+						MaxInputTokens:           mi.MaxInputTokens,
+						MaxOutputTokens:          mi.MaxOutputTokens,
+						InputCostPerMillion:      mi.InputCostPerMillion,
+						InputCacheCostPerMillion: mi.InputCacheCostPerMillion,
+						OutputCostPerMillion:     mi.OutputCostPerMillion,
+					})
+			},
+			func(first modelReg) {
+				if srv.GetDefaultModelID() == "" {
+					srv.SetDefaultModelID(first.Key())
+					slog.Info("model reload: set default model", "key", first.Key())
+				}
+				srv.BroadcastConfigOptions()
+			},
+		))
+		slog.Info("model reload: lazy reload wired for ACP",
+			"settings_plugin_count", len(mods))
+	}
+
 	policy := sandboxPolicy(cfg.Sandbox)
 	baseToolList := []string{"shell", "read", "write", "ls", "grep", "websearch", "webfetch", "settings"}
 	if caps.OnBrowser() {

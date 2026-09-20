@@ -65,6 +65,17 @@ type Handler struct {
 	// model can monitor long-running processes across turns.
 	processBaseDir string
 
+	// modelReloadFn re-runs cli:settings plugins to recover models that
+	// were unavailable at startup. Returns true if at least one model was
+	// registered. nil when no cli:settings plugins are configured.
+	// Triggered once per request that finds no model (see tryReloadModels).
+	modelReloadFn func(ctx context.Context) bool
+
+	// modelReloadMu serializes concurrent reload attempts so that N
+	// requests arriving simultaneously don't each independently fire the
+	// plugin init pipeline.
+	modelReloadMu sync.Mutex
+
 	sm *sessionManager[*sessionState] // session CRUD, store, bus
 }
 
@@ -193,6 +204,99 @@ func (h *Handler) lookupModel(provider, modelID string) openagent.Model {
 		}
 	}
 	return nil
+}
+
+// ── Lazy model reload ──
+
+// SetModelReloadFn injects the lazy model reload callback. Called by
+// RunREST when cli:settings plugin modules are available. When not set
+// (nil), tryReloadModels is a no-op.
+func (h *Handler) SetModelReloadFn(fn func(ctx context.Context) bool) {
+	h.modelReloadFn = fn
+}
+
+// SetDefaultModel replaces the handler's default model. Used after a
+// successful lazy reload when the registry was previously empty.
+func (h *Handler) SetDefaultModel(m openagent.Model) {
+	h.modelsMu.Lock()
+	defer h.modelsMu.Unlock()
+	h.defaultModel = m
+}
+
+// DefaultModel returns the handler's default model instance. Used by the
+// lazy reload wiring to check whether a default is already set.
+func (h *Handler) DefaultModel() openagent.Model {
+	h.modelsMu.RLock()
+	defer h.modelsMu.RUnlock()
+	return h.defaultModel
+}
+
+// tryReloadModels attempts to re-run cli:settings plugins to recover models
+// that were unavailable at startup. Called once per request that finds no
+// model — no retry loop, no permanent state. If the reload fails, the
+// request proceeds with no model and the next request will try again.
+//
+// Concurrency: modelReloadMu serializes concurrent calls so only one
+// goroutine runs the plugin pipeline; others wait, then check the registry
+// and return without re-running.
+func (h *Handler) tryReloadModels(ctx context.Context) bool {
+	if h.modelReloadFn == nil {
+		return false
+	}
+
+	if h.hasModels() {
+		return true
+	}
+
+	h.modelReloadMu.Lock()
+	defer h.modelReloadMu.Unlock()
+
+	if h.hasModels() {
+		return true
+	}
+
+	start := time.Now()
+	slog.Info("rest model reload: attempting plugin re-init")
+
+	loaded := false
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				slog.Error("rest model reload: panic recovered",
+					"error", panicToMsg(rec),
+					"elapsed_ms", time.Since(start).Milliseconds())
+			}
+		}()
+		loaded = h.modelReloadFn(ctx)
+	}()
+
+	if loaded {
+		slog.Info("rest model reload: succeeded, models registered",
+			"elapsed_ms", time.Since(start).Milliseconds())
+	} else {
+		slog.Warn("rest model reload: failed, will retry on next request",
+			"elapsed_ms", time.Since(start).Milliseconds())
+	}
+	return loaded
+}
+
+// hasModels reports whether the model registry has at least one entry.
+func (h *Handler) hasModels() bool {
+	h.modelsMu.RLock()
+	defer h.modelsMu.RUnlock()
+	return len(h.models) > 0
+}
+
+// panicToMsg converts a recovered panic value to a string for logging.
+func panicToMsg(rec any) string {
+	switch v := rec.(type) {
+	case error:
+		return v.Error()
+	case string:
+		return v
+	default:
+		return fmt.Sprintf("%v", rec)
+	}
 }
 
 // WithPluginManager attaches a WASM plugin manager (agent:observers for
@@ -412,6 +516,17 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	// Composite key "provider:modelId" for exact match.
 	// When provider is empty, find the first registered model for the given ID.
 	model := h.lookupModel(provider, modelID)
+	if model == nil {
+		// Lazy model recovery: re-run cli:settings plugins when no model
+		// is found (registry empty at startup). tryReloadModels is idempotent.
+		if h.tryReloadModels(r.Context()) {
+			model = h.lookupModel(provider, modelID)
+			if model != nil {
+				slog.Info("rest model reload: model resolved after lazy reload",
+					"session", id, "provider", provider, "model_id", modelID)
+			}
+		}
+	}
 	if model == nil {
 		slog.Warn("unknown model, falling back to default", "session", id, "provider", provider, "model_id", modelID)
 		model = h.defaultModel

@@ -100,8 +100,15 @@ func main() {
 	// plugin log noise on stdout/stderr.
 	if !isOfflineCmd(os.Args) {
 		var cleanup func()
-		settings, cleanup = loadPlugins(ctx, pluginPaths, settings, hub)
+		var settingsModules []*cliwasm.Module
+		settings, settingsModules, cleanup = loadPlugins(ctx, pluginPaths, settings, hub)
 		defer cleanup()
+		// Store settings plugin modules for lazy model reload: when the
+		// server starts with zero models, tryReloadModels re-invokes these
+		// modules' init export at request time to recover models from
+		// external state (keyring, env, files) that may have changed since
+		// process start. No-op when no cli:settings plugins are loaded.
+		server.SetSettingsPluginModules(settingsModules)
 	}
 
 	// 5. Parse final merged config.
@@ -612,15 +619,23 @@ func applyQuiet() {
 
 // loadPlugins instantiates the WASM runtime, loads every .wasm under
 // pluginPaths, and routes capabilities (settings merge, command
-// registration, observer wiring). Returns the possibly merged settings
-// and a cleanup func that closes the WASM runtime.
-func loadPlugins(ctx context.Context, pluginPaths []string, settings []byte, hub *cliwasm.ObserverHub) ([]byte, func()) {
+// registration, observer wiring). Returns:
+//   - the possibly merged settings bytes,
+//   - the list of cli:settings plugin modules (for lazy model reload),
+//   - a cleanup func that closes the WASM runtime.
+//
+// The settings modules are returned so they can be re-invoked at request
+// time (tryReloadModels) when no models were available at startup. The
+// WASM runtime stays alive until the cleanup func runs (process exit),
+// so the modules remain callable throughout the server's lifetime.
+func loadPlugins(ctx context.Context, pluginPaths []string, settings []byte, hub *cliwasm.ObserverHub) ([]byte, []*cliwasm.Module, func()) {
 	wasmRuntime, err := cliwasm.NewRuntime(ctx)
 	if err != nil {
 		log.Fatalf("wasm runtime: %v", err)
 	}
 
 	mgr := plugin.NewManager(pluginPaths)
+	var settingsModules []*cliwasm.Module
 	for _, p := range pluginPaths {
 		files, _ := mgr.ResolveWasmFiles(p)
 		for _, f := range files {
@@ -646,6 +661,12 @@ func loadPlugins(ctx context.Context, pluginPaths []string, settings []byte, hub
 			log.Printf("plugin: loaded %s (%s) type=%s", meta.Name, meta.Description, meta.Type)
 
 			if meta.Is("settings") {
+				// Collect the module for lazy model reload: the server may
+				// start with zero models (both settings.json and plugins
+				// returned nothing), and tryReloadModels re-invokes
+				// mod.CallInit at request time to pick up external state
+				// changes (keyring, env, files) since process start.
+				settingsModules = append(settingsModules, mod)
 				merged, err := mod.CallInit(ctx, settings)
 				if err != nil {
 					log.Printf("plugin %s init: %v", meta.Name, err)
@@ -676,7 +697,7 @@ func loadPlugins(ctx context.Context, pluginPaths []string, settings []byte, hub
 			}
 		}
 	}
-	return settings, func() { wasmRuntime.Close(ctx) }
+	return settings, settingsModules, func() { wasmRuntime.Close(ctx) }
 }
 
 var keyringCmd = &cobra.Command{Use: "keyring", Short: "Manage credentials in the system keyring"}
