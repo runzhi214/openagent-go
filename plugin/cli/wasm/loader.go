@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 
 	"github.com/tetratelabs/wazero"
@@ -30,9 +29,6 @@ func (r *Runtime) Instantiate(ctx context.Context, wasmBytes []byte, name string
 	meta, err := readCLIMeta(ctx, mod)
 	if err != nil {
 		return nil, CLIPluginMeta{}, fmt.Errorf("metadata: %w", err)
-	}
-	if !strings.HasPrefix(meta.Type, PluginCLIPrefix) {
-		return nil, CLIPluginMeta{}, fmt.Errorf("plugin type %q does not start with %q", meta.Type, PluginCLIPrefix)
 	}
 	return &Module{Mod: mod, Meta: meta}, meta, nil
 }

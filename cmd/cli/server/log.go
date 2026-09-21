@@ -17,9 +17,9 @@ import (
 	"github.com/yusheng-g/openagent-go/kernel"
 )
 
-// logWriter holds the active log writer so reconfigureLogLevel can
+// logWriter holds the active log writer so ReconfigureLogLevel can
 // rebuild the slog handler with the same writer but a new level.
-// SetupLog stores the writer here; reconfigureLogLevel reads it.
+// SetupLog stores the writer here; ReconfigureLogLevel reads it.
 var logWriter atomic.Pointer[io.Writer]
 
 // logFilePath holds the resolved log file path (empty when logging is
@@ -54,12 +54,12 @@ func SetupLog(cfg config.LogConfig) (func(), error) {
 		mw.AddWriter(io.Discard)
 	}
 
-	// Store the writer and level for reconfigureLogLevel.
+	// Store the writer and level for ReconfigureLogLevel.
 	var w io.Writer = mw
 	logWriter.Store(&w)
 	logFilePath.Store(&cfg.File)
 
-	// Use a level-switchable handler so reconfigureLogLevel can change
+	// Use a level-switchable handler so ReconfigureLogLevel can change
 	// the level without rebuilding the handler (and losing the writer).
 	h := slog.NewJSONHandler(mw, &slog.HandlerOptions{
 		Level: level,
@@ -87,11 +87,12 @@ func parseLevel(s string) slog.Level {
 	}
 }
 
-// reconfigureLogLevel changes the global slog level at runtime without
+// ReconfigureLogLevel changes the global slog level at runtime without
 // losing the log writer. Rebuilds the handler with the stored writer
 // (from SetupLog) and the new level. Called by the settings watcher
-// when log.level changes in settings.json.
-func reconfigureLogLevel(level string) {
+// when log.level changes in settings.json, and by main when a
+// cli:settings plugin injects a different log.level than preCfg.
+func ReconfigureLogLevel(level string) {
 	lvl := parseLevel(level)
 	w := logWriter.Load()
 	if w == nil {

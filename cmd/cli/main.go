@@ -82,10 +82,24 @@ func main() {
 	fs.ParseErrorsWhitelist.UnknownFlags = true
 	fs.Parse(os.Args[1:])
 	quiet, _ := fs.GetBool("quiet")
+
+	// Configure logging BEFORE loadPlugins so plugin load/init logs land
+	// in the log file (never stderr — stderr is the ACP control pipe and
+	// non-JSON output there corrupts acpws clients). ApplyDefaults on
+	// preCfg derives the log file path from cfgPath (plugins cannot change
+	// the file path); log.level may be overridden by a cli:settings plugin
+	// later, reconciled via ReconfigureLogLevel below.
+	config.ApplyDefaults(&preCfg, cfgPath)
+	logCleanup, err := server.SetupLog(preCfg.Log)
+	if err != nil {
+		log.Printf("WARNING: log setup failed, using defaults: %v", err)
+	}
+	if logCleanup != nil {
+		defer logCleanup()
+	}
 	if quiet {
-		// Apply BEFORE plugin loading (which happens before cobra's
-		// Execute), and again after SetupLog below (which reinstalls the
-		// default slog handler) so quiet survives both.
+		// SetupLog reinstalled the default slog handler — re-apply quiet
+		// so plugin load logs are discarded too.
 		applyQuiet()
 	}
 
@@ -142,16 +156,11 @@ func main() {
 		slog.Warn("settings: enum violation (use-time will silently downgrade)", "violation", v)
 	}
 
-	logCleanup, err := server.SetupLog(cfg.Log)
-	if err != nil {
-		log.Printf("WARNING: log setup failed, using defaults: %v", err)
-	}
-	if logCleanup != nil {
-		defer logCleanup()
-	}
-	if quiet {
-		// SetupLog reinstalled the default slog handler — re-apply quiet.
-		applyQuiet()
+	// A cli:settings plugin may have injected a different log.level than
+	// preCfg. Reconcile the level without rebuilding the handler (keeps
+	// the same log file writer).
+	if cfg.Log.Level != preCfg.Log.Level {
+		server.ReconfigureLogLevel(cfg.Log.Level)
 	}
 
 	// 6. Build cobra tree.
@@ -255,7 +264,7 @@ func registerCommands(parent *cobra.Command, cmds []cliwasm.CommandDef) {
 			return nil
 		}
 		parent.AddCommand(cmd)
-		log.Printf("plugin: registered command %q", name)
+		slog.Info("plugin: registered command", "name", name)
 	}
 }
 
@@ -641,12 +650,12 @@ func loadPlugins(ctx context.Context, pluginPaths []string, settings []byte, hub
 		for _, f := range files {
 			wasmBytes, err := os.ReadFile(f)
 			if err != nil {
-				log.Printf("plugin: read %s: %v", f, err)
+				slog.Warn("plugin: read failed", "file", f, "error", err)
 				continue
 			}
 			mod, meta, err := wasmRuntime.Instantiate(ctx, wasmBytes, f)
 			if err != nil {
-				log.Printf("plugin: load %s: %v", f, err)
+				slog.Warn("plugin: load failed", "file", f, "error", err)
 				continue
 			}
 
@@ -658,7 +667,7 @@ func loadPlugins(ctx context.Context, pluginPaths []string, settings []byte, hub
 				continue
 			}
 
-			log.Printf("plugin: loaded %s (%s) type=%s", meta.Name, meta.Description, meta.Type)
+			slog.Info("plugin: loaded", "name", meta.Name, "description", meta.Description, "type", meta.Type)
 
 			if meta.Is("settings") {
 				// Collect the module for lazy model reload: the server may
@@ -669,7 +678,7 @@ func loadPlugins(ctx context.Context, pluginPaths []string, settings []byte, hub
 				settingsModules = append(settingsModules, mod)
 				merged, err := mod.CallInit(ctx, settings)
 				if err != nil {
-					log.Printf("plugin %s init: %v", meta.Name, err)
+					slog.Warn("plugin init failed", "name", meta.Name, "error", err)
 					continue
 				}
 				settings = merged
@@ -678,7 +687,7 @@ func loadPlugins(ctx context.Context, pluginPaths []string, settings []byte, hub
 			if meta.Is("commands") {
 				cmds, err := mod.ReadCommands(ctx)
 				if err != nil {
-					log.Printf("plugin %s commands: %v", meta.Name, err)
+					slog.Warn("plugin commands failed", "name", meta.Name, "error", err)
 					continue
 				}
 				registerCommands(rootCmd, cmds)
@@ -686,10 +695,10 @@ func loadPlugins(ctx context.Context, pluginPaths []string, settings []byte, hub
 
 			if meta.Is("http") {
 				if err := cliwasm.RegisterHTTPRoutes(mod, meta); err != nil {
-					log.Printf("plugin %s http: %v", meta.Name, err)
+					slog.Warn("plugin http failed", "name", meta.Name, "error", err)
 					continue
 				}
-				log.Printf("plugin: registered %d http route(s) for %s", len(meta.Routes), meta.Name)
+				slog.Info("plugin: registered http routes", "count", len(meta.Routes), "name", meta.Name)
 			}
 
 			if meta.Is("observers") {
