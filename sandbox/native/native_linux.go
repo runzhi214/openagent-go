@@ -206,6 +206,9 @@ func (r *sawReader) Read(p []byte) (int, error) {
 // readLinesWithFirst is like readLines but also sends the first line it
 // reads to firstCh. Used by confineAndRunStream to detect bwrap setup
 // failures (whose first stderr line starts with "bwrap:").
+//
+// On scanner error (e.g. bufio.ErrTooLong), drains the remaining reader
+// — same rationale as readLines in native.go.
 func readLinesWithFirst(r io.Reader, ch chan<- openagent.ToolStreamChunk, done chan<- struct{}, firstCh chan<- string) {
 	defer func() { done <- struct{}{} }()
 	sc := bufio.NewScanner(r)
@@ -221,6 +224,15 @@ func readLinesWithFirst(r io.Reader, ch chan<- openagent.ToolStreamChunk, done c
 			}
 		}
 		ch <- openagent.ToolStreamChunk{Content: line + "\n"}
+	}
+	if sc.Err() != nil {
+		select {
+		case ch <- openagent.ToolStreamChunk{
+			Content: "\n... [line exceeded 1MB scanner limit; remaining output drained]\n",
+		}:
+		default:
+		}
+		io.Copy(io.Discard, r)
 	}
 }
 

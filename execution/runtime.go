@@ -20,6 +20,14 @@ import (
 	"github.com/yusheng-g/openagent-go/provider/skill"
 )
 
+// maxStreamBytes caps in-memory accumulation of a streaming tool's
+// output during the select loop in executeOnce. Excess output is still
+// received and drained (to avoid blocking the tool's goroutines) but not
+// stored. Mirrors maxExecOutputBytes in plugin/wasmhost/exec.go. The
+// post-hoc ResultPolicy applies a further token-based truncation after
+// the stream closes.
+const maxStreamBytes = 1 << 20 // 1 MiB
+
 // BuiltinHandler runs a built-in tool (load_skill, reload_skills, recall).
 type BuiltinHandler func(ctx context.Context, session openagent.Session, call openagent.ToolCall, ch chan<- openagent.StreamEvent) openagent.Message
 
@@ -207,18 +215,27 @@ func (e *ExecutionRuntime) executeOnce(ctx context.Context, session openagent.Se
 			// Rate-limit progress events (1/sec) to avoid flooding the channel.
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
-			var pending string
+			// pending accumulates chunks between ticker flushes as a []byte
+			// (amortized O(n) append) instead of string concatenation (O(n²)).
+			// On flush, string(pending) copies the slice into an immutable
+			// string safe for the channel; pending[:0] reuses the backing array.
+			var pending []byte
 			flush := func() {
-				if pending != "" && ch != nil {
+				if len(pending) > 0 && ch != nil {
 					select {
-					case ch <- openagent.StreamEvent{Type: openagent.StreamToolProgress, Text: pending, ToolCallID: call.ID}:
+					case ch <- openagent.StreamEvent{Type: openagent.StreamToolProgress, Text: string(pending), ToolCallID: call.ID}:
 					case <-toolCtx.Done():
 					}
-					pending = ""
+					pending = pending[:0]
 				}
 			}
 			done := false
 			cancelled := false
+			// truncated is set when buf reaches maxStreamBytes. Subsequent
+			// chunks are received and discarded (drain mode) so the tool's
+			// goroutines don't block on a full channel — mirroring
+			// readCapped's io.Copy(io.Discard, r) in plugin/wasmhost/exec.go.
+			truncated := false
 			for !done {
 				select {
 				case chunk, ok := <-toolCh:
@@ -236,10 +253,20 @@ func (e *ExecutionRuntime) executeOnce(ctx context.Context, session openagent.Se
 					} else if chunk.Error != nil {
 						result = openagent.ErrorResult(chunk.Error, false, "")
 						done = true
-					} else {
-						buf.WriteString(chunk.Content)
-						pending += chunk.Content
+					} else if !truncated {
+						remaining := maxStreamBytes - buf.Len()
+						if len(chunk.Content) >= remaining {
+							if remaining > 0 {
+								buf.WriteString(chunk.Content[:remaining])
+							}
+							truncated = true
+							flush()
+						} else {
+							buf.WriteString(chunk.Content)
+							pending = append(pending, chunk.Content...)
+						}
 					}
+					// truncated=true: chunk received and discarded (drain mode).
 				case <-ticker.C:
 					flush()
 				case <-toolCtx.Done():
@@ -250,6 +277,12 @@ func (e *ExecutionRuntime) executeOnce(ctx context.Context, session openagent.Se
 			}
 			flush()
 			if result == nil {
+				content := buf.String()
+				if truncated {
+					content += fmt.Sprintf(
+						"\n... [output exceeded %d byte stream limit; truncated]",
+						maxStreamBytes)
+				}
 				if cancelled {
 					// Cancelled mid-stream (run cancel / job cancel): the
 					// partial content is already on the wire as progress
@@ -260,14 +293,14 @@ func (e *ExecutionRuntime) executeOnce(ctx context.Context, session openagent.Se
 					// semantics as the blocking path, where a ctx-aware tool
 					// returns a cancellation error.
 					result = &openagent.ToolResult{
-						Content: buf.String(),
+						Content: content,
 						Error: &openagent.ToolError{
 							Message: "tool execution cancelled",
 							Code:    "cancelled",
 						},
 					}
 				} else {
-					result = &openagent.ToolResult{Content: buf.String()}
+					result = &openagent.ToolResult{Content: content}
 				}
 			}
 		}
