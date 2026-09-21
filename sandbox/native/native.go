@@ -103,12 +103,26 @@ func (s *Sandbox) RunStream(ctx context.Context, cmd *openagent.Command) <-chan 
 
 // readLines reads lines from r and sends them as chunks to ch.
 // Used by streaming implementations on all platforms.
+//
+// On scanner error (e.g. bufio.ErrTooLong for a line exceeding the 1MB
+// buffer cap — common with binary data), drains the remaining reader so
+// the pipe writer doesn't block and the child process can continue/exit.
+// Mirrors readCapped's drain in plugin/wasmhost/exec.go:164.
 func readLines(r io.Reader, ch chan<- openagent.ToolStreamChunk, done chan<- struct{}) {
 	defer func() { done <- struct{}{} }()
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 4096), 1024*1024)
 	for sc.Scan() {
 		ch <- openagent.ToolStreamChunk{Content: sc.Text() + "\n"}
+	}
+	if sc.Err() != nil {
+		select {
+		case ch <- openagent.ToolStreamChunk{
+			Content: "\n... [line exceeded 1MB scanner limit; remaining output drained]\n",
+		}:
+		default:
+		}
+		io.Copy(io.Discard, r)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
 )
@@ -164,5 +165,40 @@ func TestSandboxDisabled(t *testing.T) {
 		t.Errorf("expected NO warning when sandbox is explicitly disabled, got stderr: %s", result.Stderr)
 	} else {
 		t.Logf("✅ no warning when sandbox disabled")
+	}
+}
+
+// TestSandboxStreamingBinaryDrain verifies that a command producing
+// output with no newlines (e.g. binary data from /dev/zero) does not
+// hang the stream. Without the scanner drain, bufio.Scanner hits
+// ErrTooLong on a >1MB "line", readLines exits, the pipe writer blocks,
+// and the child process hangs until the ctx timeout.
+func TestSandboxStreamingBinaryDrain(t *testing.T) {
+	dir := t.TempDir()
+	sb, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 5 MB of null bytes — no newlines, so bufio.Scanner's 1MB line
+	// cap triggers ErrTooLong on the first read.
+	ch := sb.RunStream(context.Background(), &openagent.Command{
+		Program: "/bin/bash",
+		Args:    []string{"-c", "head -c 5000000 /dev/zero"},
+		WorkDir: dir,
+	})
+
+	done := make(chan struct{})
+	go func() {
+		for range ch {
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success — scanner drained, stream completed without hanging.
+	case <-time.After(15 * time.Second):
+		t.Fatal("stream hung — scanner drain not working for binary data")
 	}
 }
