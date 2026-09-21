@@ -981,7 +981,7 @@ func (sw *settingsWatcher) reload(ctx context.Context) acp.ReloadResult {
 
 	// Log level.
 	if sw.prev.Log.Level != newCfg.Log.Level {
-		reconfigureLogLevel(newCfg.Log.Level)
+		ReconfigureLogLevel(newCfg.Log.Level)
 		result.Applied = append(result.Applied, fmt.Sprintf("log level: %s→%s", sw.prev.Log.Level, newCfg.Log.Level))
 		slog.Info("settings reloaded: log level", "level", newCfg.Log.Level)
 	}
