@@ -83,9 +83,9 @@ var sampleLimit = 8 * 1024
 // Texts longer than sampleLimit are counted by sampling the head and
 // extrapolating linearly (density-stable; ~1-3% error).
 //
-// If the tokenizer cannot be loaded (e.g. no network for downloading encoder
-// files on first use), it falls back to a heuristic (~4 chars per token for
-// ASCII, ~1.5 for CJK). This is safe but less accurate.
+// BPE encoder files are embedded via //go:embed (see embed_loader.go), so
+// no network download is needed. The heuristic fallback only triggers if
+// the embedded data is somehow corrupt.
 func Count(modelID, text string) (n int) {
 	if text == "" {
 		return 0
