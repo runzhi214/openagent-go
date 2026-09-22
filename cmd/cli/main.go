@@ -606,6 +606,9 @@ func keyringOrFail() plugin.Keyring {
 func isOfflineCmd(args []string) bool {
 	for _, a := range args[1:] {
 		if strings.HasPrefix(a, "-") {
+			if a == "--version" || a == "-v" {
+				return true
+			}
 			continue
 		}
 		switch a {
