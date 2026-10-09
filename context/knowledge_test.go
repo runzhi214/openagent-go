@@ -111,7 +111,7 @@ func TestExtractor_DisabledNoOp(t *testing.T) {
 	ext := NewLLMExtractor(nil, prov) // nil model → disabled
 	ext.Extract(context.Background(), ContextScope{}, []openagent.Message{
 		openagent.UserMessage("I prefer nginx."),
-	})
+	}, nil)
 	if len(prov.items) != 0 {
 		t.Fatal("disabled extractor wrote to provider")
 	}
@@ -227,7 +227,7 @@ func TestExtractor_RetryOnParseFailure(t *testing.T) {
 	ext := NewLLMExtractor(func() openagent.Model { return m }, prov)
 	ext.Extract(context.Background(), ContextScope{}, []openagent.Message{
 		openagent.UserMessage("I prefer terraform for deployment."),
-	})
+	}, nil)
 	if len(prov.items) != 1 {
 		t.Fatalf("expected 1 stored item after retry, got %d", len(prov.items))
 	}
@@ -248,7 +248,7 @@ func TestExtractor_NoRetryOnValidJSON(t *testing.T) {
 	ext := NewLLMExtractor(func() openagent.Model { return m }, prov)
 	ext.Extract(context.Background(), ContextScope{}, []openagent.Message{
 		openagent.UserMessage("I use vim."),
-	})
+	}, nil)
 	if len(prov.items) != 1 {
 		t.Fatalf("expected 1 stored item, got %d", len(prov.items))
 	}

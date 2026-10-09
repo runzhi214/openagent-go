@@ -9,12 +9,14 @@ import (
 )
 
 // AsyncExtractor runs extraction in the background with a single worker:
-// submissions are coalesced per user+conversation — the latest messages
-// replace any queued job for the same user and session — so N finished
-// runs produce at most one extraction pass per conversation. Industry
-// practice: write-heavy LLM extraction runs asynchronously (Mem0:
-// extraction at write time, typically background) and must never delay
-// the agent loop.
+// submissions are coalesced per user+conversation — the latest full
+// message list replaces any queued job for the same user and session,
+// while run deltas APPEND (a replacing drop would silently lose the
+// earlier run's messages — correct for whole-transcript passes, fatal
+// for incremental sync). N finished runs therefore produce one pass per
+// conversation carrying every run's delta. Industry practice: write-heavy
+// LLM extraction runs asynchronously (Mem0: extraction at write time,
+// typically background) and must never delay the agent loop.
 //
 // The worker is bounded: one goroutine, one job at a time, 60s timeout
 // per extraction, queue capacity 64 (a saturated backlog drops new
@@ -32,6 +34,7 @@ type AsyncExtractor struct {
 type extractJob struct {
 	scope    ContextScope
 	messages []openagent.Message
+	runDelta []openagent.Message
 }
 
 // NewAsyncExtractor creates an extractor that submits to a background
@@ -71,15 +74,20 @@ func (e *AsyncExtractor) SetModelFn(fn func() openagent.Model) {
 }
 
 // Extract implements Extractor: enqueue (non-blocking, ~µs). The actual
-// extraction runs on the background worker.
-func (e *AsyncExtractor) Extract(ctx context.Context, scope ContextScope, messages []openagent.Message) {
-	if e == nil || e.inner == nil || len(messages) == 0 {
+// extraction runs on the background worker. Either payload may carry the
+// job: whole-transcript extractors read messages, incremental sync
+// extractors read runDelta — drop only when both are empty.
+func (e *AsyncExtractor) Extract(ctx context.Context, scope ContextScope, messages []openagent.Message, runDelta []openagent.Message) {
+	if e == nil || e.inner == nil || (len(messages) == 0 && len(runDelta) == 0) {
 		return
 	}
 	key := scope.UserID + "/" + scope.SessionID
 	e.mu.Lock()
-	_, queued := e.pending[key]
-	e.pending[key] = extractJob{scope: scope, messages: messages}
+	job, queued := e.pending[key]
+	job.scope = scope
+	job.messages = messages
+	job.runDelta = append(job.runDelta, runDelta...)
+	e.pending[key] = job
 	if !queued {
 		// First submission for this conversation: announce the key. A
 		// saturated backlog drops the announcement — best-effort by design.
@@ -104,7 +112,7 @@ func (e *AsyncExtractor) worker() {
 				continue
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			e.inner.Extract(ctx, job.scope, job.messages)
+			e.inner.Extract(ctx, job.scope, job.messages, job.runDelta)
 			cancel()
 		case <-e.done:
 			return

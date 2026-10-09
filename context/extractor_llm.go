@@ -29,10 +29,15 @@ import (
 // (LLMExtractor) or enqueue to a background worker (AsyncExtractor).
 // Errors are logged inside, never returned — extraction must not affect
 // the agent run.
+//
+// runDelta is the messages the finished run appended on top of the
+// conversation history it loaded (workingMessages[runStart:]). A
+// conversation-syncing extractor needs it as its incremental cursor;
+// whole-transcript extractors ignore it.
 type Extractor interface {
 	// Extract stores durable knowledge under scope. Best-effort: failures
 	// never abort the run.
-	Extract(ctx context.Context, scope ContextScope, messages []openagent.Message)
+	Extract(ctx context.Context, scope ContextScope, messages []openagent.Message, runDelta []openagent.Message)
 }
 
 // ExtractionItem is one knowledge decision from the extraction pass.
@@ -120,8 +125,9 @@ func (e *LLMExtractor) SetModelFn(fn func() openagent.Model) {
 	e.modelFn = fn
 }
 
-// Extract implements Extractor.
-func (e *LLMExtractor) Extract(ctx context.Context, scope ContextScope, messages []openagent.Message) {
+// Extract implements Extractor. runDelta is unused: the LLM pass always
+// reads the whole (budget-trimmed) transcript.
+func (e *LLMExtractor) Extract(ctx context.Context, scope ContextScope, messages []openagent.Message, runDelta []openagent.Message) {
 	e.mu.RLock()
 	modelFn := e.modelFn
 	e.mu.RUnlock()

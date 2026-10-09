@@ -160,19 +160,23 @@ func BuildACPServer(ctx context.Context, cfg *config.Config) (*openacpsdk.Server
 		}
 	}
 
-	providerCleanup, err := applyContextProviders(cfg, &deps)
+	ovClient, providerCleanup, err := applyContextProviders(cfg, &deps)
 	if err != nil {
 		return nil, nil, err
 	}
+	// Startup counterpart of the shutdown flush: commit knowledge
+	// stranded in OV sessions by dead processes.
+	recoverUncommittedAsync(ovClient)
 	// The extractor captures the MemoryProvider it writes to — build it
 	// AFTER applyContextProviders so the effective provider is used.
 	// Building it earlier would fork writes to the local sqlite store
 	// while Recall reads the OpenViking index (silent knowledge loss).
-	// NewLLMExtractor is nil-safe (nil model → no-op), so construction does
-	// not depend on a model being configured yet.
+	// Sync mode needs no model (the server VLM is the only extractor);
+	// distill mode tolerates a nil model at construction
+	// (NewLLMExtractor is nil-safe; modelFn resolves at extraction time).
 	var extractor *ctxpkg.AsyncExtractor
 	if caps.OnMemory() && deps.MemoryProvider != nil {
-		extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(dynamicModel, deps.MemoryProvider))
+		extractor = buildExtractor(cfg, ovClient, deps.MemoryProvider, dynamicModel)
 		deps.Extractor = extractor
 	}
 	srv = acp.NewAgentServer(agentCfg, deps, sessionStore, modelMap)
