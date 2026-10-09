@@ -276,19 +276,66 @@ func buildModelReloadFn(
 // remains as an opt-out escape hatch: an explicit "builtin" for a domain
 // keeps the local backend. No endpoint = fully local, no server required.
 //
-// Returns a cleanup func that flushes context providers (e.g. OpenViking
-// session) on shutdown — commits any pending messages below the threshold.
-// nil when no provider needs cleanup (no endpoint configured).
-func applyContextProviders(cfg *config.Config, deps *kernel.Deps) (func(), error) {
+// Returns the OpenViking client (nil when no endpoint is configured) and
+// a cleanup func that flushes context providers on shutdown — commits
+// any pending messages below the threshold. The caller owns the client's
+// lifecycle: run recoverUncommittedAsync(client) at startup so knowledge
+// stranded in OV sessions by dead processes is committed and extracted.
+func applyContextProviders(cfg *config.Config, deps *kernel.Deps) (*openviking.Client, func(), error) {
 	if cfg.OpenViking.Endpoint == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	client, err := buildOVClient(cfg)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	wireOVProviders(cfg, client, deps)
-	return ovFlushCleanup(client), nil
+	return client, ovFlushCleanup(client), nil
+}
+
+// recoverUncommittedAsync runs the OpenViking recovery sweep in the
+// background: bounded by a timeout, best-effort — failures log a warning
+// and leave the stranded sessions for the next process start.
+func recoverUncommittedAsync(client *openviking.Client) {
+	if client == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := client.RecoverUncommitted(ctx); err != nil {
+			slog.Warn("openviking recovery sweep failed", "error", err)
+		}
+	}()
+}
+
+// buildExtractor constructs the memory extractor per the OpenViking
+// extraction mode. Must run AFTER applyContextProviders so the effective
+// memory provider is known.
+//
+//   - sync (default; anything except an explicit "distill"), memory on
+//     OpenViking: ConversationSyncer forwards each run's user↔assistant
+//     text to the per-conversation OV session; the server VLM is the
+//     only extractor. No model dependency — sync works (and persists
+//     knowledge) even when no model is configured.
+//   - distill (explicit opt-in, or memory on any other backend):
+//     LLMExtractor distills knowledge fragments and Store()s them via
+//     the MemoryProvider. Requires a resolvable model; nil modelFn
+//     builds nothing (mirrors the previous m != nil gating).
+//
+// The returned AsyncExtractor is the server-shared instance (one worker,
+// per-conversation coalescing). nil when no extractor should be wired.
+func buildExtractor(cfg *config.Config, ovClient *openviking.Client, p ctxpkg.MemoryProvider, modelFn func() openagent.Model) *ctxpkg.AsyncExtractor {
+	if p == nil {
+		return nil
+	}
+	if ovClient != nil && cfg.ContextProviders.Memory != "builtin" && cfg.OpenViking.ExtractionMode != "distill" {
+		return ctxpkg.NewAsyncExtractor(openviking.NewConversationSyncer(ovClient))
+	}
+	if modelFn == nil {
+		return nil
+	}
+	return ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(modelFn, p))
 }
 
 // buildOVClient constructs an OpenViking client with session-reuse config
@@ -298,13 +345,10 @@ func buildOVClient(cfg *config.Config) (*openviking.Client, error) {
 	return openviking.NewClientWithSession(
 		cfg.OpenViking.Endpoint, cfg.OpenViking.APIKey,
 		openviking.SessionConfig{
-			SessionIDSeed:              configDir(),
-			CommitTokenThreshold:       s.CommitTokenThreshold,
-			CommitMessageThreshold:     s.CommitMessageThreshold,
-			MinCommitInterval:          time.Duration(s.MinCommitIntervalSeconds) * time.Second,
-			KeepRecentTurnCount:        s.KeepRecentTurnCount,
-			RetainedMessageTokenBudget: s.RetainedMessageTokenBudget,
-			MinRawTailSteps:            s.MinRawTailSteps,
+			SessionIDSeed:          configDir(),
+			CommitTokenThreshold:   s.CommitTokenThreshold,
+			CommitMessageThreshold: s.CommitMessageThreshold,
+			MinCommitInterval:      time.Duration(s.MinCommitIntervalSeconds) * time.Second,
 		},
 	)
 }

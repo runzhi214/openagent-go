@@ -108,6 +108,22 @@ func (m *Memory) Recall(ctx context.Context, scope ctxpkg.ContextScope, query st
 	return entries, nil
 }
 
+// defaultPeerID attributes knowledge when the session carries no user
+// identity (local CLI/TUI sessions). OV's extraction policy routes
+// user-role content into the PEER scope named by the message's peer_id;
+// with the assistant memory_policy (self disabled) an empty peer_id
+// leaves the knowledge with no eligible target — silently dropped.
+const defaultPeerID = "openagent"
+
+// peerIDFor resolves the OV peer attribution for a scope: the user's
+// identity, or defaultPeerID when the session carries none.
+func peerIDFor(scope ctxpkg.ContextScope) string {
+	if scope.UserID != "" {
+		return scope.UserID
+	}
+	return defaultPeerID
+}
+
 // Store implements context.MemoryProvider. OpenViking's memory is a
 // shared long-term knowledge base scoped by the server's own identity
 // (account/user), not by ContextScope — the scope is not applied on the
@@ -119,9 +135,17 @@ func (m *Memory) Recall(ctx context.Context, scope ctxpkg.ContextScope, query st
 // and commit is deferred to the threshold check (MaybeCommit). In legacy
 // mode (NewClient), Remember creates a fresh session and commits
 // immediately per call.
+//
+// The message role is "user": OV's VLM extraction treats user-role
+// content as the source for profile/preferences/entities/events (the
+// user-memory types this pipeline targets), while assistant-role content
+// only feeds agent-scope types (cases/skills) that the assistant
+// memory_policy disables — an assistant-role knowledge buffer extracts
+// zero memories. The extracted knowledge describes the user, so the
+// user role is also semantically correct.
 func (m *Memory) Store(ctx context.Context, scope ctxpkg.ContextScope, item ctxpkg.MemoryItem) error {
 	ovSID := m.client.SessionIDFor(scope.SessionID)
-	_, err := m.client.AddMessage(ctx, "assistant", item.Content, scope.UserID, ovSID)
+	_, err := m.client.AddMessage(ctx, "user", item.Content, peerIDFor(scope), ovSID)
 	if err != nil {
 		return err
 	}

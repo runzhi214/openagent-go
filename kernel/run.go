@@ -400,15 +400,23 @@ func (rt *Runtime) run(ctx context.Context, session openagent.Session, prefix []
 	// path to route knowledge fragments into per-conversation OV sessions
 	// so VLM extraction sees a coherent conversation context.
 	//
+	// runDelta carries exactly what THIS run appended to the conversation
+	// (user input + result messages). workingMessages cannot serve as a
+	// delta source: tool-turn re-compaction replaces it wholesale, so an
+	// index anchored at run start would not survive turn > 0. A
+	// conversation-syncing extractor uses runDelta as its incremental
+	// cursor; transcript extractors ignore it.
+	//
 	// The call is fire-and-forget: AsyncExtractor (the standard wiring)
 	// enqueues and extracts on its background worker, so this never
 	// delays the run's return. Applications wire Deps.Extractor once per
 	// server (never per run).
 	if rt.deps.Extractor != nil && len(workingMessages) > 0 {
+		runDelta := append([]openagent.Message{input}, result.Messages...)
 		rt.deps.Extractor.Extract(ctx, ctxpkg.ContextScope{
 			UserID:    session.UserID,
 			SessionID: session.ID,
-		}, workingMessages)
+		}, workingMessages, runDelta)
 	}
 	chSend(ctx, ch, openagent.StreamEvent{Type: openagent.StreamDone, Result: result})
 	return result, nil

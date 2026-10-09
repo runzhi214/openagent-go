@@ -430,3 +430,33 @@ func TestSecretPathsCollected(t *testing.T) {
 		t.Errorf("expected %d secret paths, got %d: %v", len(wantPaths), len(paths), paths)
 	}
 }
+
+func TestValidateEnumExtractionMode(t *testing.T) {
+	writeSettings(t, `{"openviking":{"endpoint":"http://127.0.0.1:1933","extraction_mode":"both"}}`)
+	report, err := ValidateSettings()
+	if err != nil {
+		t.Fatalf("ValidateSettings: %v (enum violations are not parse errors)", err)
+	}
+	found := false
+	for _, v := range report.EnumViolations {
+		if containsStr(v, "openviking.extraction_mode") && containsStr(v, "both") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected openviking.extraction_mode enum violation, got %v", report.EnumViolations)
+	}
+}
+
+func TestValidateEnumExtractionModeValid(t *testing.T) {
+	writeSettings(t, `{"openviking":{"endpoint":"http://127.0.0.1:1933","extraction_mode":"sync"}}`)
+	report, err := ValidateSettings()
+	if err != nil {
+		t.Fatalf("ValidateSettings: %v", err)
+	}
+	for _, v := range report.EnumViolations {
+		if containsStr(v, "openviking.extraction_mode") {
+			t.Errorf("sync is a valid extraction_mode, got violation %v", v)
+		}
+	}
+}

@@ -132,10 +132,21 @@ type ContextProviderConfig struct {
 // OpenVikingConfig connects to an OpenViking server (direct HTTP API —
 // search/remember/read, no SDK).
 type OpenVikingConfig struct {
-	Endpoint string          `json:"endpoint,omitempty"`                 // e.g. "http://127.0.0.1:1933"
-	APIKey   string          `json:"api_key,omitempty" sensitive:"true"` // Bearer token; empty = no auth
-	Recall   RecallConfig    `json:"recall,omitempty"`
-	Session  OVSessionConfig `json:"session,omitempty"`
+	Endpoint string `json:"endpoint,omitempty"`                 // e.g. "http://127.0.0.1:1933"
+	APIKey   string `json:"api_key,omitempty" sensitive:"true"` // Bearer token; empty = no auth
+	// ExtractionMode selects how knowledge reaches OpenViking for VLM
+	// extraction (applies only when the memory domain is served by
+	// OpenViking):
+	//   - "sync" (default; also when unset): each run's new user↔assistant
+	//     text messages are forwarded to the session verbatim — the server
+	//     VLM is the only extractor (no local distillation pass, no model
+	//     dependency)
+	//   - "distill" (explicit opt-in): the local LLM extractor distills
+	//     durable knowledge fragments; Store() writes them to the
+	//     per-conversation buffer session (role=user, peer-attributed)
+	ExtractionMode string          `json:"extraction_mode,omitempty" valid:"enum=distill|sync;case=cs"`
+	Recall         RecallConfig    `json:"recall,omitempty"`
+	Session        OVSessionConfig `json:"session,omitempty"`
 }
 
 // RecallConfig controls OpenViking's type-quota memory recall endpoint
@@ -168,19 +179,14 @@ type RecallConfig struct {
 // field here, also add it to openviking.SessionConfig and the mapping.
 //
 // Defaults (applied by the provider when zero):
-//   - CommitTokenThreshold: 6000 (pending tokens)
-//   - CommitMessageThreshold: 50 (messages since last commit)
+//   - CommitTokenThreshold: 30000 (server-reported pending tokens)
+//   - CommitMessageThreshold: 20 (server-reported live messages;
+//     ≈10 dialogue rounds in sync mode, 2 messages per round)
 //   - MinCommitIntervalSeconds: 300 (5 minutes)
-//   - KeepRecentTurnCount: 3 (WM v2 retention)
-//   - RetainedMessageTokenBudget: 6000
-//   - MinRawTailSteps: 1
 type OVSessionConfig struct {
-	CommitTokenThreshold       int `json:"commit_token_threshold,omitempty"`
-	CommitMessageThreshold     int `json:"commit_message_threshold,omitempty"`
-	MinCommitIntervalSeconds   int `json:"commit_min_interval_seconds,omitempty"`
-	KeepRecentTurnCount        int `json:"keep_recent_turn_count,omitempty"`
-	RetainedMessageTokenBudget int `json:"retained_message_token_budget,omitempty"`
-	MinRawTailSteps            int `json:"min_raw_tail_steps,omitempty"`
+	CommitTokenThreshold     int `json:"commit_token_threshold,omitempty"`
+	CommitMessageThreshold   int `json:"commit_message_threshold,omitempty"`
+	MinCommitIntervalSeconds int `json:"commit_min_interval_seconds,omitempty"`
 }
 
 // EmbeddingConfig selects the semantic-embedding backend for knowledge
