@@ -27,7 +27,6 @@ import (
 
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
 	clirest "github.com/yusheng-g/openagent-go/cmd/cli/rest"
-	ctxpkg "github.com/yusheng-g/openagent-go/context"
 )
 
 // ── REST server ──
@@ -103,7 +102,7 @@ func RunREST(ctx context.Context, cfg *config.Config) error {
 		deps.Summarizer = sumz
 	}
 
-	providerCleanup, err := applyContextProviders(cfg, &deps)
+	ovClient, providerCleanup, err := applyContextProviders(cfg, &deps)
 	if err != nil {
 		return err
 	}
@@ -112,12 +111,17 @@ func RunREST(ctx context.Context, cfg *config.Config) error {
 			providerCleanup()
 		}
 	}()
+	// Startup counterpart of the shutdown flush: commit knowledge
+	// stranded in OV sessions by dead processes.
+	recoverUncommittedAsync(ovClient)
 	// The extractor captures the MemoryProvider it writes to — build it
 	// AFTER applyContextProviders so the effective provider is used.
 	// Building it earlier would fork writes to the local sqlite store
 	// while Recall reads the OpenViking index (silent knowledge loss).
-	if caps.OnMemory() && m != nil && deps.MemoryProvider != nil {
-		deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(func() openagent.Model { return m }, deps.MemoryProvider))
+	// Sync mode needs no model (the server VLM is the only extractor);
+	// distill mode still requires one (buildExtractor enforces).
+	if caps.OnMemory() && deps.MemoryProvider != nil {
+		deps.Extractor = buildExtractor(cfg, ovClient, deps.MemoryProvider, func() openagent.Model { return m })
 	}
 	handler := rest.NewHandler(agentCfg, deps).
 		WithSessionStore(store).

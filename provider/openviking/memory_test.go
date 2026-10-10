@@ -242,19 +242,25 @@ func TestRecall_URIFallback(t *testing.T) {
 // ── Session reuse + threshold commit tests ──
 
 // sessionMockServer is a test double for the OpenViking session API.
-// It records all requests and serves configurable responses.
+// It records all requests and serves configurable responses. Counters
+// model server-side truth: liveMsgCount persists across client
+// instances (like the real server across process restarts) and resets
+// on commit (keep_recent_count=0 archives everything).
 type sessionMockServer struct {
 	*httptest.Server
 
 	mu              sync.Mutex
 	createCount     int
 	commitBodies    []map[string]any
+	commitSessions  []string
 	addMsgBodies    []map[string]any
 	getCount        int
-	pendingTokens   int  // value returned in add_message response
-	sessionExists   bool // GET returns 200 (true) or 404 (false)
-	addMsgStatus    int  // 0 = normal, 404 = simulate expired session (first call only)
+	pendingTokens   int    // value returned in add_message response
+	getLastCommitAt string // last_commit_at returned by GET detail
+	sessionExists   bool   // GET returns 200 (true) or 404 (false)
+	addMsgStatus    int    // 0 = normal, 404 = simulate expired session (first call only)
 	addMsgCallCount int
+	liveMsgCount    int // server-reported live message count
 	commitCount     int
 }
 
@@ -293,6 +299,8 @@ func newSessionMockServer() *sessionMockServer {
 			s.getCount++
 			exists := s.sessionExists
 			pt := s.pendingTokens
+			mc := s.liveMsgCount
+			lca := s.getLastCommitAt
 			s.mu.Unlock()
 
 			if !exists {
@@ -307,7 +315,12 @@ func newSessionMockServer() *sessionMockServer {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"status": "ok",
-				"result": map[string]any{"pending_tokens": pt},
+				"result": map[string]any{
+					"session_id":     "test-session",
+					"pending_tokens": pt,
+					"message_count":  mc,
+					"last_commit_at": lca,
+				},
 			})
 			return
 		}
@@ -330,6 +343,14 @@ func newSessionMockServer() *sessionMockServer {
 				})
 				return
 			}
+			// Server truth: one live message per message in the batch
+			// (not per request).
+			if msgs, ok := body["messages"].([]any); ok {
+				s.liveMsgCount += len(msgs)
+			} else {
+				s.liveMsgCount++
+			}
+			mc := s.liveMsgCount
 			s.mu.Unlock()
 
 			w.Header().Set("Content-Type", "application/json")
@@ -338,6 +359,7 @@ func newSessionMockServer() *sessionMockServer {
 				"result": map[string]any{
 					"session_id":     "test-session",
 					"pending_tokens": pt,
+					"message_count":  mc,
 				},
 			})
 			return
@@ -350,12 +372,14 @@ func newSessionMockServer() *sessionMockServer {
 			raw, _ := io.ReadAll(r.Body)
 			_ = json.Unmarshal(raw, &body)
 			s.commitBodies = append(s.commitBodies, body)
+			s.commitSessions = append(s.commitSessions, path)
+			s.liveMsgCount = 0 // keep_recent_count=0 archives everything
 			s.mu.Unlock()
 
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"status": "ok",
-				"result": map[string]any{"task_id": "task-1"},
+				"result": map[string]any{"task_id": "task-1", "archived": true},
 			})
 			return
 		}
@@ -428,7 +452,9 @@ func TestStore_NoCommitBelowThreshold(t *testing.T) {
 }
 
 // TestStore_CommitAtTokenThreshold: pending_tokens >= threshold → commit
-// with WM v2 retention parameters.
+// with keep_recent_count=0 (archive-everything buffer semantics). No
+// retention fields — the WM v2 turn-retention parameters apply to user
+// conversations, not knowledge buffers.
 func TestStore_CommitAtTokenThreshold(t *testing.T) {
 	srv := newSessionMockServer()
 	defer srv.Close()
@@ -453,21 +479,18 @@ func TestStore_CommitAtTokenThreshold(t *testing.T) {
 		t.Fatalf("commit count = %d, want 1", srv.commitCount)
 	}
 	body := srv.commitBodies[0]
-	if body["retention_mode"] != "turn_budget" {
-		t.Errorf("retention_mode = %v, want turn_budget", body["retention_mode"])
+	if body["keep_recent_count"] != float64(0) {
+		t.Errorf("keep_recent_count = %v, want 0 (archive everything)", body["keep_recent_count"])
 	}
-	if body["keep_recent_turn_count"] != float64(3) {
-		t.Errorf("keep_recent_turn_count = %v, want 3", body["keep_recent_turn_count"])
-	}
-	if body["retained_message_token_budget"] != float64(6000) {
-		t.Errorf("retained_message_token_budget = %v, want 6000", body["retained_message_token_budget"])
-	}
-	if body["min_raw_tail_steps"] != float64(1) {
-		t.Errorf("min_raw_tail_steps = %v, want 1", body["min_raw_tail_steps"])
+	for _, k := range []string{"retention_mode", "keep_recent_turn_count", "retained_message_token_budget", "min_raw_tail_steps"} {
+		if _, ok := body[k]; ok {
+			t.Errorf("commit body must not contain %q (buffer model), got %v", k, body[k])
+		}
 	}
 }
 
-// TestStore_CommitAtMessageThreshold: message count reaches the
+// TestStore_CommitAtMessageThreshold: the server-reported live message
+// count (message_count in the add_message response) reaches the
 // threshold even when pending_tokens is low.
 func TestStore_CommitAtMessageThreshold(t *testing.T) {
 	srv := newSessionMockServer()
@@ -527,7 +550,10 @@ func TestStore_MinInterval(t *testing.T) {
 }
 
 // TestStore_PeerIDAndRole: add_message includes peer_id from scope.UserID
-// and role="assistant" (knowledge is agent-extracted, not user input).
+// and role="user" — OV's extraction contract sources user memories
+// (profile/preferences/entities/events) from user-role content only;
+// assistant-role content feeds agent-scope types the assistant
+// memory_policy disables.
 func TestStore_PeerIDAndRole(t *testing.T) {
 	srv := newSessionMockServer()
 	defer srv.Close()
@@ -550,43 +576,98 @@ func TestStore_PeerIDAndRole(t *testing.T) {
 	}
 	msgs := srv.addMsgBodies[0]["messages"].([]any)
 	msg := msgs[0].(map[string]any)
-	if msg["role"] != "assistant" {
-		t.Errorf("role = %v, want assistant", msg["role"])
+	if msg["role"] != "user" {
+		t.Errorf("role = %v, want user", msg["role"])
 	}
 	if msg["peer_id"] != "alice@example.com" {
 		t.Errorf("peer_id = %v, want alice@example.com", msg["peer_id"])
 	}
 }
 
-// TestStore_CrashRecovery: on startup, GET session returns
-// pending_tokens > 0 → client commits the leftovers before proceeding.
-func TestStore_CrashRecovery(t *testing.T) {
+// TestStore_DefaultPeerID: an empty scope.UserID (local CLI/TUI session)
+// falls back to the default peer so extraction still has a target —
+// without a peer_id, user-role knowledge is silently dropped under the
+// assistant memory_policy.
+func TestStore_DefaultPeerID(t *testing.T) {
 	srv := newSessionMockServer()
 	defer srv.Close()
-	srv.mu.Lock()
-	srv.sessionExists = true
-	srv.pendingTokens = 8000 // leftover from a crashed process
-	srv.mu.Unlock()
 
 	client, _ := NewClientWithSession(srv.URL, "", SessionConfig{
 		SessionIDSeed: "/test/config",
 	})
-	ovSID := client.SessionIDFor("conv-1")
+	mem := NewMemory(client)
 
-	// Trigger ensureSession by calling AddMessage.
-	_, err := client.AddMessage(context.Background(), "assistant", "new message", "", ovSID)
+	err := mem.Store(context.Background(), ctxpkg.ContextScope{SessionID: "conv-1"},
+		ctxpkg.MemoryItem{Content: "some local fact"})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
-	// GET happened (crash recovery check), then commit happened (leftover flush).
-	if srv.getCount != 1 {
-		t.Errorf("GET session count = %d, want 1", srv.getCount)
+	if len(srv.addMsgBodies) != 1 {
+		t.Fatalf("add_message count = %d, want 1", len(srv.addMsgBodies))
 	}
-	if srv.commitCount < 1 {
-		t.Errorf("commit count = %d, want >= 1 (crash recovery)", srv.commitCount)
+	msg := srv.addMsgBodies[0]["messages"].([]any)[0].(map[string]any)
+	if msg["peer_id"] != defaultPeerID {
+		t.Errorf("peer_id = %v, want fallback %q", msg["peer_id"], defaultPeerID)
+	}
+}
+
+// TestStore_RestartSeedsCounting: a restarted client (same seed, fresh
+// in-memory state) adopts the server-reported counters via GET, so
+// message-count accumulation continues across process restarts instead
+// of resetting. ensureSession itself must NOT commit — an active
+// conversation keeps accumulating; the startup sweep owns abandoned
+// sessions.
+func TestStore_RestartSeedsCounting(t *testing.T) {
+	srv := newSessionMockServer()
+	defer srv.Close()
+	srv.mu.Lock()
+	srv.sessionExists = true
+	srv.mu.Unlock()
+
+	cfg := SessionConfig{
+		SessionIDSeed:          "/test/config",
+		CommitMessageThreshold: 3,
+		MinCommitInterval:      1 * time.Millisecond,
+	}
+
+	// First process: 2 stores, below threshold → no commit. The mock
+	// (like the real server) persists liveMsgCount across clients.
+	c1, _ := NewClientWithSession(srv.URL, "", cfg)
+	mem1 := NewMemory(c1)
+	for i := 0; i < 2; i++ {
+		if err := mem1.Store(context.Background(), ctxpkg.ContextScope{SessionID: "conv-1"},
+			ctxpkg.MemoryItem{Content: "fact", Topic: "t"}); err != nil {
+			t.Fatalf("Store[%d]: %v", i, err)
+		}
+	}
+	srv.mu.Lock()
+	if srv.commitCount != 0 {
+		srv.mu.Unlock()
+		t.Fatalf("pre-restart commit count = %d, want 0", srv.commitCount)
+	}
+	if srv.liveMsgCount != 2 {
+		srv.mu.Unlock()
+		t.Fatalf("server liveMsgCount = %d, want 2", srv.liveMsgCount)
+	}
+	srv.mu.Unlock()
+
+	// Simulated restart: a NEW client with the same seed. ensureSession
+	// GET seeds local state from the server truth (message_count=2);
+	// one more write crosses the threshold → commit.
+	c2, _ := NewClientWithSession(srv.URL, "", cfg)
+	mem2 := NewMemory(c2)
+	if err := mem2.Store(context.Background(), ctxpkg.ContextScope{SessionID: "conv-1"},
+		ctxpkg.MemoryItem{Content: "third fact", Topic: "t"}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.commitCount != 1 {
+		t.Errorf("post-restart commit count = %d, want 1 (counting continued from server truth)", srv.commitCount)
 	}
 }
 
