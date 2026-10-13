@@ -21,10 +21,13 @@
 //	TF_BINARY_MIRRORS  comma-separated terraform binary download mirror URLs
 //	TF_PROVIDER_MIRRORS comma-separated provider mirror URLs or local paths
 //
-// Cloud credentials are read from the environment by the selected provider
-// (e.g. HW_ACCESS_KEY, HW_SECRET_KEY, HW_REGION, HW_SECURITY_TOKEN for
-// huaweicloud). The http_request tool uses AK/SK for SDK-HMAC-SHA256 signing
-// — credentials never enter the LLM context.
+// Cloud credentials (AK/SK, optional temporary security token) are read
+// from the Linux kernel user keyring (keyctl) by the selected provider —
+// service "hwcloud", keys HW_ACCESS_KEY / HW_SECRET_KEY / HW_SECURITY_TOKEN,
+// payload base64, provisioned per boot (the kernel keyring is RAM-only).
+// HW_REGION stays an environment variable. The http_request tool uses
+// AK/SK for SDK-HMAC-SHA256 signing — credentials never enter the LLM
+// context.
 //
 // Skills (deployment guide + references, pricing guide, troubleshoot guide)
 // are embedded at compile time (go:embed) and extracted to disk at startup.

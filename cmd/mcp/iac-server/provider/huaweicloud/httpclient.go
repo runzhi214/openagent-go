@@ -120,7 +120,7 @@ func (t *HTTPRequest) Execute(ctx context.Context, args json.RawMessage) *openag
 		return openagent.ErrorResult(fmt.Errorf("http_request: %w", err), false, "")
 	}
 	if t.ak == "" || t.sk == "" {
-		return openagent.ErrorResult(fmt.Errorf("http_request: credentials not configured — set HW_ACCESS_KEY and HW_SECRET_KEY"), false, "")
+		return openagent.ErrorResult(fmt.Errorf("http_request: credentials not configured — provision HW_ACCESS_KEY and HW_SECRET_KEY in the kernel keyring (keyctl add user hwcloud:HW_ACCESS_KEY \"$(printf %%s \"$AK\" | base64)\" @u)"), false, "")
 	}
 	method := strings.ToUpper(params.Method)
 	if method == "" {

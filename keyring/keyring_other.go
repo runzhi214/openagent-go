@@ -19,3 +19,11 @@ func openBackend() (backend, error) {
 	}
 	return secretServiceBackend{}, nil
 }
+
+// OpenKeyctl returns ErrKeyringUnavailable on non-Linux platforms: the
+// kernel user keyring (KeyCtl) is a Linux-only facility. Callers using it
+// for a cross-platform credential contract must degrade to their
+// "credentials not configured" error path, not abort.
+func OpenKeyctl() (Keyring, error) {
+	return nil, ErrKeyringUnavailable
+}

@@ -36,6 +36,21 @@ func openBackend() (backend, error) {
 	return keyctlBackend{}, nil
 }
 
+// OpenKeyctl returns a keyring pinned to the Linux kernel user keyring
+// (KeyCtl), bypassing openBackend's Secret Service preference entirely.
+// The two backends are separate stores: on a machine with a D-Bus Secret
+// Service, Open() returns the D-Bus backend and cannot see keys written
+// via keyctl — callers that provision credentials into the kernel keyring
+// (e.g. iac-server's deployment contract) must read them through here.
+// Returns ErrKeyringUnavailable when the kernel keyring is not usable
+// (non-Linux, containers without keyutils).
+func OpenKeyctl() (Keyring, error) {
+	if err := ensureKeyringLinked(); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrKeyringUnavailable, err)
+	}
+	return keyctlBackend{}, nil
+}
+
 // isSecretServiceAvailable checks whether the Secret Service D-Bus
 // service is registered on the session bus. It guards against the two
 // autolaunch triggers in godbus getSessionBusAddress — an empty or
@@ -84,21 +99,36 @@ func ensureKeyringLinked() error {
 
 // keyctlBackend stores base64-encoded secrets in the Linux kernel
 // keyring under type "user" with descriptions "<service>:<key>".
+//
+// Set and Delete operate on the user keyring (@u) — the keyring shared
+// by every session of the UID. Get searches the session keyring tree
+// (@s) first and falls back to @u, so keys provisioned into either the
+// session keyring (sandbox / container entrypoint provisioning, where
+// the session keyring is the natural per-boot secret store) or the user
+// keyring are readable. When both hold a key with the same description,
+// the session-keyring copy wins.
 type keyctlBackend struct{}
 
 func keyctlDesc(service, key string) string {
 	return service + ":" + key
 }
 
-func (keyctlBackend) Get(service, key string) (string, error) {
-	id, err := unix.KeyctlSearch(unix.KEY_SPEC_USER_KEYRING,
-		keyringKeyType, keyctlDesc(service, key), 0)
+// keyctlSearchID finds the id of a "user" key with the given description,
+// searching the keyring tree rooted at root. Returns gkr.ErrNotFound when
+// no such key exists in the tree.
+func keyctlSearchID(root int, desc string) (int, error) {
+	id, err := unix.KeyctlSearch(root, keyringKeyType, desc, 0)
 	if err != nil {
 		if errors.Is(err, unix.ENOKEY) || errors.Is(err, unix.ENOENT) {
-			return "", gkr.ErrNotFound
+			return 0, gkr.ErrNotFound
 		}
-		return "", fmt.Errorf("keyctl search: %w", err)
+		return 0, fmt.Errorf("keyctl search: %w", err)
 	}
+	return id, nil
+}
+
+// keyctlRead reads a key's payload by id and decodes the base64 wrapper.
+func keyctlRead(id int) (string, error) {
 	// First call with nil buffer returns the required size.
 	n, err := unix.KeyctlBuffer(unix.KEYCTL_READ, id, nil, 0)
 	if err != nil {
@@ -111,13 +141,35 @@ func (keyctlBackend) Get(service, key string) (string, error) {
 	return b64Decode(string(buf))
 }
 
+func (keyctlBackend) Get(service, key string) (string, error) {
+	desc := keyctlDesc(service, key)
+	// Search the session keyring tree first. KEYCTL_SEARCH walks the tree
+	// depth-first, and ensureKeyringLinked() — run by openBackend /
+	// OpenKeyctl before any Get — links @u into the caller's session
+	// keyring, so an @s-rooted search normally covers @u-provisioned keys
+	// as well. The explicit @u retry below covers setups where that link
+	// does not reach the key's actual location.
+	id, err := keyctlSearchID(unix.KEY_SPEC_SESSION_KEYRING, desc)
+	if err == nil {
+		return keyctlRead(id)
+	}
+	if !errors.Is(err, gkr.ErrNotFound) {
+		return "", err
+	}
+	// Not in the session keyring tree — retry the user keyring directly.
+	id, err = keyctlSearchID(unix.KEY_SPEC_USER_KEYRING, desc)
+	if err != nil {
+		return "", err
+	}
+	return keyctlRead(id)
+}
+
 func (keyctlBackend) Set(service, key, value string) error {
 	desc := keyctlDesc(service, key)
 	// Revoke an existing key with the same description to avoid duplicates.
 	// AddKey would update an in-place key, but revoking first is simpler
 	// and consistent across kernel versions.
-	if id, err := unix.KeyctlSearch(unix.KEY_SPEC_USER_KEYRING,
-		keyringKeyType, desc, 0); err == nil {
+	if id, err := keyctlSearchID(unix.KEY_SPEC_USER_KEYRING, desc); err == nil {
 		_, _ = unix.KeyctlInt(unix.KEYCTL_REVOKE, id, 0, 0, 0)
 	}
 	if _, err := unix.AddKey(keyringKeyType, desc,
@@ -128,13 +180,9 @@ func (keyctlBackend) Set(service, key, value string) error {
 }
 
 func (keyctlBackend) Delete(service, key string) error {
-	id, err := unix.KeyctlSearch(unix.KEY_SPEC_USER_KEYRING,
-		keyringKeyType, keyctlDesc(service, key), 0)
+	id, err := keyctlSearchID(unix.KEY_SPEC_USER_KEYRING, keyctlDesc(service, key))
 	if err != nil {
-		if errors.Is(err, unix.ENOKEY) || errors.Is(err, unix.ENOENT) {
-			return gkr.ErrNotFound
-		}
-		return fmt.Errorf("keyctl search: %w", err)
+		return err
 	}
 	if _, err := unix.KeyctlInt(unix.KEYCTL_UNLINK, id,
 		unix.KEY_SPEC_USER_KEYRING, 0, 0); err != nil {
