@@ -188,6 +188,10 @@ type ModelConfig struct {
 	InputCostPerMillion      float64
 	InputCacheCostPerMillion float64
 	OutputCostPerMillion     float64
+	// ReasoningEfforts is the settings-declared vocabulary (nil when the
+	// model relies on built-in detection). Preserved by SetModel like
+	// apiKey/baseURL so runtime_set_model_config updates don't lose it.
+	ReasoningEfforts []string
 }
 
 // agentSession holds per-session runtime state.
@@ -600,8 +604,9 @@ func (s *AgentServer) killSubAgents(ss *agentSession) {
 // SetModel replaces or inserts a model in the registry. Used by
 // runtime_set_model_config. When the model already exists, empty apiKey
 // or baseURL preserve the originals; when inserting a new model, values
-// are used as-is.
-func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string, maxInputTokens, maxOutputTokens int) {
+// are used as-is. reasoningEfforts follows the same rule (nil preserves
+// the settings-declared vocabulary of the existing entry).
+func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string, maxInputTokens, maxOutputTokens int, reasoningEfforts []string) {
 	s.modelsMu.Lock()
 	defer s.modelsMu.Unlock()
 	key := provider + "/" + modelID
@@ -622,6 +627,10 @@ func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string, maxInp
 	if mot == 0 {
 		mot = old.MaxOutputTokens
 	}
+	vocab := reasoningEfforts
+	if len(vocab) == 0 {
+		vocab = old.ReasoningEfforts
+	}
 	if exists {
 		slog.Info("acp updating model", "key", key)
 	} else {
@@ -631,6 +640,9 @@ func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string, maxInp
 	if cw > 0 {
 		m = m.WithContextWindow(cw)
 	}
+	if len(vocab) > 0 {
+		m = m.WithReasoningEfforts(vocab)
+	}
 	s.Models[key] = m
 	s.modelConfigs[key] = ModelConfig{
 		Provider: provider, ModelID: modelID, APIKey: apiKey, BaseURL: baseURL,
@@ -639,6 +651,7 @@ func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string, maxInp
 		InputCostPerMillion:      old.InputCostPerMillion,
 		InputCacheCostPerMillion: old.InputCacheCostPerMillion,
 		OutputCostPerMillion:     old.OutputCostPerMillion,
+		ReasoningEfforts:         vocab,
 	}
 }
 
@@ -733,7 +746,7 @@ func (s *AgentServer) GetDefaultModelID() string {
 }
 
 // RegisterModel stores a model's original config for SetModel fallback.
-func (s *AgentServer) RegisterModel(key, provider, modelID, apiKey, baseURL string, pricing ModelPricing) {
+func (s *AgentServer) RegisterModel(key, provider, modelID, apiKey, baseURL string, reasoningEfforts []string, pricing ModelPricing) {
 	s.modelsMu.Lock()
 	defer s.modelsMu.Unlock()
 	s.modelConfigs[key] = ModelConfig{
@@ -743,6 +756,7 @@ func (s *AgentServer) RegisterModel(key, provider, modelID, apiKey, baseURL stri
 		InputCostPerMillion:      pricing.InputCostPerMillion,
 		InputCacheCostPerMillion: pricing.InputCacheCostPerMillion,
 		OutputCostPerMillion:     pricing.OutputCostPerMillion,
+		ReasoningEfforts:         reasoningEfforts,
 	}
 }
 
@@ -775,6 +789,16 @@ func (s *AgentServer) resolveModelConfig(ss *agentSession) (provider, modelID st
 	return "", key
 }
 
+// sessionModelKey returns the registry key of the session's model: the
+// session "model" config value wins over the server default.
+func (s *AgentServer) sessionModelKey(ss *agentSession) string {
+	key := s.GetDefaultModelID()
+	if val, ok := ss.ConfigString("model"); ok {
+		key = val
+	}
+	return key
+}
+
 // resolveSessionModel returns the model for the session's current config
 // (session "model" config value wins over the server default). Unlike
 // Runtime.Model() which returns the previous run's snapshot (runModel),
@@ -782,12 +806,80 @@ func (s *AgentServer) resolveModelConfig(ss *agentSession) (provider, modelID st
 // critical for oaSession.Model in OnPrompt so run()'s session.Model
 // override does not defeat a mid-session model switch.
 func (s *AgentServer) resolveSessionModel(ss *agentSession) openagent.Model {
-	key := s.GetDefaultModelID()
-	if val, ok := ss.ConfigString("model"); ok {
-		key = val
-	}
-	m, _ := s.LookupModel(key)
+	m, _ := s.LookupModel(s.sessionModelKey(ss))
 	return m
+}
+
+// vocabForModel returns the effective reasoning-effort vocabulary for the
+// model registered under key: the model instance first (settings
+// reasoning_efforts already applied over built-in detection at
+// construction), then the settings-declared vocabulary (when the instance
+// is missing), then the generic default.
+func (s *AgentServer) vocabForModel(key string) []string {
+	s.modelsMu.Lock()
+	defer s.modelsMu.Unlock()
+	if m, ok := s.Models[key]; ok {
+		if rm, ok := m.(openagent.ReasoningEffortModeler); ok {
+			if v := rm.ReasoningEfforts(); len(v) > 0 {
+				return v
+			}
+		}
+	}
+	if v := s.modelConfigs[key].ReasoningEfforts; len(v) > 0 {
+		return v
+	}
+	return openagent.DefaultReasoningEfforts()
+}
+
+// defaultThoughtLevel is the thought_level a fresh session on the model
+// registered under key starts with.
+func (s *AgentServer) defaultThoughtLevel(key string) string {
+	return openagent.DefaultReasoningEffort(s.vocabForModel(key))
+}
+
+// revalidateThoughtLevel re-checks the session's thought_level against the
+// vocabulary of the newly selected model. An effort that was legal on the
+// previous model (e.g. medium on glm-5.2) may be rejected by the new one
+// (glm-5.3-flash intermittently 400s medium) — fall back to the model's
+// default, persist it, and sync it onto the live runtime.
+func (s *AgentServer) revalidateThoughtLevel(ctx context.Context, sid openacp.SessionId, ss *agentSession, modelKey string) {
+	lv, ok := ss.ConfigString("thought_level")
+	if !ok || lv == "" {
+		return
+	}
+	vocab := s.vocabForModel(modelKey)
+	if openagent.AllowsReasoningEffort(vocab, lv) {
+		return
+	}
+	fallback := openagent.DefaultReasoningEffort(vocab)
+	slog.Warn("thought_level not supported by model, falling back",
+		"session", sid, "model", modelKey, "thought_level", lv, "fallback", fallback)
+	ss.SetConfigValue("thought_level", fallback)
+	s.saveConfig(ctx, string(sid))
+	if rt := ss.getRuntime(); rt != nil {
+		rt.SetReasoningEffort(fallback)
+	}
+}
+
+// effortDisplayName renders a vocabulary entry for the select option list
+// ("low" → "Low", "max" → "Max").
+func effortDisplayName(v string) string {
+	if v == "" {
+		return v
+	}
+	r := []rune(v)
+	return strings.ToUpper(string(r[0])) + string(r[1:])
+}
+
+// freshSessionConfig is the config map a session with no persisted state
+// starts with: the default model and that model's default thought level
+// (medium on the generic vocabulary, high on always-thinking models).
+func (s *AgentServer) freshSessionConfig() map[openacp.SessionConfigId]any {
+	key := s.GetDefaultModelID()
+	return map[openacp.SessionConfigId]any{
+		"thought_level": s.defaultThoughtLevel(key),
+		"model":         key,
+	}
 }
 
 // switchSessionModel updates the session runtime, summarizer, and
@@ -1334,7 +1426,7 @@ func (s *AgentServer) OnNewSession(ctx context.Context, req openacp.NewSessionRe
 		cwd:                   cwd,
 		createdAt:             time.Now(),
 		mode:                  s.defaultMode(),
-		config:                map[openacp.SessionConfigId]any{"thought_level": "medium", "model": s.defaultModelID},
+		config:                s.freshSessionConfig(),
 		firstPrompt:           true,
 		additionalDirectories: req.AdditionalDirectories,
 		mcpServers:            req.McpServers,
@@ -1383,7 +1475,7 @@ func (s *AgentServer) OnLoadSession(ctx context.Context, req openacp.LoadSession
 			mode = s.defaultMode()
 		}
 		if config == nil {
-			config = map[openacp.SessionConfigId]any{"thought_level": "medium", "model": s.defaultModelID}
+			config = s.freshSessionConfig()
 		}
 		cwd := s.resolveSessionCwd(ctx, string(req.SessionID), req.Cwd)
 		ss = &agentSession{
@@ -1560,7 +1652,7 @@ func (s *AgentServer) OnResumeSession(ctx context.Context, req openacp.ResumeSes
 			mode = s.defaultMode()
 		}
 		if config == nil {
-			config = map[openacp.SessionConfigId]any{"thought_level": "medium", "model": s.defaultModelID}
+			config = s.freshSessionConfig()
 		}
 		cwd := s.resolveSessionCwd(ctx, string(req.SessionID), req.Cwd)
 		ss = &agentSession{
@@ -1711,8 +1803,8 @@ func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.Sessio
 	// mode picker: the client believed auto was already selected, so picking
 	// auto hit the no-change early return and the first switch did nothing.
 	mode := s.defaultMode()
-	thoughtLevel := "medium"
 	modelID := s.GetDefaultModelID()
+	thoughtLevel := s.defaultThoughtLevel(modelID)
 	if ss != nil {
 		mode = ss.Mode()
 		if val, ok := ss.ConfigString("thought_level"); ok {
@@ -1721,6 +1813,14 @@ func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.Sessio
 		if val, ok := ss.ConfigString("model"); ok {
 			modelID = val
 		}
+	}
+	// A persisted thought_level outside the model's vocabulary (saved while
+	// another model was selected) is advertised as the model's default —
+	// the same fallback buildRuntimeForSession applies before the next
+	// prompt, so the picker never shows a value the provider rejects.
+	tlVocab := s.vocabForModel(modelID)
+	if !openagent.AllowsReasoningEffort(tlVocab, thoughtLevel) {
+		thoughtLevel = openagent.DefaultReasoningEffort(tlVocab)
 	}
 
 	opts := []openacp.SessionConfigOption{
@@ -1738,20 +1838,24 @@ func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.Sessio
 				{Value: "plan", Name: "Plan", Description: "Present the plan first, AI will execute it according to the plan"},
 			},
 		},
-		{
-			ID:           "thought_level",
-			Name:         "Reasoning Level",
-			Description:  "Controls the amount of reasoning the model produces",
-			Category:     "thought_level",
-			Type:         "select",
-			CurrentValue: thoughtLevel,
-			Options: []openacp.SessionConfigOptValue{
-				{Value: "low", Name: "Low"},
-				{Value: "medium", Name: "Medium"},
-				{Value: "high", Name: "High"},
-			},
-		},
 	}
+
+	// The thought_level options come from the current model's vocabulary
+	// (settings reasoning_efforts > built-in table > generic default), so
+	// the picker only offers values the provider actually accepts.
+	tlOpts := make([]openacp.SessionConfigOptValue, 0, len(tlVocab))
+	for _, v := range tlVocab {
+		tlOpts = append(tlOpts, openacp.SessionConfigOptValue{Value: v, Name: effortDisplayName(v)})
+	}
+	opts = append(opts, openacp.SessionConfigOption{
+		ID:           "thought_level",
+		Name:         "Reasoning Level",
+		Description:  "Controls the amount of reasoning the model produces",
+		Category:     "thought_level",
+		Type:         "select",
+		CurrentValue: thoughtLevel,
+		Options:      tlOpts,
+	})
 
 	// Model selector.
 	if ids := s.ModelIDs(); len(ids) > 0 {
@@ -1982,10 +2086,22 @@ func (s *AgentServer) OnSetSessionConfigOption(ctx context.Context, req openacp.
 	case "boolean":
 		if b, ok := req.Value.(bool); ok {
 			ss.SetConfigValue(req.ConfigID, b)
+			slog.Info("session config set", "session", req.SessionID, "config_id", req.ConfigID, "value", b)
 		}
 	default:
 		if val, ok := req.Value.(string); ok {
+			// thought_level must be in the current model's vocabulary —
+			// reject before it is stored or reaches the provider
+			// (glm-5.3-flash intermittently 400s "medium" at the gateway).
+			if req.ConfigID == "thought_level" {
+				key := s.sessionModelKey(ss)
+				if vocab := s.vocabForModel(key); !openagent.AllowsReasoningEffort(vocab, val) {
+					return nil, fmt.Errorf("thought_level %q is not supported by model %q (supported: %s)",
+						val, key, strings.Join(vocab, ", "))
+				}
+			}
 			ss.SetConfigValue(req.ConfigID, val)
+			slog.Info("session config set", "session", req.SessionID, "config_id", req.ConfigID, "value", val)
 		}
 	}
 
@@ -2004,24 +2120,26 @@ func (s *AgentServer) OnSetSessionConfigOption(ctx context.Context, req openacp.
 		}
 	}
 
-	// Live-sync model / reasoning-effort onto the session runtime so the
-	// next prompt uses the new config without a runtime rebuild.
-	if rt := ss.getRuntime(); rt != nil {
-		switch req.ConfigID {
-		case "model":
-			if v, ok := ss.ConfigString("model"); ok {
-				if m, ok := s.LookupModel(v); ok {
-					s.switchSessionModel(ss, m)
-				} else {
-					// The requested model is not in the provider list —
-					// keep the current model, but don't stay silent.
-					slog.Warn("requested model not in provider list, keeping current", "session", req.SessionID, "model", v)
-				}
+	// Live-sync the model switch onto the session runtime so the next
+	// prompt uses the new model without a runtime rebuild. Runs even when
+	// the session has no runtime yet: revalidateThoughtLevel persists the
+	// vocabulary fallback, which buildRuntimeForSession picks up later.
+	if req.ConfigID == "model" {
+		if v, ok := ss.ConfigString("model"); ok {
+			if m, ok := s.LookupModel(v); ok {
+				s.switchSessionModel(ss, m)
+				s.revalidateThoughtLevel(ctx, req.SessionID, ss, v)
+			} else {
+				// The requested model is not in the provider list —
+				// keep the current model, but don't stay silent.
+				slog.Warn("requested model not in provider list, keeping current", "session", req.SessionID, "model", v)
 			}
-		case "thought_level":
-			if v, ok := ss.ConfigString("thought_level"); ok && v != "" {
-				rt.SetReasoningEffort(v)
-			}
+		}
+	}
+	// Live-sync the reasoning effort onto the session runtime.
+	if rt := ss.getRuntime(); rt != nil && req.ConfigID == "thought_level" {
+		if v, ok := ss.ConfigString("thought_level"); ok && v != "" {
+			rt.SetReasoningEffort(v)
 		}
 	}
 
@@ -2176,9 +2294,14 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 		}
 	}
 
-	// Inject AgentRuntime for runtime_* host exports.
+	// Inject AgentRuntime for runtime_* host exports. The adapter drops
+	// the vocabulary parameter: runtime_set_model_config edits connection
+	// params only, so the registered vocabulary is preserved (SetModel
+	// treats a nil vocab like an empty apiKey — keep the stored value).
 	if s.PluginMgr != nil {
-		rt := wasm.BuildAgentRuntime(agent, &oaSession, s.SetModel, s.SetEmbedding)
+		rt := wasm.BuildAgentRuntime(agent, &oaSession, func(provider, modelID, apiKey, baseURL string, maxIn, maxOut int) {
+			s.SetModel(provider, modelID, apiKey, baseURL, maxIn, maxOut, nil)
+		}, s.SetEmbedding)
 		ctx = wasmhost.WithAgentRuntime(ctx, rt)
 	}
 
@@ -2566,6 +2689,19 @@ func (s *AgentServer) buildRuntimeForSession(sid openacp.SessionId, ss *agentSes
 		cfg.Model = m
 	}
 	if v, ok := ss.ConfigString("thought_level"); ok && v != "" {
+		// Self-heal sessions persisted with an effort the current model
+		// rejects (saved on another model, or before the vocabulary
+		// constraint existed): fall back to the model's default so the
+		// stored value never reaches the provider.
+		if rm, ok := cfg.Model.(openagent.ReasoningEffortModeler); ok {
+			if vocab := rm.ReasoningEfforts(); !openagent.AllowsReasoningEffort(vocab, v) {
+				fallback := openagent.DefaultReasoningEffort(vocab)
+				slog.Warn("saved thought_level not supported by model, falling back",
+					"session", sid, "model", modelID, "thought_level", v, "fallback", fallback)
+				ss.SetConfigValue("thought_level", fallback)
+				v = fallback
+			}
+		}
 		cfg.ReasoningEffort = v
 	}
 
@@ -3001,6 +3137,7 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 			}
 			ss.SetConfigValue("model", modelID)
 			s.switchSessionModel(ss, m)
+			s.revalidateThoughtLevel(ctx, sid, ss, modelID)
 			s.saveConfig(ctx, string(sid))
 			if s.updateSender != nil {
 				opts := s.buildConfigOptions(sid)

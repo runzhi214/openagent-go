@@ -239,7 +239,8 @@ type ProviderConfig struct {
 //	  "max_output_tokens": 8192,
 //	  "input_cost_per_million": 1,
 //	  "input_cache_cost_per_million": 0.1,
-//	  "output_cost_per_million": 2
+//	  "output_cost_per_million": 2,
+//	  "reasoning_efforts": ["low", "high", "max"]
 //	}]
 //
 // max_input_tokens overrides the built-in vendor lookup — required for
@@ -247,13 +248,19 @@ type ProviderConfig struct {
 // smaller than the table (a declared 1M with an actual 128K would fail
 // requests past 128K with no diagnostics). The cost fields feed usage
 // reporting (ACP usage_update cost). 0/absent = built-in lookup / no cost.
+//
+// reasoning_efforts restricts the reasoning_effort (thought_level) values
+// advertised and accepted for this model — required when the provider
+// rejects parts of the generic set (glm-5.3-flash intermittently 400s
+// "medium"). Absent = built-in vendor lookup, then low/medium/high.
 type ModelConfig struct {
-	ID                       string  `json:"id"`
-	MaxInputTokens           int     `json:"max_input_tokens,omitempty"`
-	MaxOutputTokens          int     `json:"max_output_tokens,omitempty"`
-	InputCostPerMillion      float64 `json:"input_cost_per_million,omitempty"`
-	InputCacheCostPerMillion float64 `json:"input_cache_cost_per_million,omitempty"`
-	OutputCostPerMillion     float64 `json:"output_cost_per_million,omitempty"`
+	ID                       string   `json:"id"`
+	MaxInputTokens           int      `json:"max_input_tokens,omitempty"`
+	MaxOutputTokens          int      `json:"max_output_tokens,omitempty"`
+	InputCostPerMillion      float64  `json:"input_cost_per_million,omitempty"`
+	InputCacheCostPerMillion float64  `json:"input_cache_cost_per_million,omitempty"`
+	OutputCostPerMillion     float64  `json:"output_cost_per_million,omitempty"`
+	ReasoningEfforts         []string `json:"reasoning_efforts,omitempty"`
 }
 
 // UnmarshalJSON accepts both the legacy string form ("gpt-4o") and the

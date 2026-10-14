@@ -36,7 +36,7 @@ func TestReload_KeepsPluginInjectedProvider(t *testing.T) {
 	// as loadPlugins → CallInit → buildModels → RegisterModel/SetModel does
 	// at startup. This key never appears in the on-disk settings.json.
 	const pluginKey = "my_plugin_provider/injected-model"
-	srv.SetModel("my_plugin_provider", "injected-model", "sk-plugin-secret", "", 0, 0)
+	srv.SetModel("my_plugin_provider", "injected-model", "sk-plugin-secret", "", 0, 0, nil)
 	if !containsModel(srv, pluginKey) {
 		t.Fatalf("setup: plugin-injected model %q not registered", pluginKey)
 	}

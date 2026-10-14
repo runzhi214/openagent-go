@@ -3,6 +3,7 @@ package kernel
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"runtime"
 	"strings"
 	"time"
@@ -108,7 +109,20 @@ func (rt *Runtime) buildModelRequest(session openagent.Session, messages []opena
 	}
 	rt.mu.RLock()
 	reasoningEffort := rt.cfg.ReasoningEffort
+	model := rt.cfg.Model
 	rt.mu.RUnlock()
+	// Last-resort vocabulary guard: an effort saved on another model (or
+	// inherited by a sub-agent) may be rejected by this model's provider
+	// (glm-5.3-flash intermittently 400s "medium"). Drop it to the
+	// model's default instead of letting an invalid value reach the wire.
+	if rm, ok := model.(openagent.ReasoningEffortModeler); ok {
+		if vocab := rm.ReasoningEfforts(); !openagent.AllowsReasoningEffort(vocab, reasoningEffort) {
+			fallback := openagent.DefaultReasoningEffort(vocab)
+			slog.Warn("reasoning effort not supported by model, falling back",
+				"effort", reasoningEffort, "fallback", fallback)
+			reasoningEffort = fallback
+		}
+	}
 	return openagent.ChatCompletionRequest{
 		Model:           session.ModelID,
 		Messages:        messages,
