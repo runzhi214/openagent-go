@@ -27,9 +27,10 @@ import (
 
 // Model implements openagent.Model via openai-go v3.
 type Model struct {
-	client        openaisdk.Client
-	modelID       string
-	contextWindow int
+	client           openaisdk.Client
+	modelID          string
+	contextWindow    int
+	reasoningEfforts []string
 }
 
 // New creates a Model with the given API key, model ID, and base URL.
@@ -56,14 +57,26 @@ func New(apiKey, modelID, baseURL string) *Model {
 		opts = append(opts, option.WithBaseURL(baseURL))
 	}
 	return &Model{
-		client:        openaisdk.NewClient(opts...),
-		modelID:       modelID,
-		contextWindow: modelContextWindow(modelID),
+		client:           openaisdk.NewClient(opts...),
+		modelID:          modelID,
+		contextWindow:    modelContextWindow(modelID),
+		reasoningEfforts: utils.ModelReasoningEfforts(modelID),
 	}
 }
 
 func (m *Model) WithContextWindow(tokens int) *Model { m.contextWindow = tokens; return m }
 func (m *Model) ContextWindow() int                  { return m.contextWindow }
+
+// WithReasoningEfforts overrides the built-in vocabulary detection with
+// the settings-declared one (provider models "reasoning_efforts"). Empty
+// slices are ignored so built-in detection survives.
+func (m *Model) WithReasoningEfforts(v []string) *Model {
+	if len(v) > 0 {
+		m.reasoningEfforts = v
+	}
+	return m
+}
+func (m *Model) ReasoningEfforts() []string { return m.reasoningEfforts }
 
 // ListModels queries the provider's /models endpoint for the list of
 // available models. Works against any OpenAI-compatible base URL (OpenAI,
@@ -173,6 +186,9 @@ func modelContextWindow(modelID string) int {
 
 // Ensure *Model implements the optional TokenizerModeler interface.
 var _ openagent.TokenizerModeler = (*Model)(nil)
+
+// Ensure *Model implements the optional ReasoningEffortModeler interface.
+var _ openagent.ReasoningEffortModeler = (*Model)(nil)
 var _ openagent.ModelLister = (*Model)(nil)
 
 func (m *Model) ChatCompletion(ctx context.Context, req openagent.ChatCompletionRequest) (*openagent.ChatCompletionResponse, error) {

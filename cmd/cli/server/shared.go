@@ -109,9 +109,13 @@ func buildModels(providers map[string]config.ProviderConfig) ([]openagent.Model,
 			m := openai.New(apiKey, mc.ID, p.BaseURL)
 			// Explicit max_input_tokens overrides the built-in vendor
 			// lookup (quantized/shrunk custom models may declare 1M but
-			// serve 128K).
+			// serve 128K). Explicit reasoning_efforts overrides the
+			// built-in vocabulary the same way.
 			if mc.MaxInputTokens > 0 {
 				m = m.WithContextWindow(mc.MaxInputTokens)
+			}
+			if len(mc.ReasoningEfforts) > 0 {
+				m = m.WithReasoningEfforts(mc.ReasoningEfforts)
 			}
 			models = append(models, m)
 			infos = append(infos, modelReg{
@@ -125,6 +129,7 @@ func buildModels(providers map[string]config.ProviderConfig) ([]openagent.Model,
 				InputCostPerMillion:      mc.InputCostPerMillion,
 				InputCacheCostPerMillion: mc.InputCacheCostPerMillion,
 				OutputCostPerMillion:     mc.OutputCostPerMillion,
+				ReasoningEfforts:         mc.ReasoningEfforts,
 			})
 		}
 	}
@@ -142,6 +147,7 @@ type modelReg struct {
 	InputCostPerMillion      float64
 	InputCacheCostPerMillion float64
 	OutputCostPerMillion     float64
+	ReasoningEfforts         []string
 }
 
 // Key returns the registry key for this model: "<provider>/<id>" when a
@@ -1120,7 +1126,7 @@ func (sw *settingsWatcher) reconfigureModels(cfg config.Config) {
 	_, newInfos := buildModels(cfg.Provider)
 	for _, mi := range newInfos {
 		sw.srv.SetModel(mi.Provider, mi.ID, mi.APIKey, mi.BaseURL,
-			mi.MaxInputTokens, mi.MaxOutputTokens)
+			mi.MaxInputTokens, mi.MaxOutputTokens, mi.ReasoningEfforts)
 	}
 	// The extractor uses a dynamic model lookup (SetModelFn at startup),
 	// so it automatically picks up the new model instances — no manual

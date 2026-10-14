@@ -8,15 +8,17 @@ import (
 // ChatCompletionRequest is the input to a model call.
 // Follows OpenAI Chat Completions API format.
 type ChatCompletionRequest struct {
-	Model           string               `json:"model"`
-	Messages        []Message            `json:"messages"`
-	Tools           []FunctionDefinition `json:"tools,omitempty"`
-	Temperature     *float64             `json:"temperature,omitempty"` // nil = model default
-	MaxTokens       int                  `json:"max_tokens,omitempty"`  // 0 = model default
-	TopP            *float64             `json:"top_p,omitempty"`       // nil = model default
-	Stop            []string             `json:"stop,omitempty"`
-	ReasoningEffort string               `json:"reasoning_effort,omitempty"` // "none","minimal","low","medium","high","xhigh"
-	Stream          bool                 `json:"stream,omitempty"`
+	Model       string               `json:"model"`
+	Messages    []Message            `json:"messages"`
+	Tools       []FunctionDefinition `json:"tools,omitempty"`
+	Temperature *float64             `json:"temperature,omitempty"` // nil = model default
+	MaxTokens   int                  `json:"max_tokens,omitempty"`  // 0 = model default
+	TopP        *float64             `json:"top_p,omitempty"`       // nil = model default
+	Stop        []string             `json:"stop,omitempty"`
+	// The value must be in the model's vocabulary — see ReasoningEffortModeler.
+	// Providers accept subsets of "none","minimal","low","medium","high","max".
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	Stream          bool   `json:"stream,omitempty"`
 }
 
 // ChatCompletionResponse is the result of a model call.
@@ -64,6 +66,53 @@ type Model interface {
 // be a user-assigned label like "deepseek-v3" that tiktoken doesn't map).
 type TokenizerModeler interface {
 	TokenizerModel() string
+}
+
+// ReasoningEffortModeler is an optional interface for Models that declare
+// which reasoning_effort values their backing provider accepts. The ACP
+// server uses it to generate and validate the thought_level option; the
+// kernel drops efforts outside the vocabulary before they reach the wire.
+// A nil/empty vocabulary means unrestricted (any effort passes through).
+type ReasoningEffortModeler interface {
+	ReasoningEfforts() []string
+}
+
+// DefaultReasoningEfforts is the vocabulary assumed when a model declares
+// none — no settings reasoning_efforts and no built-in table match.
+func DefaultReasoningEfforts() []string {
+	return []string{"low", "medium", "high"}
+}
+
+// DefaultReasoningEffort picks the default effort for a vocabulary:
+// "medium" when present (the historical default), else "high" (the
+// closest tier on always-thinking models), else the last declared entry.
+// An empty vocabulary yields "".
+func DefaultReasoningEffort(vocab []string) string {
+	if len(vocab) == 0 {
+		return ""
+	}
+	for _, want := range []string{"medium", "high"} {
+		for _, v := range vocab {
+			if v == want {
+				return v
+			}
+		}
+	}
+	return vocab[len(vocab)-1]
+}
+
+// AllowsReasoningEffort reports whether effort is within vocab. An empty
+// vocabulary (or empty effort) means unrestricted.
+func AllowsReasoningEffort(vocab []string, effort string) bool {
+	if len(vocab) == 0 || effort == "" {
+		return true
+	}
+	for _, v := range vocab {
+		if v == effort {
+			return true
+		}
+	}
+	return false
 }
 
 // ModelLister is an optional interface for Models backed by a provider

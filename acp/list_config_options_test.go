@@ -78,7 +78,7 @@ func TestModelIDsSorted(t *testing.T) {
 	}
 	for _, k := range keys {
 		provider, model, _ := strings.Cut(k, "/")
-		srv.SetModel(provider, model, "sk-test", "", 0, 0)
+		srv.SetModel(provider, model, "sk-test", "", 0, 0, nil)
 	}
 	got := srv.ModelIDs()
 	want := append([]string(nil), keys...)
