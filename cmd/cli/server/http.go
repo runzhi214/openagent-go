@@ -233,7 +233,8 @@ func RunREST(ctx context.Context, cfg *config.Config) error {
 
 	// Register the settings watcher for the reload action. REST mode has
 	// no AgentServer (srv=nil) so model registry updates are skipped.
-	// fsnotify auto-reload is disabled — see acp.go for rationale.
+	// Settings changes apply via explicit reload (/settings reload or
+	// SIGHUP) — see acp.go for rationale.
 	activeWatcher.Store(&settingsWatcher{
 		cfgPath:  config.Path(),
 		prev:     cfg,

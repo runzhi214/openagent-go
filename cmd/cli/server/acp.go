@@ -266,12 +266,13 @@ func BuildACPServer(ctx context.Context, cfg *config.Config) (*openacpsdk.Server
 	server.SetLogger(slog.Default())
 
 	// Register the settings watcher so the settings tool's reload action
-	// can apply changes on demand. fsnotify auto-reload is disabled —
-	// settings changes are applied only via explicit reload (agent calls
-	// set → reload, or operator runs `openagent settings reload`).
-	// TODO: re-enable fsnotify with a non-broadcast notification mechanism
-	// (e.g. DynamicContext injection on next user turn) instead of
-	// broadcasting idle turns to all sessions.
+	// can apply changes on demand. settings changes are applied only via
+	// explicit reload: the agent calls set → reload, the user runs
+	// /settings reload, or the operator sends SIGHUP (handled by the
+	// reload signal loop started in main).
+	// TODO: optional fsnotify auto-reload with a non-broadcast notification
+	// mechanism (e.g. DynamicContext injection on next user turn) instead
+	// of broadcasting idle turns to all sessions.
 	activeWatcher.Store(&settingsWatcher{
 		cfgPath:  config.Path(),
 		prev:     cfg,

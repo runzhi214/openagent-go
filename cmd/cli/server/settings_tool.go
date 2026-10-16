@@ -15,9 +15,9 @@ import (
 // The settings tool lets the agent read and modify settings.json — the
 // same operations as the `openagent settings` CLI subcommand (set/get/
 // list/append/delete), against the same on-disk file. Writes are atomic
-// (temp file + rename); a running server's fsnotify watcher picks up the
-// change and hot-reloads applicable config (telemetry, log level, models,
-// mcp_servers) within ~500ms.
+// (temp file + rename); the `reload` action (or a SIGHUP to the server)
+// then hot-reloads applicable config (telemetry, log level, models,
+// mcp_servers).
 //
 // The tool is NOT read-only — it is classified Dangerous so every action
 // (including get/list) routes through the approver in manual mode.

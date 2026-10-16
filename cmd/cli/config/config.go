@@ -506,9 +506,8 @@ func Load(path string) (*Config, error) {
 
 // WriteConfig writes the config to path as pretty-printed JSON, creating
 // the parent directory if needed. Used on first run to persist a default
-// settings.json so the user has a file to edit and the fsnotify watcher
-// has something to monitor. Atomic (tmp + rename): a crash mid-write
-// must not leave a truncated file.
+// settings.json so the user has a file to edit. Atomic (tmp + rename): a
+// crash mid-write must not leave a truncated file.
 func WriteConfig(cfg *Config, path string) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
