@@ -41,9 +41,8 @@ func main() {
 			log.Fatalf("read settings: %v", err)
 		}
 		// First run: create an empty settings.json so the user has a file
-		// to edit, `settings get/list` works, and the fsnotify watcher has
-		// something to monitor. Defaults are applied in-memory by
-		// ApplyDefaults (step 5).
+		// to edit and `settings get/list` works. Defaults are applied
+		// in-memory by ApplyDefaults (step 5).
 		if wErr := config.WriteConfig(&config.Config{}, cfgPath); wErr != nil {
 			log.Printf("could not create %s: %v", cfgPath, wErr)
 		}
@@ -70,6 +69,14 @@ func main() {
 	// 3. Plugin runtime (keyring + HTTP + logger wired internally).
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// SIGHUP hot-reloads settings (nginx/sshd convention) instead of the
+	// default terminate — installed before any subcommand runs so the whole
+	// process is immune to terminal hangups for its lifetime. The loop is a
+	// no-op until a server stores the reload function (serve --acp / REST);
+	// short-lived subcommands never register one.
+	hupCh := server.NotifySIGHUP()
+	go server.RunReloadSignalLoop(ctx, hupCh)
 
 	// -q/--quiet silences log output for the whole process. cobra parses
 	// flags during Execute, but plugin loading happens before that — parse
@@ -490,7 +497,7 @@ Wrap your message in quotes when it contains spaces:
 // buildSettingsCmd creates the `settings` subcommand for reading and
 // modifying settings.json. Supports dotted-path keys (e.g.
 // "telemetry.endpoint", "provider.openai.apikey"). Changes are written
-// atomically; a running server detects the file change via fsnotify and
+// atomically; apply them to a running server by sending it SIGHUP, which
 // hot-reloads applicable config (telemetry, log level, providers).
 func buildSettingsCmd() *cobra.Command {
 	cmd := &cobra.Command{
