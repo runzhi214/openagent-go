@@ -869,6 +869,17 @@ type settingsWatcher struct {
 	prevResult *otelhooks.SetupResult
 	shutdown   func()
 	srv        *acp.AgentServer // nil in REST/run mode
+
+	// settingsKeys is the deletion baseline: the model registry keys
+	// derivable from the settings.json FILE on disk ("provider/modelID"),
+	// parsed without plugin merging. Only keys in this set can be pruned
+	// by a reload, so models injected by cli:settings plugins or
+	// registered at runtime (wasm runtime_set_model_config) survive every
+	// reload. nil = baseline unknown (file unreadable/unparseable when the
+	// watcher was built) → deletion is disabled (fail-safe: a broken file
+	// must never be read as "everything deleted"). Updated after each
+	// reload to the new file state. Guarded by mu.
+	settingsKeys map[string]struct{}
 }
 
 // activeWatcher is the process-wide settings watcher, set when the server
@@ -1051,8 +1062,12 @@ func (sw *settingsWatcher) reloadLocked(ctx context.Context) acp.ReloadResult {
 
 	// Providers/models (ACP only — REST/run have no AgentServer).
 	if sw.srv != nil && !reflect.DeepEqual(sw.prev.Provider, newCfg.Provider) {
-		sw.reconfigureModels(newCfg)
-		result.Applied = append(result.Applied, fmt.Sprintf("providers (disk): %d→%d — note: model registry is additive-only (deleted providers stay in memory until restart; new sessions can still use them)", len(sw.prev.Provider), len(newCfg.Provider)))
+		removed := sw.reconfigureModels(newCfg)
+		summary := fmt.Sprintf("providers (disk): %d→%d", len(sw.prev.Provider), len(newCfg.Provider))
+		if removed > 0 {
+			summary += fmt.Sprintf(", removed %d model(s) (affected sessions migrated to the default)", removed)
+		}
+		result.Applied = append(result.Applied, summary)
 	}
 
 	// MCP servers (ACP only). Settings servers are merged with client-
@@ -1118,35 +1133,86 @@ func (sw *settingsWatcher) reconfigureTelemetry(ctx context.Context, cfg config.
 	slog.Info("settings reloaded: telemetry", "endpoint", cfg.Telemetry.Endpoint, "protocol", cfg.Telemetry.Protocol)
 }
 
-// reconfigureModels applies provider/model additions and updates to the ACP
-// model registry. New providers/models are inserted via SetModel; changed
-// providers (edited API key/baseURL/context window) are replaced in place.
+// parseSettingsFileKeys derives the model keys declared by the settings
+// file on disk, WITHOUT plugin merging — this is the deletion baseline
+// for model pruning on reload. ${VAR} references (api keys, urls) are
+// irrelevant to key derivation; NormalizeRawRefs is applied so raw-mode
+// unquoted ${PORT} tokens still parse. Returns nil on any read/parse
+// failure, which disables deletion entirely (see settingsKeys).
+func parseSettingsFileKeys(cfgPath string) map[string]struct{} {
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		slog.Warn("settings watcher: cannot read file for model deletion baseline; deletions disabled", "error", err)
+		return nil
+	}
+	var cfg config.Config
+	if err := json.Unmarshal(config.NormalizeRawRefs(raw), &cfg); err != nil {
+		slog.Warn("settings watcher: cannot parse file for model deletion baseline; deletions disabled", "error", err)
+		return nil
+	}
+	_, infos := buildModels(cfg.Provider)
+	keys := make(map[string]struct{}, len(infos))
+	for _, mi := range infos {
+		keys[mi.Key()] = struct{}{}
+	}
+	return keys
+}
+
+// reconfigureModels applies provider/model additions, updates, and
+// deletions to the ACP model registry. New providers/models are inserted
+// via SetModel; changed providers (edited API key/baseURL/context
+// window) are replaced in place.
 //
-// Providers no longer in settings are NOT removed. Two reasons:
-//  1. Plugin-injected providers (from cli:settings plugins) are absent from
-//     the file-only config that reload parses, so a delete-on-missing loop
-//     would scrub them on every reload. SetModel is replace-or-insert, so
-//     add/update still works; the missing-from-file case is simply left
-//     untouched.
-//  2. Existing sessions may still reference a model the user just removed
-//     from settings.json; deletion would break them. Removal happens on
-//     restart.
+// Models whose keys were in the file baseline but are gone from the new
+// file were deleted from settings.json by this edit — they are pruned
+// via PruneModels (registry removal + active-session migration to the
+// new default), so deletion takes effect on reload instead of waiting
+// for a restart. Keys outside the baseline are untouched:
 //
-// This matches the original design intent this function's comment stated
-// ("removed ones are logged but not deleted") before the delete loop was
-// added in contradiction to it.
-func (sw *settingsWatcher) reconfigureModels(cfg config.Config) {
+//  1. Plugin-injected providers (from cli:settings plugins) are absent
+//     from the file-only config that reload parses, so they are never
+//     candidates for deletion. SetModel is replace-or-insert, so
+//     add/update still works for them.
+//  2. Models registered at runtime (wasm runtime_set_model_config) have
+//     no settings entry either.
+func (sw *settingsWatcher) reconfigureModels(cfg config.Config) (removed int) {
 	_, newInfos := buildModels(cfg.Provider)
 	for _, mi := range newInfos {
 		sw.srv.SetModel(mi.Provider, mi.ID, mi.APIKey, mi.BaseURL,
 			mi.MaxInputTokens, mi.MaxOutputTokens, mi.ReasoningEfforts)
 	}
+	// Deletion pass: baseline − new file keys. A nil baseline disables
+	// deletion (see settingsKeys / parseSettingsFileKeys).
+	newKeys := make(map[string]struct{}, len(newInfos))
+	for _, mi := range newInfos {
+		newKeys[mi.Key()] = struct{}{}
+	}
+	if sw.settingsKeys != nil {
+		var pruneList []string
+		for key := range sw.settingsKeys {
+			if _, still := newKeys[key]; !still {
+				pruneList = append(pruneList, key)
+			}
+		}
+		sort.Strings(pruneList) // deterministic log/test order
+		if len(pruneList) > 0 {
+			removed = len(pruneList)
+			sw.srv.PruneModels(context.Background(), pruneList)
+		}
+	}
+	// The baseline follows the file: the next reload diffs against this
+	// state. New keys are absent from it until then — a model added and
+	// deleted between reloads is simply never seen, which is correct.
+	sw.settingsKeys = newKeys
 	// The extractor uses a dynamic model lookup (SetModelFn at startup),
 	// so it automatically picks up the new model instances — no manual
 	// update needed here.
 	// Notify all active sessions so the frontend model dropdown refreshes.
+	// This runs AFTER PruneModels, so migrated sessions advertise their
+	// new model and removed models are gone from every picker.
 	sw.srv.BroadcastConfigOptions()
-	slog.Info("settings reloaded: models", "providers", len(cfg.Provider), "models", len(newInfos))
+	slog.Info("settings reloaded: models", "providers", len(cfg.Provider), "models", len(newInfos), "removed", removed)
+	return removed
 }
 
 // modes: the RunHooks pipeline and the stage observer. Mode-specific

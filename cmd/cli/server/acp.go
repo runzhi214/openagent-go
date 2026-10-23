@@ -303,11 +303,12 @@ func BuildACPServer(ctx context.Context, cfg *config.Config) (*openacpsdk.Server
 	// mechanism (e.g. DynamicContext injection on next user turn) instead
 	// of broadcasting idle turns to all sessions.
 	activeWatcher.Store(&settingsWatcher{
-		cfgPath:  config.Path(),
-		prev:     cfg,
-		holder:   holder,
-		shutdown: telemetryShutdown,
-		srv:      srv,
+		cfgPath:      config.Path(),
+		prev:         cfg,
+		holder:       holder,
+		shutdown:     telemetryShutdown,
+		srv:          srv,
+		settingsKeys: parseSettingsFileKeys(config.Path()),
 	})
 	// Inject settings callbacks so /settings slash commands and the settings
 	// tool can operate on settings.json without acp importing cmd/cli/config.

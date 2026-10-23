@@ -687,11 +687,9 @@ func (s *AgentServer) ModelIDs() []string {
 	return ids
 }
 
-// RemoveModel removes a model from the registry. Called by the settings
-// watcher when a provider/model is removed from settings.json. Existing
-// sessions referencing the removed model keep their runtime snapshot
-// (rt.Model() returns the last-used model), but new sessions will not
-// be able to select it.
+// RemoveModel removes a model from the registry. Called by PruneModels
+// when a settings reload removed provider/model entries from
+// settings.json.
 //
 // If the removed model was the default, the default falls back to the
 // first remaining model (sorted keys, deterministic) so background
@@ -704,6 +702,63 @@ func (s *AgentServer) RemoveModel(key string) {
 	delete(s.modelConfigs, key)
 	if s.defaultModelID == key {
 		s.defaultModelID = firstModelIDLocked(s.Models)
+	}
+}
+
+// PruneModels removes the given model keys from the registry and
+// migrates active sessions that still reference them to the server's new
+// default model, so a model deleted from settings.json takes effect on
+// reload instead of waiting for a restart.
+//
+// Migration mirrors the lazy-reload fix: the session's model config is
+// synced to the new default and persisted (saveConfig); the frontend
+// refreshes via the config_option_update broadcast the settings reload
+// already sends after reconfigureModels. Sessions keep a working model
+// instead of failing their next prompt on a dangling key.
+//
+// When the registry ends up empty (new default ""), migration is
+// skipped — sessions keep the stale key, and the next prompt takes the
+// no-model path (lazy reload, or the "no models" error), which is the
+// correct behavior when the operator removes every model.
+func (s *AgentServer) PruneModels(ctx context.Context, removed []string) {
+	if len(removed) == 0 {
+		return
+	}
+	for _, key := range removed {
+		s.RemoveModel(key)
+		slog.Info("acp removing model", "key", key)
+	}
+	def := s.GetDefaultModelID()
+	if def == "" {
+		slog.Warn("acp model prune: registry empty; sessions with removed models keep a stale key until models are configured")
+		return
+	}
+	removedSet := make(map[string]struct{}, len(removed))
+	for _, key := range removed {
+		removedSet[key] = struct{}{}
+	}
+	// Snapshot sessions under s.mu, migrate outside it: SetConfigValue and
+	// saveConfig take their own locks, and nesting them under s.mu is
+	// unnecessary — prompt goroutines read session config without s.mu.
+	s.mu.Lock()
+	type candidate struct {
+		ss  *agentSession
+		key string
+	}
+	var candidates []candidate
+	for _, ss := range s.sessions {
+		if key, ok := ss.ConfigString("model"); ok {
+			if _, gone := removedSet[key]; gone {
+				candidates = append(candidates, candidate{ss: ss, key: key})
+			}
+		}
+	}
+	s.mu.Unlock()
+	for _, c := range candidates {
+		c.ss.SetConfigValue("model", def)
+		s.saveConfig(ctx, string(c.ss.id))
+		slog.Info("acp model prune: migrated session model to default",
+			"session", c.ss.id, "from", c.key, "to", def)
 	}
 }
 
@@ -1115,6 +1170,35 @@ func (s *AgentServer) loadSessionState(ctx context.Context, sessionID string) (m
 	return mode, prevMode, createdAt, config
 }
 
+// sanitizeSessionModelConfig resets a restored session's model config
+// when it references a model no longer in the registry. Called on the
+// session/load and session/resume paths, where config comes from
+// persistence and may predate a settings reload that pruned the model
+// (deleted from settings.json). Without this, the next prompt resolves
+// no model and takes the no-model path (lazy reload / explicit error)
+// even though the server has a usable default.
+//
+// Keeps the stale key when the registry is empty as well — the no-model
+// path is the correct outcome when no model is configured at all. The
+// map is mutated in place before the session is published, so no locking
+// is needed.
+func (s *AgentServer) sanitizeSessionModelConfig(sid openacp.SessionId, config map[openacp.SessionConfigId]any) {
+	key, ok := config["model"].(string)
+	if !ok || key == "" {
+		return
+	}
+	if _, found := s.LookupModel(key); found {
+		return
+	}
+	def := s.GetDefaultModelID()
+	if def == "" {
+		return
+	}
+	config["model"] = def
+	slog.Info("acp session restore: model no longer registered, reset to default",
+		"session", sid, "from", key, "to", def)
+}
+
 // saveConfig persists the session's config options to _meta["config"].
 func (s *AgentServer) saveConfig(ctx context.Context, sessionID string) {
 	ss := s.getSession(openacp.SessionId(sessionID))
@@ -1483,6 +1567,7 @@ func (s *AgentServer) OnLoadSession(ctx context.Context, req openacp.LoadSession
 		if config == nil {
 			config = s.freshSessionConfig()
 		}
+		s.sanitizeSessionModelConfig(req.SessionID, config)
 		cwd := s.resolveSessionCwd(ctx, string(req.SessionID), req.Cwd)
 		ss = &agentSession{
 			id:                    req.SessionID,
@@ -1660,6 +1745,7 @@ func (s *AgentServer) OnResumeSession(ctx context.Context, req openacp.ResumeSes
 		if config == nil {
 			config = s.freshSessionConfig()
 		}
+		s.sanitizeSessionModelConfig(req.SessionID, config)
 		cwd := s.resolveSessionCwd(ctx, string(req.SessionID), req.Cwd)
 		ss = &agentSession{
 			id:                    req.SessionID,
@@ -1819,6 +1905,15 @@ func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.Sessio
 		if val, ok := ss.ConfigString("model"); ok {
 			modelID = val
 		}
+	}
+	// Dangling model fallback: the session's selected model may have been
+	// pruned from the registry by a settings reload (PruneModels migrates
+	// active sessions, but a persisted session loaded later keeps the
+	// stale key until its next prompt). Advertise the default instead —
+	// same never-offer-an-unresolvable-value rule as the thought_level
+	// fallback below.
+	if _, ok := s.LookupModel(modelID); !ok {
+		modelID = s.GetDefaultModelID()
 	}
 	// A persisted thought_level outside the model's vocabulary (saved while
 	// another model was selected) is advertised as the model's default —
