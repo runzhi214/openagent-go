@@ -12,6 +12,7 @@ import (
 	openacpsdk "github.com/yusheng-g/openagent-go/acp/sdk"
 	"github.com/yusheng-g/openagent-go/agent"
 	"github.com/yusheng-g/openagent-go/keyring"
+	"github.com/yusheng-g/openagent-go/model/openai"
 	"github.com/yusheng-g/openagent-go/sandbox/native"
 	"github.com/yusheng-g/openagent-go/summarizer"
 	"github.com/yusheng-g/openagent-go/version"
@@ -157,6 +158,20 @@ func BuildACPServer(ctx context.Context, cfg *config.Config) (*openacpsdk.Server
 				deps.Observer = obs
 			}
 			slog.Info("plugin observer wired", "source", "wasm")
+		}
+	}
+
+	// Plugin-provided API error decoration applies to every model built
+	// above (buildModels ran before Discover). SetModel (hot model
+	// insert/update) picks the decorator up itself via PluginMgr.
+	if pluginMgr != nil {
+		if d := pluginMgr.APIErrorDecorator(); d != nil {
+			for _, m := range modelMap {
+				if om, ok := m.(*openai.Model); ok {
+					om.SetAPIErrorDecorator(d)
+				}
+			}
+			slog.Info("plugin api-error decorator wired", "source", "wasm")
 		}
 	}
 

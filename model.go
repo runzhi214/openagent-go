@@ -216,3 +216,36 @@ type RetryableError struct {
 
 func (e *RetryableError) Error() string { return e.Err.Error() }
 func (e *RetryableError) Unwrap() error { return e.Err }
+
+// ── API error decoration ──
+
+// APIErrorInfo describes one provider API error for an APIErrorDecorator.
+// StatusCode is the provider's HTTP status (a 0 means the error never
+// reached HTTP — decorators are not consulted for those).
+type APIErrorInfo struct {
+	StatusCode int
+	BaseURL    string
+	ModelID    string
+	Err        error
+}
+
+// APIErrorDecorator replaces the user-visible message of a provider API
+// error. It returns the complete replacement text ("" = keep the original
+// message). The Model backend wraps the error in a ReplacedError when the
+// return is non-empty — retryability, Retry-After, and the original error
+// (via Unwrap) are preserved; only the displayed text changes.
+type APIErrorDecorator func(APIErrorInfo) string
+
+// ReplacedError carries a decorator-provided message that replaces the
+// error's display text. The original error stays in the unwrap chain so
+// classification (errors.As → *RetryableError, Retry-After) and
+// programmatic inspection survive the replacement; only what humans see
+// changes. The kernel delivers it as-is on retry exhaustion — no "max
+// retries exceeded" prefix, because the message is already user-facing.
+type ReplacedError struct {
+	Message string
+	Err     error
+}
+
+func (e *ReplacedError) Error() string { return e.Message }
+func (e *ReplacedError) Unwrap() error { return e.Err }

@@ -293,6 +293,36 @@ pub struct DecisionOutput {
     pub action: String,
 }
 
+// ── API error decoration (agent plugins, optional export) ──
+//
+// The host consults a plugin's on_api_error whenever a provider API call
+// fails with a status-coded error. The plugin decides by status code /
+// base URL whether a replacement applies; a non-empty return replaces
+// the error's display message entirely — retry semantics stay with the
+// host.
+
+/// Input passed to a plugin's on_api_error export.
+/// Matches agent/wasm/abi.go APIErrorInput.
+#[derive(Deserialize, Default)]
+pub struct ApiErrorInput {
+    #[serde(default)]
+    pub status_code: i32,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub model_id: String,
+    #[serde(default)]
+    pub error: String,
+}
+
+/// Output returned from on_api_error. Empty hint = no decoration.
+/// Matches agent/wasm/abi.go APIErrorOutput.
+#[derive(Serialize, Default)]
+pub struct ApiErrorOutput {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hint: String,
+}
+
 // ── Command definitions (cli:commands plugins) ──
 
 /// A single command registered by a cli:commands plugin.

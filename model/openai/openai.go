@@ -29,8 +29,10 @@ import (
 type Model struct {
 	client           openaisdk.Client
 	modelID          string
+	baseURL          string
 	contextWindow    int
 	reasoningEfforts []string
+	apiErrDecorator  openagent.APIErrorDecorator
 }
 
 // New creates a Model with the given API key, model ID, and base URL.
@@ -59,6 +61,7 @@ func New(apiKey, modelID, baseURL string) *Model {
 	return &Model{
 		client:           openaisdk.NewClient(opts...),
 		modelID:          modelID,
+		baseURL:          baseURL,
 		contextWindow:    modelContextWindow(modelID),
 		reasoningEfforts: utils.ModelReasoningEfforts(modelID),
 	}
@@ -66,6 +69,24 @@ func New(apiKey, modelID, baseURL string) *Model {
 
 func (m *Model) WithContextWindow(tokens int) *Model { m.contextWindow = tokens; return m }
 func (m *Model) ContextWindow() int                  { return m.contextWindow }
+
+// WithAPIErrorDecorator sets the decorator that replaces the display
+// message of API errors returned by this Model (see APIErrorDecorator).
+// Empty returns keep the original message; the original error stays in
+// the unwrap chain, so retryability and Retry-After are preserved.
+func (m *Model) WithAPIErrorDecorator(d openagent.APIErrorDecorator) *Model {
+	m.apiErrDecorator = d
+	return m
+}
+
+// SetAPIErrorDecorator is the post-construction variant of
+// WithAPIErrorDecorator for servers that discover the decorator after
+// building their models. Call before the model is published for use (or
+// under the registry's own synchronization); the field is otherwise
+// write-while-reading.
+func (m *Model) SetAPIErrorDecorator(d openagent.APIErrorDecorator) {
+	m.apiErrDecorator = d
+}
 
 // WithReasoningEfforts overrides the built-in vocabulary detection with
 // the settings-declared one (provider models "reasoning_efforts"). Empty
@@ -94,7 +115,7 @@ func (m *Model) ReasoningEfforts() []string { return m.reasoningEfforts }
 func (m *Model) ListModels(ctx context.Context) ([]openagent.AvailableModel, error) {
 	page, err := m.client.Models.List(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list models: %w", err)
+		return nil, m.decorateAPIError(fmt.Errorf("list models: %w", err))
 	}
 	out := make([]openagent.AvailableModel, 0, len(page.Data))
 	for _, mo := range page.Data {
@@ -191,6 +212,7 @@ var _ openagent.TokenizerModeler = (*Model)(nil)
 var _ openagent.ReasoningEffortModeler = (*Model)(nil)
 var _ openagent.ModelLister = (*Model)(nil)
 
+// ChatCompletion implements openagent.Model.
 func (m *Model) ChatCompletion(ctx context.Context, req openagent.ChatCompletionRequest) (*openagent.ChatCompletionResponse, error) {
 	modelID := req.Model
 	if modelID == "" {
@@ -222,7 +244,7 @@ func (m *Model) ChatCompletion(ctx context.Context, req openagent.ChatCompletion
 
 	completion, err := m.client.Chat.Completions.New(ctx, params)
 	if err != nil {
-		return nil, toRetryableError(err)
+		return nil, m.toRetryableError(err)
 	}
 	return toResponse(completion), nil
 }
@@ -264,15 +286,22 @@ func (m *Model) ChatCompletionStream(ctx context.Context, req openagent.ChatComp
 
 	stream := m.client.Chat.Completions.NewStreaming(ctx, params)
 	if err := stream.Err(); err != nil {
-		return nil, toRetryableError(err)
+		return nil, m.toRetryableError(err)
 	}
-	return &streamReader{stream: stream}, nil
+	return &streamReader{
+		stream:    stream,
+		decorator: m.apiErrDecorator,
+		baseURL:   m.baseURL,
+		modelID:   modelID,
+	}, nil
 }
 
 // toRetryableError wraps transient API errors (429 + server 5xx) so the
 // Runner can retry with backoff. The Retry-After header, when present,
 // becomes the explicit backoff hint (RFC 7231; seconds or HTTP date).
-func toRetryableError(err error) error {
+// A configured APIErrorDecorator may then replace the display message
+// (ReplacedError) — retryability and Retry-After are preserved either way.
+func (m *Model) toRetryableError(err error) error {
 	var apiErr *openaisdk.Error
 	if errors.As(err, &apiErr) {
 		switch apiErr.StatusCode {
@@ -287,10 +316,43 @@ func toRetryableError(err error) error {
 					}
 				}
 			}
-			return re
+			return m.decorateAPIError(re)
 		}
+		return m.decorateAPIError(fmt.Errorf("chat completion: %w", err))
 	}
 	return fmt.Errorf("chat completion: %w", err)
+}
+
+// decorateAPIError consults the configured decorator for err. Errors
+// without an HTTP status (transport failures) and empty decorator returns
+// pass through untouched.
+func (m *Model) decorateAPIError(err error) error {
+	return decorateAPIError(m.apiErrDecorator, m.baseURL, m.modelID, err)
+}
+
+// decorateAPIError is the replacement core shared by the request path
+// (Model.decorateAPIError) and the mid-stream path (streamReader.Err).
+// A non-empty decorator return wraps err in a ReplacedError whose message
+// replaces the display text; the original error stays in the unwrap
+// chain so retry classification (RetryableError, Retry-After) survives.
+func decorateAPIError(decorator openagent.APIErrorDecorator, baseURL, modelID string, err error) error {
+	if decorator == nil {
+		return err
+	}
+	var apiErr *openaisdk.Error
+	if !errors.As(err, &apiErr) || apiErr.StatusCode == 0 {
+		return err
+	}
+	msg := decorator(openagent.APIErrorInfo{
+		StatusCode: apiErr.StatusCode,
+		BaseURL:    baseURL,
+		ModelID:    modelID,
+		Err:        err,
+	})
+	if msg == "" {
+		return err
+	}
+	return &openagent.ReplacedError{Message: strings.TrimSpace(msg), Err: err}
 }
 
 // ── openagent → SDK ──
@@ -466,6 +528,12 @@ type streamReader struct {
 	stream  *ssestream.Stream[openaisdk.ChatCompletionChunk]
 	current openagent.StreamChunk
 	done    bool
+
+	// Decoration context for mid-stream API errors — mirrors the Model
+	// that produced this reader.
+	decorator openagent.APIErrorDecorator
+	baseURL   string
+	modelID   string
 }
 
 func (s *streamReader) Next() bool {
@@ -488,9 +556,11 @@ func (s *streamReader) Err() error {
 	//   - io.ErrUnexpectedEOF / net.Error (connection cut mid-chunk —
 	//     local model servers and flaky gateways truncate streams)
 	// Non-retryable errors are returned as-is to preserve error semantics.
+	// API errors (with a status) carry the decorator's hint; transport
+	// errors have none to decorate and pass through.
 	var apiErr *openaisdk.Error
 	if errors.As(err, &apiErr) && (apiErr.StatusCode == 429 || apiErr.StatusCode == 503) {
-		return &openagent.RetryableError{Err: err}
+		return decorateAPIError(s.decorator, s.baseURL, s.modelID, &openagent.RetryableError{Err: err})
 	}
 	if errors.Is(err, io.ErrUnexpectedEOF) {
 		return &openagent.RetryableError{Err: err}
@@ -499,7 +569,7 @@ func (s *streamReader) Err() error {
 	if errors.As(err, &ne) {
 		return &openagent.RetryableError{Err: err}
 	}
-	return err
+	return decorateAPIError(s.decorator, s.baseURL, s.modelID, err)
 }
 func (s *streamReader) Close() error { return s.stream.Close() }
 
