@@ -64,6 +64,16 @@ func (rt *Runtime) CompressAll(ctx context.Context, sessionID string) (*Compress
 	runID := uuid.NewString()
 	ctx = openagent.WithRunInfo(ctx, openagent.RunInfo{RunID: runID, TurnID: -1})
 	ctx = openagent.WithSession(ctx, openagent.Session{ID: sessionID})
+	// Same self-stamp rationale as WithRunInfo/WithSession above — but for
+	// the model it only fills the gap: a caller that knows the session's
+	// CURRENT model (the ACP slash callback, which sees the session config)
+	// stamps it before calling, and that stamp wins. The runtime's last-run
+	// model is the fallback for unstamped callers.
+	if _, ok := openagent.ModelFromContext(ctx); !ok {
+		if m := rt.Model(); m != nil {
+			ctx = openagent.WithModel(ctx, m)
+		}
+	}
 
 	total, err := rt.deps.SessionStore.Count(ctx, sessionID)
 	if err != nil {

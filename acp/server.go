@@ -895,10 +895,11 @@ func (s *AgentServer) switchSessionModel(ss *agentSession, m openagent.Model) {
 	if rt := ss.getRuntime(); rt != nil {
 		rt.SetModel(m)
 	}
-	// Summarizer and extractor use dynamic model lookup (SetModelFn) in
-	// ACP mode, so they pick up registry updates automatically — no need
-	// to call SetModel here. rt.SetModel above updates the session runtime,
-	// which is the per-session model switch.
+	// No direct summarizer update needed: the kernel stamps each run's
+	// resolved model into ctx (openagent.WithModel), which the summarizer
+	// resolves via ModelFromContext at call time — so compaction follows
+	// this switch from the next run on. A running turn keeps the model it
+	// snapshotted at run start (SetModel contract).
 }
 
 // ── Lazy model reload ──
@@ -3165,6 +3166,15 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 				rt = s.buildRuntimeForSession(sid, ss)
 				ss.setRuntime(rt)
 			}
+			// Stamp the session's CURRENT model so the summarizer follows
+			// it (the kernel stamps this at run entry; /compact runs outside
+			// a run, and a switch since the last prompt must not leave
+			// compaction on the stale last-run model). Local copy: the
+			// captured ctx is shared with the sibling closures.
+			cctx := ctx
+			if m := s.resolveSessionModel(ss); m != nil {
+				cctx = openagent.WithModel(ctx, m)
+			}
 			// Notify the client that compaction is starting.
 			if s.updateSender != nil {
 				s.updateSender.SendSessionUpdate(sid, openacp.SessionUpdate{
@@ -3172,7 +3182,7 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 					Meta:          map[string]any{},
 				})
 			}
-			st, err := rt.CompressAll(ctx, string(sid))
+			st, err := rt.CompressAll(cctx, string(sid))
 			if err != nil {
 				// Notify the client that compaction failed.
 				if s.updateSender != nil {

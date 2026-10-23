@@ -60,6 +60,28 @@ type Model interface {
 	ContextWindow() int
 }
 
+// modelCtxKey is the context key for Model propagation. Unexported to
+// prevent external packages from colliding (same pattern as sessionCtxKey).
+type modelCtxKey struct{}
+
+// WithModel returns a copy of ctx with the run's resolved model attached.
+// The kernel stamps it at run() entry (after session.Model override) so
+// downstream LLM calls that are not the main model call — compaction via
+// the summarizer, most notably — follow the model the user is actually
+// conversing with, including mid-session switches (each run re-stamps).
+// Callers recover it via ModelFromContext.
+func WithModel(ctx context.Context, m Model) context.Context {
+	return context.WithValue(ctx, modelCtxKey{}, m)
+}
+
+// ModelFromContext extracts the model the kernel stamped into ctx for the
+// current run. ok=false when no model was stamped (custom callers, tests)
+// — the caller falls back to its own resolution.
+func ModelFromContext(ctx context.Context) (Model, bool) {
+	m, ok := ctx.Value(modelCtxKey{}).(Model)
+	return m, ok
+}
+
 // TokenizerModeler is an optional interface for Models that know which
 // tokenizer encoding to use. The Runner calls this to get a canonical
 // model name for tiktoken rather than using session.ModelID (which may

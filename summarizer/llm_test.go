@@ -214,3 +214,43 @@ func TestSummarize_CancelledDuringBackoff(t *testing.T) {
 		t.Fatalf("expected context.Canceled in chain, got: %v", err)
 	}
 }
+
+// TestSummarize_ModelResolvedFromContext pins the mid-session-switch fix:
+// the lookup closure mirrors the server wiring (ctx model stamp first, then
+// the server default), so a ctx-stamped model wins and unstamped callers
+// fall back to the default.
+func TestSummarize_ModelResolvedFromContext(t *testing.T) {
+	stamped := &scriptModel{steps: []scriptStep{{resp: okResponse("1. Primary Request: x\n8. Next Step: y")}}}
+	fallback := &scriptModel{steps: []scriptStep{{resp: okResponse("1. Primary Request: y\n8. Next Step: z")}}}
+	c := NewWithLookup(func(ctx context.Context) openagent.Model {
+		if m, ok := openagent.ModelFromContext(ctx); ok && m != nil {
+			return m
+		}
+		return fallback
+	})
+	c.backoff = func(int, *openagent.RetryableError) time.Duration { return 0 }
+
+	msgs := []openagent.Message{{Role: openagent.RoleUser, Content: "hello"}}
+
+	// Stamped ctx → the stamped model answers; the fallback is untouched.
+	if _, err := c.Summarize(openagent.WithModel(context.Background(), stamped), msgs, nil); err != nil {
+		t.Fatalf("Summarize(stamped ctx): %v", err)
+	}
+	if stamped.callCount() != 1 {
+		t.Fatalf("stamped model calls = %d, want 1", stamped.callCount())
+	}
+	if fallback.callCount() != 0 {
+		t.Fatalf("fallback model calls = %d, want 0 (ctx stamp must win)", fallback.callCount())
+	}
+
+	// Unstamped ctx → the fallback answers.
+	if _, err := c.Summarize(context.Background(), msgs, nil); err != nil {
+		t.Fatalf("Summarize(unstamped ctx): %v", err)
+	}
+	if fallback.callCount() != 1 {
+		t.Fatalf("fallback model calls = %d, want 1 (fallback for unstamped callers)", fallback.callCount())
+	}
+	if stamped.callCount() != 1 {
+		t.Fatalf("stamped model calls = %d, want 1 (unchanged by the unstamped call)", stamped.callCount())
+	}
+}
