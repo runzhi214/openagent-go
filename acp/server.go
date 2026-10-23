@@ -1900,11 +1900,13 @@ func (s *AgentServer) buildModeState(sid openacp.SessionId) *openacp.SessionMode
 	}
 }
 
-// BroadcastConfigOptions sends a config_option_update to every active
-// session so the frontend picks up model list changes (e.g. after a
-// settings reload added/removed models via SetModel). Sessions without
-// an updateSender (CLI one-shot) are skipped.
-func (s *AgentServer) BroadcastConfigOptions() {
+// broadcastToSessions sends an update to every active session via the
+// shared updateSender; build constructs the per-session payload (some
+// updates, like config_option_update, vary per session). Session ids are
+// snapshotted under the lock and the sends happen outside it — enqueue is
+// non-blocking (unbounded single-writer queue), so a slow client cannot
+// stall the caller.
+func (s *AgentServer) broadcastToSessions(build func(sid openacp.SessionId) openacp.SessionUpdate) {
 	if s.updateSender == nil {
 		return
 	}
@@ -1915,11 +1917,43 @@ func (s *AgentServer) BroadcastConfigOptions() {
 	}
 	s.mu.Unlock()
 	for _, sid := range ids {
-		s.updateSender.SendSessionUpdate(sid, openacp.SessionUpdate{
+		s.updateSender.SendSessionUpdate(sid, build(sid))
+	}
+}
+
+// BroadcastConfigOptions sends a config_option_update to every active
+// session so the frontend picks up model list changes (e.g. after a
+// settings reload added/removed models via SetModel). Sessions without
+// an updateSender (CLI one-shot) are skipped.
+func (s *AgentServer) BroadcastConfigOptions() {
+	s.broadcastToSessions(func(sid openacp.SessionId) openacp.SessionUpdate {
+		return openacp.SessionUpdate{
 			SessionUpdate: "config_option_update",
 			ConfigOptions: s.buildConfigOptions(sid),
-		})
-	}
+		}
+	})
+}
+
+// BroadcastSettingsReloaded notifies every active session that a settings
+// reload finished, with its outcome, as a custom session/update subtype
+// (same pattern as model_retrying/context_compacting) carrying the result
+// in _meta. Reload triggers that cannot see the return value — e.g. acpws
+// POST /reload delivering SIGHUP — use this to learn when the reload
+// completed and whether it succeeded. Sent on failure too: a blocked
+// reload (parse error / new violations, previous config kept) is exactly
+// what the triggering client needs to hear about.
+func (s *AgentServer) BroadcastSettingsReloaded(r ReloadResult) {
+	s.broadcastToSessions(func(openacp.SessionId) openacp.SessionUpdate {
+		return openacp.SessionUpdate{
+			SessionUpdate: "settings_reload_result",
+			Meta: map[string]any{
+				"success":     r.ParseError == "" && len(r.Violations) == 0,
+				"applied":     r.Applied,
+				"violations":  r.Violations,
+				"parse_error": r.ParseError,
+			},
+		}
+	})
 }
 
 // availableCommands returns the slash commands this agent advertises.

@@ -924,14 +924,27 @@ func loadSettingsReloadFn() func(ctx context.Context) acp.ReloadResult {
 	return *fn
 }
 
-// reload reads the new settings.json, parses it, diffs against the previous
-// config, and applies changes to telemetry/log-level/models. Returns a
-// acp.ReloadResult describing what was applied/skipped. Called by the
-// watcher (auto) and by the settings tool's `reload` action (explicit).
+// reload runs one reload pass and reports the outcome to every active ACP
+// session (settings_reload_result session/update), so reload triggers that
+// cannot see the return value — acpws POST /reload delivering SIGHUP —
+// learn when it finished and whether it succeeded. All three trigger
+// paths (SIGHUP, /settings reload, the settings tool's reload action)
+// converge here, so they broadcast uniformly. The broadcast runs after
+// unlock: enqueue is non-blocking, but keeping it out of the critical
+// section costs nothing.
 func (sw *settingsWatcher) reload(ctx context.Context) acp.ReloadResult {
 	sw.mu.Lock()
-	defer sw.mu.Unlock()
+	result := sw.reloadLocked(ctx)
+	sw.mu.Unlock()
+	if sw.srv != nil {
+		sw.srv.BroadcastSettingsReloaded(result)
+	}
+	return result
+}
 
+// reloadLocked is the reload body: read the file, apply env vars, parse,
+// validate-gate, and apply diffable changes. Callers must hold sw.mu.
+func (sw *settingsWatcher) reloadLocked(ctx context.Context) acp.ReloadResult {
 	var result acp.ReloadResult
 
 	raw, err := os.ReadFile(sw.cfgPath)
