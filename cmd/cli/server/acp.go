@@ -86,6 +86,19 @@ func BuildACPServer(ctx context.Context, cfg *config.Config) (*openacpsdk.Server
 		return nil
 	}
 
+	// Summarizer resolves the model per call: the kernel's ctx model stamp
+	// first (each run stamps its resolved model, so compaction follows the
+	// session's current model including mid-session switches), then the
+	// server default for unstamped callers. Summarize is nil-safe (returns
+	// an error → prepare.go degrades to tail-trim), so construction does
+	// not depend on a model being configured yet.
+	summarizerModel := func(ctx context.Context) openagent.Model {
+		if m, ok := openagent.ModelFromContext(ctx); ok && m != nil {
+			return m
+		}
+		return dynamicModel()
+	}
+
 	// Tools and sandbox are created once per session (buildRuntimeForSession)
 	// scoped to the session's cwd. Agent configuration is pure (model,
 	// prompts, limits, guards, skills); runtime capabilities live in
@@ -127,12 +140,13 @@ func BuildACPServer(ctx context.Context, cfg *config.Config) (*openacpsdk.Server
 		deps.MemoryProvider = knowledge
 	}
 
-	// Summarizer resolves the model via dynamicModel at call time. Summarize
-	// is nil-safe (returns an error → prepare.go degrades to tail-trim), so
-	// construction does not depend on a model being configured yet.
+	// Summarizer resolves the model via summarizerModel at call time (ctx
+	// model stamp → server default). Summarize is nil-safe (returns an
+	// error → prepare.go degrades to tail-trim), so construction does not
+	// depend on a model being configured yet.
 	var sumz *summarizer.Compressor
 	if caps.OnMemory() && caps.OnSummarizer() {
-		sumz = summarizer.NewWithLookup(dynamicModel).WithMaxTokens(agentCfg.MaxCompressedTokens)
+		sumz = summarizer.NewWithLookup(summarizerModel).WithMaxTokens(agentCfg.MaxCompressedTokens)
 		ms.WithSummarizer(sumz)
 		deps.Summarizer = sumz
 	}

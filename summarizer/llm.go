@@ -22,7 +22,7 @@ import (
 // Model to produce incremental summaries.
 type Compressor struct {
 	mu        sync.RWMutex
-	modelFn   func() openagent.Model
+	modelFn   func(ctx context.Context) openagent.Model
 	maxTokens int // 0 = no hint; non-zero = prompt the model to keep the summary under this
 	// backoff returns the wait before retry attempt N (1-based). nil uses
 	// the default exponential backoff. Overridable in tests to avoid sleeps.
@@ -31,13 +31,14 @@ type Compressor struct {
 
 // New creates a Compressor backed by m.
 func New(m openagent.Model) *Compressor {
-	return &Compressor{modelFn: func() openagent.Model { return m }}
+	return &Compressor{modelFn: func(context.Context) openagent.Model { return m }}
 }
 
 // NewWithLookup creates a Compressor that resolves the model at call time
-// via modelFn, so api_key/base_url changes in the registry propagate
-// without an explicit SetModel call.
-func NewWithLookup(modelFn func() openagent.Model) *Compressor {
+// via modelFn, so the effective model can depend on the call's context
+// (the kernel stamps the run model into ctx) and api_key/base_url changes
+// in the registry propagate without an explicit SetModel call.
+func NewWithLookup(modelFn func(ctx context.Context) openagent.Model) *Compressor {
 	return &Compressor{modelFn: modelFn}
 }
 
@@ -46,12 +47,12 @@ func NewWithLookup(modelFn func() openagent.Model) *Compressor {
 func (c *Compressor) SetModel(m openagent.Model) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.modelFn = func() openagent.Model { return m }
+	c.modelFn = func(context.Context) openagent.Model { return m }
 }
 
 // SetModelFn updates the model resolver. Use this for dynamic model
 // lookup (e.g. from a registry that may be updated at runtime).
-func (c *Compressor) SetModelFn(fn func() openagent.Model) {
+func (c *Compressor) SetModelFn(fn func(ctx context.Context) openagent.Model) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.modelFn = fn
@@ -80,7 +81,7 @@ func (c *Compressor) Summarize(ctx context.Context, messages []openagent.Message
 	c.mu.RUnlock()
 	var model openagent.Model
 	if modelFn != nil {
-		model = modelFn()
+		model = modelFn(ctx)
 	}
 	if model == nil {
 		return nil, fmt.Errorf("summarizer: no model configured")

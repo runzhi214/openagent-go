@@ -97,7 +97,15 @@ func RunREST(ctx context.Context, cfg *config.Config) error {
 	}
 
 	if caps.OnSummarizer() && m != nil && caps.OnMemory() {
-		sumz := summarizer.New(m).WithMaxTokens(agentCfg.MaxCompressedTokens)
+		// Per-call resolution: the kernel stamps each run's resolved model
+		// into ctx, so compaction follows the session's request-time model;
+		// unstamped callers fall back to the startup default.
+		sumz := summarizer.NewWithLookup(func(ctx context.Context) openagent.Model {
+			if rm, ok := openagent.ModelFromContext(ctx); ok && rm != nil {
+				return rm
+			}
+			return m
+		}).WithMaxTokens(agentCfg.MaxCompressedTokens)
 		ms.WithSummarizer(sumz)
 		deps.Summarizer = sumz
 	}

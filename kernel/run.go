@@ -43,6 +43,7 @@ func (rt *Runtime) run(ctx context.Context, session openagent.Session, prefix []
 	if session.Model != nil {
 		rt.runModel = session.Model
 	}
+	runModel := rt.runModel
 	rt.mu.Unlock()
 
 	result := &openagent.RunResult{}
@@ -72,6 +73,14 @@ func (rt *Runtime) run(ctx context.Context, session openagent.Session, prefix []
 	result.ParentRunID = prev.RunID
 	ctx = openagent.WithRunInfo(ctx, openagent.RunInfo{RunID: runID, TurnID: -1, ParentRunID: prev.RunID})
 	ctx = openagent.WithSession(ctx, session)
+	// WithModel stamps the resolved run model so LLM side-calls inside the
+	// run (compaction via the summarizer) follow the model the user is
+	// conversing with — a mid-session switch takes effect on the next run,
+	// which re-resolves and re-stamps. Survives the per-turn WithRunInfo
+	// re-stamp (different key).
+	if runModel != nil {
+		ctx = openagent.WithModel(ctx, runModel)
+	}
 	if d, ok := rt.deps.Observer.(openagent.DecisionObserver); ok {
 		ctx = openagent.WithDecisionObserver(ctx, d)
 	}

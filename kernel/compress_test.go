@@ -14,18 +14,21 @@ import (
 // Compact records the throughIndex it was asked to compress up to, then
 // publishes a CompressedContext whose ThroughIndex reflects that cutoff (so
 // the "summary advanced" branch fires). Compressed returns the stored cc.
+// lastCtx captures the ctx Compact received (for model-stamp assertions).
 type fakeCompressor struct {
 	mu       sync.Mutex
 	cc       *openagent.CompressedContext
 	compactN int // number of Compact calls
 	cutoff   int // last cutoff passed to Compact
+	lastCtx  context.Context
 }
 
-func (f *fakeCompressor) Compact(_ context.Context, _ string, throughIndex int, _ []openagent.Message) error {
+func (f *fakeCompressor) Compact(ctx context.Context, _ string, throughIndex int, _ []openagent.Message) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.compactN++
 	f.cutoff = throughIndex
+	f.lastCtx = ctx
 	// Summary advanced: ThroughIndex reflects the cutoff the caller passed.
 	f.cc = &openagent.CompressedContext{
 		Summary:      "compressed summary",
@@ -38,6 +41,15 @@ func (f *fakeCompressor) Compressed(_ context.Context, _ string) (*openagent.Com
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.cc, nil
+}
+
+// lastModel returns the model the kernel stamped into the ctx Compact
+// received, or nil when nothing was stamped.
+func (f *fakeCompressor) lastModel() openagent.Model {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m, _ := openagent.ModelFromContext(f.lastCtx)
+	return m
 }
 
 // fakeTokenizerModel is unused: CompressAll resolves the tokenizer via
