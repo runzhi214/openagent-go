@@ -276,16 +276,43 @@ func (s *recordingSender) SendHistoryMessageWithMeta(string, string, string, map
 }
 
 // updateRecordingClient is a ClientRequester whose SendSessionUpdate records
-// config_option_update notifications (the frontend-visible reload effect).
+// config_option_update notifications (the frontend-visible reload effect)
+// and settings_reload_result notifications (the reload outcome broadcast).
 type updateRecordingClient struct {
 	mu      sync.Mutex
 	updates []string
+	reloads []settingsReloadNotif
+}
+
+// settingsReloadNotif is one recorded settings_reload_result notification.
+type settingsReloadNotif struct {
+	sid        string
+	success    bool
+	applied    []string
+	violations []string
+	parseError string
 }
 
 func (c *updateRecordingClient) SendSessionUpdate(sid openacp.SessionId, update openacp.SessionUpdate) error {
 	c.mu.Lock()
 	if update.SessionUpdate == "config_option_update" {
 		c.updates = append(c.updates, string(sid))
+	}
+	if update.SessionUpdate == "settings_reload_result" {
+		n := settingsReloadNotif{sid: string(sid)}
+		if v, ok := update.Meta["success"].(bool); ok {
+			n.success = v
+		}
+		if v, ok := update.Meta["applied"].([]string); ok {
+			n.applied = v
+		}
+		if v, ok := update.Meta["violations"].([]string); ok {
+			n.violations = v
+		}
+		if v, ok := update.Meta["parse_error"].(string); ok {
+			n.parseError = v
+		}
+		c.reloads = append(c.reloads, n)
 	}
 	c.mu.Unlock()
 	return nil
@@ -294,6 +321,11 @@ func (c *updateRecordingClient) configUpdates() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.updates)
+}
+func (c *updateRecordingClient) reloadNotifs() []settingsReloadNotif {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]settingsReloadNotif(nil), c.reloads...)
 }
 func (c *updateRecordingClient) RequestPermission(ctx context.Context, req openacp.RequestPermissionRequest) (*openacp.RequestPermissionResponse, error) {
 	return nil, nil
@@ -473,6 +505,20 @@ func TestSIGHUP_MidGenerationReloadKeepsPrompt(t *testing.T) {
 	}
 	if client.configUpdates() == 0 {
 		t.Error("no config_option_update reached the client after reload")
+	}
+	// The reload outcome broadcast must reach the client too, with the
+	// successful outcome of this reload.
+	notifs := client.reloadNotifs()
+	if len(notifs) == 0 {
+		t.Fatal("no settings_reload_result reached the client after reload")
+	}
+	n := notifs[len(notifs)-1]
+	if n.sid != string(sid) {
+		t.Errorf("settings_reload_result sid = %q, want %q", n.sid, sid)
+	}
+	if !n.success {
+		t.Errorf("settings_reload_result success = false, want true (applied=%v violations=%v parse_error=%q)",
+			n.applied, n.violations, n.parseError)
 	}
 
 	// The same session must keep serving.
