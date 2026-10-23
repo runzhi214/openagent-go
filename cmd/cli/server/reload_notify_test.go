@@ -40,7 +40,12 @@ func newReloadTestServer(t *testing.T, settingsPath string, withSession bool) (*
 		sid = resp.SessionID
 	}
 
-	sw := &settingsWatcher{cfgPath: settingsPath, prev: &config.Config{}, srv: srv}
+	sw := &settingsWatcher{
+		cfgPath:      settingsPath,
+		prev:         &config.Config{},
+		srv:          srv,
+		settingsKeys: parseSettingsFileKeys(settingsPath),
+	}
 	return sw, client, sid
 }
 

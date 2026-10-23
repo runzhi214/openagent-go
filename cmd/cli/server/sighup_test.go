@@ -279,9 +279,10 @@ func (s *recordingSender) SendHistoryMessageWithMeta(string, string, string, map
 // config_option_update notifications (the frontend-visible reload effect)
 // and settings_reload_result notifications (the reload outcome broadcast).
 type updateRecordingClient struct {
-	mu      sync.Mutex
-	updates []string
-	reloads []settingsReloadNotif
+	mu               sync.Mutex
+	updates          []string
+	reloads          []settingsReloadNotif
+	lastModelCurrent string // CurrentValue of the "model" option in the latest config_option_update
 }
 
 // settingsReloadNotif is one recorded settings_reload_result notification.
@@ -297,6 +298,13 @@ func (c *updateRecordingClient) SendSessionUpdate(sid openacp.SessionId, update 
 	c.mu.Lock()
 	if update.SessionUpdate == "config_option_update" {
 		c.updates = append(c.updates, string(sid))
+		for i := range update.ConfigOptions {
+			if update.ConfigOptions[i].ID == "model" {
+				if v, ok := update.ConfigOptions[i].CurrentValue.(string); ok {
+					c.lastModelCurrent = v
+				}
+			}
+		}
 	}
 	if update.SessionUpdate == "settings_reload_result" {
 		n := settingsReloadNotif{sid: string(sid)}
@@ -326,6 +334,11 @@ func (c *updateRecordingClient) reloadNotifs() []settingsReloadNotif {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]settingsReloadNotif(nil), c.reloads...)
+}
+func (c *updateRecordingClient) modelCurrent() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastModelCurrent
 }
 func (c *updateRecordingClient) RequestPermission(ctx context.Context, req openacp.RequestPermissionRequest) (*openacp.RequestPermissionResponse, error) {
 	return nil, nil
