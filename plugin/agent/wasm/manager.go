@@ -23,6 +23,9 @@ type Manager struct {
 	ldr       loader
 	tools     []openagent.Tool
 	observers []*wasmObserver
+	// apiErrPlugins are the loaded modules exporting on_api_error (probed
+	// at load), in load order. Guarded by mu.
+	apiErrPlugins []*apiErrorPlugin
 
 	hostAPI   *wasmhost.HostAPI
 	scheduler *scheduler.Scheduler
@@ -157,6 +160,13 @@ func (m *Manager) loadOne(ctx context.Context, path string) error {
 	default:
 		slog.Debug("wasm skipping non-agent plugin type", "file", filepath.Base(path), "type", meta.Type)
 		return nil
+	}
+
+	// Decorator consults are type-agnostic: any registered agent plugin
+	// (tool or observer) that exports on_api_error is consulted when a
+	// provider API error needs a hint.
+	if mod.hasAPIError {
+		m.apiErrPlugins = append(m.apiErrPlugins, &apiErrorPlugin{mod: mod, name: meta.Name})
 	}
 
 	m.registerSchedules(meta, mod)

@@ -92,6 +92,23 @@ pub trait Plugin: Sized {
         DecisionOutput::default()
     }
 
+    // ── API error decoration (all agent plugin types) ──
+
+    /// Called when a provider API call fails with a status-coded error
+    /// (the host consults every loaded agent plugin that opts in). Return
+    /// the complete replacement text for the error message — it replaces
+    /// what the user sees entirely; empty means keep the original
+    /// message. Filter by `err.status_code` / `err.base_url`.
+    ///
+    /// Absent in older binaries: the host probes for the `on_api_error`
+    /// export at load time and never consults plugins that don't expose
+    /// it. A plugin compiled against this PDK always exports it (the
+    /// macro emits it unconditionally) — overriding this method is what
+    /// opts in.
+    fn on_api_error(_err: &ApiErrorInput) -> String {
+        String::new()
+    }
+
     // ── Scheduled jobs (all plugin types) ──
 
     /// Cron jobs this plugin declares. The host registers them at load
@@ -215,6 +232,18 @@ macro_rules! export {
         pub extern "C" fn observe_decision(ptr: u32, len: u32) -> u64 {
             let input: $crate::types::DecisionInput = $crate::read_input_json($crate::pk(ptr, len));
             let out = <$t as $crate::export::Plugin>::observe_decision(&input);
+            $crate::sdk_return_json(&out)
+        }
+
+        // on_api_error: same probe-at-load contract as observe_decision.
+        // The macro always emits it; overriding Plugin::on_api_error is
+        // what opts a plugin into decorator consults.
+        #[no_mangle]
+        pub extern "C" fn on_api_error(ptr: u32, len: u32) -> u64 {
+            let input: $crate::types::ApiErrorInput = $crate::read_input_json($crate::pk(ptr, len));
+            let out = $crate::types::ApiErrorOutput {
+                hint: <$t as $crate::export::Plugin>::on_api_error(&input),
+            };
             $crate::sdk_return_json(&out)
         }
 

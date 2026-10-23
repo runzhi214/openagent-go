@@ -131,6 +131,47 @@ func (h *Handler) RegisterModel(id string, model openagent.Model, provider, apiK
 	h.models[key] = model
 	h.modelConfigs[key] = ModelConfig{Provider: provider, ModelID: id, APIKey: apiKey, BaseURL: baseURL}
 	h.modelList = append(h.modelList, ModelInfo{ID: id, Provider: provider})
+	h.applyAPIErrorDecoratorLocked(key, model)
+}
+
+// applyAPIErrorDecoratorLocked decorates a registry model with the
+// plugin-provided API error decorator when one is loaded. Called under
+// modelsMu; non-openai models are skipped (they wire their own decorator
+// at construction).
+func (h *Handler) applyAPIErrorDecoratorLocked(key string, model openagent.Model) {
+	if h.pluginMgr == nil {
+		return
+	}
+	d := h.pluginMgr.APIErrorDecorator()
+	if d == nil {
+		return
+	}
+	if om, ok := model.(*openai.Model); ok {
+		om.SetAPIErrorDecorator(d)
+		slog.Debug("rest model api-error decorator applied", "key", key)
+	}
+}
+
+// ApplyAPIErrorDecorator decorates every registered model (and the
+// default) with the given decorator. For models registered before the
+// plugin manager was wired; later registrations apply it via the plugin
+// manager themselves.
+func (h *Handler) ApplyAPIErrorDecorator(d openagent.APIErrorDecorator) {
+	if d == nil {
+		return
+	}
+	h.modelsMu.Lock()
+	defer h.modelsMu.Unlock()
+	for _, m := range h.models {
+		if om, ok := m.(*openai.Model); ok {
+			om.SetAPIErrorDecorator(d)
+		}
+	}
+	if h.defaultModel != nil {
+		if om, ok := h.defaultModel.(*openai.Model); ok {
+			om.SetAPIErrorDecorator(d)
+		}
+	}
 }
 
 // SetModel replaces or inserts a model in the registry. apiKey and baseURL
@@ -162,6 +203,7 @@ func (h *Handler) SetModel(provider, modelID, apiKey, baseURL string, maxInputTo
 	if cw > 0 {
 		m = m.WithContextWindow(cw)
 	}
+	h.applyAPIErrorDecoratorLocked(key, m)
 	h.models[key] = m
 	h.modelConfigs[key] = ModelConfig{Provider: provider, ModelID: modelID, APIKey: apiKey, BaseURL: baseURL}
 }

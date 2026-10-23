@@ -94,6 +94,29 @@ type DecisionOutput struct {
 	Action string `json:"action,omitempty"` // reserved (always empty today)
 }
 
+// ── API error decoration (agent plugins, optional export) ──
+//
+// Any agent plugin (tools or observers) may export "on_api_error"
+// (probed at load — see module.hasAPIError). The Model backend consults
+// the export whenever a provider call fails with a status-coded API
+// error; the plugin decides by status code / base URL whether a hint
+// applies. The host replaces the error's display message with the
+// returned text and nothing else — retry semantics stay with the host.
+
+// APIErrorInput is passed to plugins' on_api_error().
+type APIErrorInput struct {
+	StatusCode int    `json:"status_code"`
+	BaseURL    string `json:"base_url,omitempty"`
+	ModelID    string `json:"model_id,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+// APIErrorOutput is returned from on_api_error(). An empty hint means no
+// decoration.
+type APIErrorOutput struct {
+	Hint string `json:"hint,omitempty"`
+}
+
 // ── Tool input/output ──
 
 // ToolInput is passed to tool plugins' execute().

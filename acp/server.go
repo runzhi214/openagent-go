@@ -643,6 +643,11 @@ func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string, maxInp
 	if len(vocab) > 0 {
 		m = m.WithReasoningEfforts(vocab)
 	}
+	if s.PluginMgr != nil {
+		if d := s.PluginMgr.APIErrorDecorator(); d != nil {
+			m = m.WithAPIErrorDecorator(d)
+		}
+	}
 	s.Models[key] = m
 	s.modelConfigs[key] = ModelConfig{
 		Provider: provider, ModelID: modelID, APIKey: apiKey, BaseURL: baseURL,

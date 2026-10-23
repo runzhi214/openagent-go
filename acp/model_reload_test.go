@@ -126,7 +126,12 @@ func TestTryReloadModels_ConcurrentSerializes(t *testing.T) {
 	var callCount int32
 	s.SetModelReloadFn(func(ctx context.Context) bool {
 		atomic.AddInt32(&callCount, 1)
+		// Register like the real reload path does — under modelsMu. An
+		// unsynchronized write here races hasModels' locked reads and
+		// trips -race without exercising anything the test intends.
+		s.modelsMu.Lock()
 		s.Models["test/model"] = nil
+		s.modelsMu.Unlock()
 		return true
 	})
 

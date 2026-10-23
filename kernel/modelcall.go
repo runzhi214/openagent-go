@@ -57,7 +57,20 @@ func (rt *Runtime) callModel(ctx context.Context, req openagent.ChatCompletionRe
 		}
 		lastErr = err
 	}
-	return nil, maxRetries, fmt.Errorf("max retries exceeded: %w", lastErr)
+	return nil, maxRetries, wrapRetryExhaustion(lastErr)
+}
+
+// wrapRetryExhaustion formats the error surfaced after the retry budget is
+// spent. A ReplacedError's message is already user-facing guidance (an
+// APIErrorDecorator rewrote it); prefixing it with retry bookkeeping would
+// bury the fix, so it passes through as-is. The original error remains in
+// its unwrap chain either way.
+func wrapRetryExhaustion(lastErr error) error {
+	var rep *openagent.ReplacedError
+	if errors.As(lastErr, &rep) {
+		return rep
+	}
+	return fmt.Errorf("max retries exceeded: %w", lastErr)
 }
 
 // callModelOnce tries streaming first, falls back to non-streaming.

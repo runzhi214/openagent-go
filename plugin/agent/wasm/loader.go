@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -40,6 +41,7 @@ func (l loader) loadModule(ctx context.Context, name string, wasmBytes []byte) (
 	return &module{
 		mod:         mod,
 		hasDecision: mod.ExportedFunction("observe_decision") != nil,
+		hasAPIError: mod.ExportedFunction("on_api_error") != nil,
 	}, nil
 }
 
@@ -52,6 +54,16 @@ type module struct {
 	// the host probes once at load and silently skips decision events for
 	// them (graceful degradation — see runDecisionObservers).
 	hasDecision bool
+	// hasAPIError is true when the guest exports "on_api_error". Same
+	// probe-at-load contract as hasDecision: older binaries never receive
+	// a decorator consult.
+	hasAPIError bool
+	// invokeMu serializes host→guest calls on this module. wazero does
+	// not guarantee concurrent-call safety on one module (the observer
+	// path already serializes through its single worker); holding it in
+	// invoke extends that guarantee to tool and decorator calls, which
+	// arrive from parallel goroutines.
+	invokeMu sync.Mutex
 }
 
 // metadataJSON calls guest's metadata() → packed(ptr, len) and returns the JSON bytes.
@@ -78,8 +90,11 @@ func (m *module) metadataJSON(ctx context.Context) ([]byte, error) {
 }
 
 // invoke calls a guest export with JSON input and returns JSON output
-// (shared ABI helper — see wasmhost.CallWithInput).
+// (shared ABI helper — see wasmhost.CallWithInput). Serialized per module
+// (see module.invokeMu).
 func (m *module) invoke(ctx context.Context, fnName string, input []byte) ([]byte, error) {
+	m.invokeMu.Lock()
+	defer m.invokeMu.Unlock()
 	return wasmhost.CallWithInput(ctx, m.mod, fnName, input)
 }
 

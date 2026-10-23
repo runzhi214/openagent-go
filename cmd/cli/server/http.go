@@ -179,6 +179,13 @@ func RunREST(ctx context.Context, cfg *config.Config) error {
 		slog.Warn("plugin discover failed", "error", err)
 	} else {
 		handler.WithPluginManager(mgr)
+		// Models were registered before Discover; decorate them now.
+		// Later registrations (SetModel/RegisterModel) apply the
+		// decorator via the plugin manager themselves.
+		if d := mgr.APIErrorDecorator(); d != nil {
+			handler.ApplyAPIErrorDecorator(d)
+			slog.Info("plugin api-error decorator wired", "source", "wasm")
+		}
 	}
 
 	// Start IM channels (immediate-connect; fail-fast for an explicitly
