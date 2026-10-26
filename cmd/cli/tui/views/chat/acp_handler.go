@@ -253,3 +253,10 @@ func (h *acpEventHandler) HandleKillTerminal(ctx context.Context, req openacp.Ki
 func (h *acpEventHandler) HandleReleaseTerminal(ctx context.Context, req openacp.ReleaseTerminalRequest) (*openacp.ReleaseTerminalResponse, error) {
 	return nil, fmt.Errorf("terminal/release not implemented")
 }
+
+// HandleElicitationCreate: the TUI does not advertise elicitation support
+// during initialize, so the agent never sends elicitation/create to it.
+// Defended defensively like the fs/terminal stubs above.
+func (h *acpEventHandler) HandleElicitationCreate(ctx context.Context, req openacp.ElicitCreateParams) (*openacp.ElicitResult, error) {
+	return nil, fmt.Errorf("elicitation/create not implemented")
+}

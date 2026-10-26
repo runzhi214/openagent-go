@@ -76,10 +76,32 @@ type AgentCapabilities struct {
 
 // ClientCapabilities is sent by the Client during initialize.
 type ClientCapabilities struct {
-	Meta     map[string]any             `json:"_meta,omitempty"`
-	FS       FileSystemCapabilities     `json:"fs,omitempty"`
-	Session  *ClientSessionCapabilities `json:"session,omitempty"`
-	Terminal bool                       `json:"terminal,omitempty"`
+	Meta        map[string]any             `json:"_meta,omitempty"`
+	FS          FileSystemCapabilities     `json:"fs,omitempty"`
+	Session     *ClientSessionCapabilities `json:"session,omitempty"`
+	Terminal    bool                       `json:"terminal,omitempty"`
+	Elicitation *ElicitationCapabilities   `json:"elicitation,omitempty"`
+}
+
+// ElicitationCapabilities advertises elicitation support. Per the ACP v1
+// spec every supported mode must be explicitly present and non-null: an
+// omitted or null top-level field (or an empty object, or null mode fields)
+// advertises NO support. This deliberately differs from the MCP RC where an
+// empty elicitation capability retains form-only meaning.
+type ElicitationCapabilities struct {
+	Meta map[string]any               `json:"_meta,omitempty"`
+	Form *FormElicitationCapabilities `json:"form,omitempty"`
+	URL  *URLElicitationCapabilities  `json:"url,omitempty"`
+}
+
+// FormElicitationCapabilities advertises form-mode elicitation support.
+type FormElicitationCapabilities struct {
+	Meta map[string]any `json:"_meta,omitempty"`
+}
+
+// URLElicitationCapabilities advertises URL-mode elicitation support.
+type URLElicitationCapabilities struct {
+	Meta map[string]any `json:"_meta,omitempty"`
 }
 
 // PromptCapabilities advertises rich prompt content support.
@@ -742,6 +764,33 @@ type RequestPermissionOutcome struct {
 	OptionID *PermissionOptionId   `json:"optionId,omitempty"` // present when "selected"
 }
 
+// ── Elicitation (Agent → Client RPC) ──
+
+// ElicitCreateParams is the params for the elicitation/create request the
+// Agent sends to ask the user for structured information. Adapts the MCP
+// 2026-07-28 RC elicitation data model; per the ACP v1 spec the mode must
+// be explicit (ACP does not apply MCP's omitted-mode form default).
+//
+// https://agentclientprotocol.com/protocol/v1/elicitation
+type ElicitCreateParams struct {
+	Meta      map[string]any `json:"_meta,omitempty"`
+	SessionID SessionId      `json:"sessionId"`
+	Mode      string         `json:"mode"` // "form" (only supported mode)
+	Message   string         `json:"message"`
+	// RequestedSchema is a flat JSON schema object (primitive/enum
+	// properties only, per MCP elicitation constraints).
+	RequestedSchema any `json:"requestedSchema,omitempty"`
+}
+
+// ElicitResult is the client's answer to elicitation/create.
+type ElicitResult struct {
+	Meta map[string]any `json:"_meta,omitempty"`
+	// Action is one of "accept", "decline", "cancel".
+	Action string `json:"action"`
+	// Content carries the submitted form data; only meaningful on "accept".
+	Content map[string]any `json:"content,omitempty"`
+}
+
 // ── File system (Agent → Client RPC) ──
 
 // ReadTextFileRequest reads a file from the client's filesystem.
@@ -1035,6 +1084,7 @@ type ClientRequester interface {
 	WaitForTerminalExit(ctx context.Context, req WaitForTerminalExitRequest) (*WaitForTerminalExitResponse, error)
 	KillTerminal(ctx context.Context, req KillTerminalRequest) (*KillTerminalResponse, error)
 	ReleaseTerminal(ctx context.Context, req ReleaseTerminalRequest) (*ReleaseTerminalResponse, error)
+	ElicitationCreate(ctx context.Context, req ElicitCreateParams) (*ElicitResult, error)
 }
 
 // ClientRequestHandler receives Agent→Client RPC requests from a connected
@@ -1051,6 +1101,7 @@ type ClientRequestHandler interface {
 	HandleWaitForTerminalExit(ctx context.Context, req WaitForTerminalExitRequest) (*WaitForTerminalExitResponse, error)
 	HandleKillTerminal(ctx context.Context, req KillTerminalRequest) (*KillTerminalResponse, error)
 	HandleReleaseTerminal(ctx context.Context, req ReleaseTerminalRequest) (*ReleaseTerminalResponse, error)
+	HandleElicitationCreate(ctx context.Context, req ElicitCreateParams) (*ElicitResult, error)
 }
 
 // SessionUpdateSender writes a session/update notification to the transport.

@@ -46,27 +46,50 @@ var (
 // generates a unique progressToken per CallTool so the handler can attribute
 // progress to the originating tool.
 func NewClient(name, version string) *Client {
+	return newClient(name, version, nil)
+}
+
+// ElicitHandler answers an MCP server's elicitation/create request (form
+// mode). Returning a non-nil handler causes the MCP client to advertise the
+// form elicitation capability during initialize — servers then know they may
+// ask the user for structured input mid-tool-call.
+type ElicitHandler func(context.Context, *mcpsdk.ElicitRequest) (*mcpsdk.ElicitResult, error)
+
+// NewClientWithElicitation is [NewClient] plus an elicitation handler: the
+// MCP client advertises form elicitation and forwards the server's
+// elicitation/create requests to h. The handler's ctx is the MCP connection
+// lifecycle context, not any particular CallTool's — cancellation across
+// tool calls must be wired by the caller if needed.
+func NewClientWithElicitation(name, version string, h ElicitHandler) *Client {
+	return newClient(name, version, h)
+}
+
+func newClient(name, version string, elicit ElicitHandler) *Client {
+	opts := &mcpsdk.ClientOptions{
+		Logger: slog.Default(),
+		ProgressNotificationHandler: func(_ context.Context, req *mcpsdk.ProgressNotificationClientRequest) {
+			token, _ := req.Params.ProgressToken.(string)
+			progressMu.Lock()
+			toolName := progressLog[token]
+			progressMu.Unlock()
+			if toolName == "" {
+				return // token unknown — stale or from another client
+			}
+			slog.Info("mcp progress",
+				"tool", toolName,
+				"message", req.Params.Message,
+				"progress", req.Params.Progress,
+				"total", req.Params.Total,
+			)
+		},
+	}
+	if elicit != nil {
+		opts.ElicitationHandler = elicit
+	}
 	return &Client{
 		inner: mcpsdk.NewClient(&mcpsdk.Implementation{
 			Name: name, Version: version,
-		}, &mcpsdk.ClientOptions{
-			Logger: slog.Default(),
-			ProgressNotificationHandler: func(_ context.Context, req *mcpsdk.ProgressNotificationClientRequest) {
-				token, _ := req.Params.ProgressToken.(string)
-				progressMu.Lock()
-				toolName := progressLog[token]
-				progressMu.Unlock()
-				if toolName == "" {
-					return // token unknown — stale or from another client
-				}
-				slog.Info("mcp progress",
-					"tool", toolName,
-					"message", req.Params.Message,
-					"progress", req.Params.Progress,
-					"total", req.Params.Total,
-				)
-			},
-		}),
+		}, opts),
 	}
 }
 

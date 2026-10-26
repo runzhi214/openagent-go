@@ -46,6 +46,10 @@ func (f *fakeClientRequester) ReleaseTerminal(context.Context, openacp.ReleaseTe
 	return nil, nil
 }
 
+func (f *fakeClientRequester) ElicitationCreate(context.Context, openacp.ElicitCreateParams) (*openacp.ElicitResult, error) {
+	return nil, nil
+}
+
 func strPtr(s string) *openacp.PermissionOptionId { v := openacp.PermissionOptionId(s); return &v }
 
 // sampleCall is a tool call with a real name + args so ApprovalKey and
