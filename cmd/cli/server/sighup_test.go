@@ -364,6 +364,9 @@ func (c *updateRecordingClient) KillTerminal(context.Context, openacp.KillTermin
 func (c *updateRecordingClient) ReleaseTerminal(context.Context, openacp.ReleaseTerminalRequest) (*openacp.ReleaseTerminalResponse, error) {
 	return nil, nil
 }
+func (c *updateRecordingClient) ElicitationCreate(context.Context, openacp.ElicitCreateParams) (*openacp.ElicitResult, error) {
+	return nil, nil
+}
 
 // memStore is an in-memory session.Store.
 type memStore struct {

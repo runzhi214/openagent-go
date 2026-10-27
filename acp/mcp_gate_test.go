@@ -46,7 +46,7 @@ func TestConnectMCP_Gate(t *testing.T) {
 	// ── Disabled: no spawn, no file ──
 	fileOff := filepath.Join(t.TempDir(), "spawned-off")
 	srv.MCPEnabled = false
-	if conns, tools := srv.connectMCP(ctx, mkServers(fileOff)); conns != nil || tools != nil {
+	if conns, tools := srv.connectMCP(ctx, "s-test", mkServers(fileOff)); conns != nil || tools != nil {
 		t.Errorf("disabled connectMCP = %v, %v; want nil, nil", conns, tools)
 	}
 	if _, err := os.Stat(fileOff); err == nil {
@@ -56,7 +56,7 @@ func TestConnectMCP_Gate(t *testing.T) {
 	// ── Enabled: spawn happens, file created ──
 	fileOn := filepath.Join(t.TempDir(), "spawned-on")
 	srv.MCPEnabled = true
-	srv.connectMCP(ctx, mkServers(fileOn))
+	srv.connectMCP(ctx, "s-test", mkServers(fileOn))
 	// The spawn is synchronous up to handshake, but allow a brief window
 	// for the filesystem to reflect the touch.
 	deadline := time.Now().Add(2 * time.Second)

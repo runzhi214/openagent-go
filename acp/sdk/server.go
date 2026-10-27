@@ -771,6 +771,15 @@ func (m *mux) request(ctx context.Context, method string, params any) (rpcRespon
 	select {
 	case <-call.done:
 	case <-ctx.Done():
+		// Per the ACP spec the agent notifies the client it no longer
+		// wants the answer ($/cancel_request), so the client can dismiss
+		// its UI (e.g. a parked elicitation form) and cancel the handler.
+		cnParams, _ := json.Marshal(CancelRequestNotification{RequestID: RequestId(callKey)})
+		_ = m.enqueue(jsonrpcMessage{
+			JSONRPC: "2.0",
+			Method:  "$/cancel_request",
+			Params:  cnParams,
+		})
 		return rpcResponse{}, ctx.Err()
 	}
 	return call.resp, nil
@@ -836,6 +845,10 @@ func (m *mux) KillTerminal(ctx context.Context, req KillTerminalRequest) (*KillT
 }
 func (m *mux) ReleaseTerminal(ctx context.Context, req ReleaseTerminalRequest) (*ReleaseTerminalResponse, error) {
 	return doCall[ReleaseTerminalRequest, ReleaseTerminalResponse](m, ctx, "terminal/release", req)
+}
+
+func (m *mux) ElicitationCreate(ctx context.Context, req ElicitCreateParams) (*ElicitResult, error) {
+	return doCall[ElicitCreateParams, ElicitResult](m, ctx, "elicitation/create", req)
 }
 
 // SendSessionUpdate writes a session/update notification (out of a

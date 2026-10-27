@@ -163,6 +163,12 @@ type Session struct {
 	pending    map[string]*pendingCall
 	eh         EventHandler
 	clientReqH ClientRequestHandler
+
+	// agentReqCancel holds the cancel func of each in-flight Agent→Client
+	// request handler, keyed by normalised JSON-RPC id. When the agent
+	// sends $/cancel_request the corresponding handler ctx is cancelled
+	// (e.g. a parked elicitation form the agent no longer wants answered).
+	agentReqCancel map[string]context.CancelFunc
 }
 
 type pendingCall struct {
@@ -531,9 +537,13 @@ func (s *Session) startReader(ctx context.Context) {
 
 		switch {
 		case env.Method != "" && len(env.ID) > 0:
-			// Agent→Client RPC request. Handle synchronously and write
-			// the response back to the agent on stdin.
-			s.handleAgentRequest(ctx, env.Method, env.ID, env.Params)
+			// Agent→Client RPC request. Handle ASYNCHRONOUSLY: the reader
+			// loop must keep draining while a handler is parked (e.g. an
+			// elicitation form waiting for the user — meanwhile the agent
+			// keeps sending session/update notifications, and its writer
+			// blocks once the transport buffer fills). JSON-RPC ids pair
+			// responses, so out-of-order completion is safe.
+			go s.handleAgentRequest(ctx, env.Method, env.ID, env.Params)
 
 		case env.Method != "":
 			// Notification — dispatch to EventHandler.
@@ -559,6 +569,11 @@ func (s *Session) startReader(ctx context.Context) {
 
 // handleAgentRequest dispatches an incoming Agent→Client RPC request
 // and writes the JSON-RPC 2.0 response back to the agent on stdin.
+//
+// The handler runs under a per-request cancellable ctx: the agent may send
+// $/cancel_request when it no longer wants the answer (e.g. the run that
+// triggered the elicitation was cancelled), which cancels the handler so a
+// parked UI can dismiss itself instead of blocking the reader forever.
 func (s *Session) handleAgentRequest(ctx context.Context, method string, id json.RawMessage, params json.RawMessage) {
 	s.mu.Lock()
 	h := s.clientReqH
@@ -568,6 +583,22 @@ func (s *Session) handleAgentRequest(ctx context.Context, method string, id json
 		s.writeRPCResponse(id, nil, fmt.Errorf("agent→client RPC not configured"))
 		return
 	}
+
+	reqKey := idString(id)
+	hctx, cancel := context.WithCancel(ctx)
+	s.mu.Lock()
+	if s.agentReqCancel == nil {
+		s.agentReqCancel = make(map[string]context.CancelFunc)
+	}
+	s.agentReqCancel[reqKey] = cancel
+	s.mu.Unlock()
+	defer func() {
+		cancel()
+		s.mu.Lock()
+		delete(s.agentReqCancel, reqKey)
+		s.mu.Unlock()
+	}()
+	ctx = hctx
 
 	var resp any
 	var err error
@@ -629,6 +660,18 @@ func (s *Session) handleAgentRequest(ctx context.Context, method string, id json
 			return
 		}
 		resp, err = h.HandleReleaseTerminal(ctx, req)
+	case "elicitation/create":
+		var req ElicitCreateParams
+		if err := json.Unmarshal(params, &req); err != nil {
+			s.writeRPCResponse(id, nil, fmt.Errorf("invalid params for elicitation/create: %w", err))
+			return
+		}
+		resp, err = h.HandleElicitationCreate(ctx, req)
+	default:
+		// Unknown agent→client method: answer with an error rather than a
+		// null result so the agent can fail the originating operation.
+		s.writeRPCResponse(id, nil, fmt.Errorf("unknown agent->client method %q", method))
+		return
 	}
 
 	if err != nil {
@@ -672,22 +715,21 @@ func (s *Session) dispatchNotif(method string, params json.RawMessage) {
 }
 
 // handleCancelRequestNotif handles an incoming $/cancel_request notification
-// from the agent.  The agent is asking us to cancel an in-flight client→agent
-// request.  We cancel the pending call so the blocked goroutine unblocks with
-// a context-cancelled error.
+// from the agent. Per the JSON-RPC cancellation convention the sender
+// cancels its OWN request, so from the client's perspective this cancels an
+// in-flight Agent→Client request: the parked handler ctx is cancelled (e.g.
+// an elicitation form the agent no longer wants answered), so the handler
+// returns and the reader loop keeps flowing.
 func (s *Session) handleCancelRequestNotif(params json.RawMessage) {
 	var notif CancelRequestNotification
 	if json.Unmarshal(params, &notif) != nil {
 		return
 	}
 	s.mu.Lock()
-	call := s.pending[notif.RequestID]
+	cancel := s.agentReqCancel[string(notif.RequestID)]
 	s.mu.Unlock()
-	if call != nil {
-		// Deliver a synthetic cancellation error so the blocked caller
-		// returns promptly.
-		call.resp.Error = &Error{Code: ErrorCodeRequestCancelled, Message: "request cancelled by agent"}
-		close(call.done)
+	if cancel != nil {
+		cancel()
 	}
 }
 

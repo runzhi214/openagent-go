@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	openagent "github.com/yusheng-g/openagent-go"
 	openacp "github.com/yusheng-g/openagent-go/acp/sdk"
 	"github.com/yusheng-g/openagent-go/agent"
@@ -97,6 +98,16 @@ type AgentServer struct {
 	// registration (fs/read_text_file, fs/write_text_file, terminal/*)
 	// so the LLM is never offered a tool the client cannot handle.
 	clientCaps openacp.ClientCapabilities
+
+	// Pending elicitation cancellation registry. MCP elicitation handlers
+	// run on the MCP connection's read loop with a connection-lifecycle
+	// ctx, so run/session cancellation must be wired explicitly: each
+	// in-flight elicitation parks its cancel func here keyed by session,
+	// and OnCancel cancels them alongside the prompt. Guarded by
+	// elicitMu. elicitCtr is a global monotonic key source.
+	elicitMu      sync.Mutex
+	elicitCancels map[openacp.SessionId]map[int64]context.CancelFunc
+	elicitCtr     int64
 
 	// defaultModelID is used when the session config hasn't selected one.
 	defaultModelID string
@@ -1069,6 +1080,119 @@ func (s *AgentServer) clientCanTerminal() bool {
 	return s.clientCaps.Terminal
 }
 
+// clientCanElicit reports whether the client advertised form-mode
+// elicitation. Per the ACP v1 spec each mode must be explicitly non-null:
+// an absent capability or a null form field means no support.
+func (s *AgentServer) clientCanElicit() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.clientCaps.Elicitation
+	return e != nil && e.Form != nil
+}
+
+// parkElicitCancel registers the cancel func of an in-flight elicitation
+// under sid and returns its unregister func. Called by bridgeElicit before
+// blocking on the client's response.
+func (s *AgentServer) parkElicitCancel(sid openacp.SessionId, cancel context.CancelFunc) (unregister func()) {
+	s.elicitMu.Lock()
+	if s.elicitCancels == nil {
+		s.elicitCancels = make(map[openacp.SessionId]map[int64]context.CancelFunc)
+	}
+	key := s.elicitCtr
+	s.elicitCtr++
+	if s.elicitCancels[sid] == nil {
+		s.elicitCancels[sid] = make(map[int64]context.CancelFunc)
+	}
+	s.elicitCancels[sid][key] = cancel
+	s.elicitMu.Unlock()
+	return func() {
+		s.elicitMu.Lock()
+		delete(s.elicitCancels[sid], key)
+		if len(s.elicitCancels[sid]) == 0 {
+			delete(s.elicitCancels, sid)
+		}
+		s.elicitMu.Unlock()
+	}
+}
+
+// cancelPendingElicitations cancels every in-flight elicitation parked
+// under sid. Called from OnCancel (session/cancel) so a stopped run also
+// dismisses the forms the user stopped answering.
+//
+// The funcs are snapshotted under the lock because each cancel() causes
+// the parked handler's unregister to delete from the same map concurrently
+// (it runs on the MCP read loop goroutine) — ranging the live map would
+// race with those deletes.
+func (s *AgentServer) cancelPendingElicitations(sid openacp.SessionId) {
+	s.elicitMu.Lock()
+	funcs := make([]context.CancelFunc, 0, len(s.elicitCancels[sid]))
+	for _, cancel := range s.elicitCancels[sid] {
+		funcs = append(funcs, cancel)
+	}
+	s.elicitMu.Unlock()
+	if len(funcs) == 0 {
+		return // common case: session cancel with no form pending
+	}
+	slog.Warn("acp elicitation dismissed by session cancel", "session", sid, "count", len(funcs))
+	for _, cancel := range funcs {
+		cancel()
+	}
+}
+
+// bridgeElicit adapts an MCP elicitation/create (form mode) into the ACP
+// elicitation/create request and waits for the client's answer. connCtx is
+// the MCP connection lifecycle context supplied by the go-sdk read loop;
+// session cancellation is wired on top via parkElicitCancel.
+//
+// Faithful-forwarding policy (docs/elicitation.md): the agent adds only the
+// scope (sessionId) and the explicit mode; schema validation of accepted
+// content stays with the go-sdk, and timeouts / decline-copy are the
+// server's own business.
+//
+// Logs carry identifiers and outcomes only (session, mode, action, elapsed,
+// error) — never the message, schema, or submitted form content, which are
+// user data.
+func (s *AgentServer) bridgeElicit(connCtx context.Context, sid openacp.SessionId, req *mcpsdk.ElicitRequest) (*mcpsdk.ElicitResult, error) {
+	start := time.Now()
+	slog.Info("acp elicitation request", "session", sid)
+	// Defence: only form mode was advertised to the server, so any other
+	// mode (URL or an unknown value) is a protocol violation — answer
+	// with an error so the server fails the originating operation itself.
+	// An omitted mode defaults to form per the MCP elicitation spec.
+	if (req.Params.Mode != "" && req.Params.Mode != "form") || req.Params.URL != "" {
+		slog.Warn("acp elicitation mode rejected", "session", sid, "mode", req.Params.Mode)
+		return nil, fmt.Errorf("elicitation mode %q not advertised", req.Params.Mode)
+	}
+
+	ectx, cancel := context.WithCancel(connCtx)
+	unregister := s.parkElicitCancel(sid, cancel)
+	defer unregister()
+
+	rpc := s.clientRPC
+	if rpc == nil {
+		return &mcpsdk.ElicitResult{Action: "cancel"}, nil
+	}
+	resp, err := rpc.ElicitationCreate(ectx, openacp.ElicitCreateParams{
+		SessionID:       sid,
+		Mode:            "form",
+		Message:         req.Params.Message,
+		RequestedSchema: req.Params.RequestedSchema,
+	})
+	if err != nil {
+		// Cancelled (session/cancel or disconnect) or transport failure:
+		// the user never answered — report dismissal, not an error, so a
+		// still-alive server sees a well-formed cancel.
+		if ectx.Err() != nil {
+			slog.Warn("acp elicitation cancelled", "session", sid, "elapsed", time.Since(start).Round(time.Millisecond), "error", ectx.Err())
+			return &mcpsdk.ElicitResult{Action: "cancel"}, nil
+		}
+		slog.Error("acp elicitation failed", "session", sid, "elapsed", time.Since(start).Round(time.Millisecond), "error", err)
+		return nil, fmt.Errorf("acp elicitation: %w", err)
+	}
+	slog.Info("acp elicitation answered", "session", sid, "action", resp.Action, "elapsed", time.Since(start).Round(time.Millisecond))
+	return &mcpsdk.ElicitResult{Action: resp.Action, Content: resp.Content}, nil
+}
+
 // ── Session helpers ──
 
 func (s *AgentServer) newSessionID() openacp.SessionId {
@@ -1290,12 +1414,26 @@ func (conns mcpConns) statuses() []openacp.McpServerStatus {
 // listed once at connect time and cached — the connection is long-lived
 // (one connection per session lifetime). Failed connections are logged but
 // not fatal — MCP is an optional enhancement.
-func (s *AgentServer) connectMCP(ctx context.Context, servers []openacp.McpServer) (mcpConns, []openagent.Tool) {
+//
+// When the client advertised form-mode elicitation, the MCP client gets an
+// ElicitationHandler that bridges the server's elicitation/create requests
+// to the ACP client via bridgeElicit (see docs/elicitation.md).
+func (s *AgentServer) connectMCP(ctx context.Context, sid openacp.SessionId, servers []openacp.McpServer) (mcpConns, []openagent.Tool) {
 	if !s.MCPEnabled {
 		return nil, nil
 	}
 	servers = s.mergeMcpServers(servers)
-	client := mcp.NewClient(s.AgentName, s.AgentVersion)
+	var client *mcp.Client
+	if s.clientCanElicit() && s.clientRPC != nil {
+		client = mcp.NewClientWithElicitation(s.AgentName, s.AgentVersion, func(cctx context.Context, ereq *mcpsdk.ElicitRequest) (*mcpsdk.ElicitResult, error) {
+			return s.bridgeElicit(cctx, sid, ereq)
+		})
+	} else {
+		// Old clients hit this on every session/new — Debug keeps the
+		// log quiet while still explaining why the feature is dark.
+		slog.Debug("acp elicitation handler skipped: client did not advertise form elicitation")
+		client = mcp.NewClient(s.AgentName, s.AgentVersion)
+	}
 	var conns mcpConns
 	var tools []openagent.Tool
 	seen := make(map[string]string) // tool name → server (duplicate detection)
@@ -1509,7 +1647,7 @@ func (s *AgentServer) resolveSessionCwd(ctx context.Context, sessionID, reqCwd s
 
 func (s *AgentServer) OnNewSession(ctx context.Context, req openacp.NewSessionRequest) (*openacp.NewSessionResponse, error) {
 	id := s.newSessionID()
-	mcpConns, mcpTools := s.connectMCP(ctx, req.McpServers)
+	mcpConns, mcpTools := s.connectMCP(ctx, id, req.McpServers)
 	cwd := utils.NormalizePath(req.Cwd)
 	ss := &agentSession{
 		id:                    id,
@@ -1581,7 +1719,7 @@ func (s *AgentServer) OnLoadSession(ctx context.Context, req openacp.LoadSession
 			mcpServers:            req.McpServers,
 		}
 		// Reconnect MCP servers and inject tools for this session.
-		ss.mcpConns, ss.mcpTools = s.connectMCP(ctx, req.McpServers)
+		ss.mcpConns, ss.mcpTools = s.connectMCP(ctx, req.SessionID, req.McpServers)
 		s.sendMcpServersUpdate(req.SessionID, ss.mcpConns)
 
 		// Create per-session process manager for long-running shell commands.
@@ -1759,7 +1897,7 @@ func (s *AgentServer) OnResumeSession(ctx context.Context, req openacp.ResumeSes
 			mcpServers:            req.McpServers,
 		}
 		// Reconnect MCP servers and inject tools for this session.
-		ss.mcpConns, ss.mcpTools = s.connectMCP(ctx, req.McpServers)
+		ss.mcpConns, ss.mcpTools = s.connectMCP(ctx, req.SessionID, req.McpServers)
 		s.sendMcpServersUpdate(req.SessionID, ss.mcpConns)
 
 		// Create per-session process manager for shell tool background processes.
@@ -2686,6 +2824,9 @@ func (s *AgentServer) OnCancel(ctx context.Context, sid openacp.SessionId) error
 	if ss != nil {
 		ss.cancelPrompt()
 	}
+	// A stopped run must also dismiss elicitation forms still waiting for
+	// an answer (the MCP handler ctx is connection-scoped, not run-scoped).
+	s.cancelPendingElicitations(sid)
 	return nil
 }
 
